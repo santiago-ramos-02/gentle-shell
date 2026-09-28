@@ -1,19 +1,15 @@
-# Keeps Pi on upstream gentle-pi main plus this fork's API.
+# Keeps this fork on upstream gentle-pi main, releases it, and keeps Pi on it.
 #
-# Merges upstream/main into main, checks the build, and installs a clean copy of
-# main at <agent home>/gentle-pi-t3, which Pi's settings.json then declares in
-# place of npm:gentle-pi. The checkout itself is never what Pi loads, so work in
-# progress here cannot break Pi. Merging (not rebasing) keeps main pushable
-# without a force push. Any failure (dirty tree, merge conflict, failing checks,
-# an install that cannot answer `describe`) stops before the swap, so the
-# working copy is never replaced by a broken one. Runs daily from the
-# "gentle-pi T3 update" scheduled task.
+# Merges upstream/main into main, checks the fork's additions, and pushes main
+# to origin, where .github/workflows/t3-release.yml publishes it as a release.
+# Pi then installs the fork the same way anyone else does, from git
+# (git:github.com/<owner>/gentle-shell) in place of npm:gentle-pi, and
+# `pi update` moves it to the new main. Merging (not rebasing) keeps main
+# pushable without a force push. Any failure (dirty tree, merge conflict,
+# failing checks) stops before the push, so neither the release nor Pi gets a
+# broken build. Runs daily from the "gentle-pi T3 update" scheduled task.
 #
-# The version is main's package version plus the fork commit installed, such as
-# 3.7.0-t3.232bfd4, so any new commit triggers a reinstall.
-#
-# Opting out: -Uninstall declares npm:gentle-pi again (installing it if Pi has
-# no copy) and leaves this copy on disk until the next update removes it.
+# Opting out: -Uninstall declares npm:gentle-pi again.
 
 param(
   [string]$AgentHome = $(if ($env:GENTLE_PI_AGENT_HOME) { $env:GENTLE_PI_AGENT_HOME }
@@ -25,10 +21,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $Branch = 'main'
 $Repo = Split-Path -Parent $PSScriptRoot
-$Install = Join-Path $AgentHome 'gentle-pi-t3'
 $Settings = Join-Path $AgentHome 'settings.json'
 $Log = Join-Path $AgentHome 'gentle-pi-t3-update.log'
 New-Item -ItemType Directory -Force $AgentHome | Out-Null
+$env:PI_CODING_AGENT_DIR = $AgentHome
 
 function Write-Log([string]$Message) {
   $line = "$(Get-Date -Format s) $Message"
@@ -48,8 +44,8 @@ function Invoke-Checked([string]$What, [scriptblock]$Command) {
   $output
 }
 
-# Declares `source` as Pi's gentle-pi package, replacing any other gentle-pi
-# declaration and keeping the rest of settings.json and its two-space format.
+# Declares `source` as Pi's gentle-pi package in place of any other gentle-pi
+# declaration, keeping the rest of settings.json and its two-space format.
 function Set-GentlePiDeclaration([string]$Source) {
   $script = @'
 const fs = require("node:fs");
@@ -59,7 +55,7 @@ const settings = fs.existsSync(settingsPath) ? JSON.parse(fs.readFileSync(settin
 const isGentlePi = (entry) => {
   const value = typeof entry === "string" ? entry : entry && entry.source;
   if (typeof value !== "string") return false;
-  if (/^npm:gentle-pi(@|$)/.test(value)) return true;
+  if (value === source || /^npm:gentle-pi(@|$)/.test(value) || /gentle-shell(@|$)/.test(value)) return true;
   const dir = path.resolve(path.dirname(settingsPath), value);
   try { return JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).name === "gentle-pi"; } catch { return false; }
 };
@@ -78,18 +74,16 @@ fs.renameSync(temporary, settingsPath);
 
 try {
   if ($Uninstall) {
-    $npmCopy = Join-Path $AgentHome 'npm\node_modules\gentle-pi\package.json'
-    if (-not (Test-Path $npmCopy)) {
-      $env:PI_CODING_AGENT_DIR = $AgentHome
-      Invoke-Checked 'pi install npm:gentle-pi' { pi install npm:gentle-pi } | Out-Null
-    }
     Set-GentlePiDeclaration 'npm:gentle-pi'
+    Invoke-Checked 'pi update npm:gentle-pi' { pi update npm:gentle-pi } | Out-Null
     Write-Log 'Pi declares npm:gentle-pi again'
     exit 0
   }
 
   if ((Invoke-Git rev-parse --abbrev-ref HEAD) -ne $Branch) { throw "$Repo is not on $Branch" }
   if (Invoke-Git status --porcelain) { throw "$Repo has uncommitted changes" }
+  $origin = (Invoke-Git remote get-url origin) -replace '^https://', '' -replace '\.git$', ''
+  $source = "git:$origin"
 
   Invoke-Git fetch --quiet upstream | Out-Null
   $upstream = Invoke-Git rev-parse upstream/main
@@ -116,42 +110,11 @@ try {
     Pop-Location
   }
 
-  $packageVersion = (Get-Content (Join-Path $Repo 'package.json') -Raw | ConvertFrom-Json).version
-  $version = "$packageVersion-t3.$((Invoke-Git rev-parse --short=7 HEAD))"
-  $versionFile = Join-Path $Install '.t3-version'
-  $installed = if (Test-Path $versionFile) { (Get-Content $versionFile -Raw).Trim() }
-  if ($installed -eq $version) {
-    Set-GentlePiDeclaration $Install
-    Write-Log "up to date at $version"
-    exit 0
-  }
-
-  $stage = "$Install.new"
-  if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-  $archive = Join-Path ([IO.Path]::GetTempPath()) "gentle-pi-$version.zip"
-  Invoke-Git archive --format=zip -o $archive HEAD | Out-Null
-  Expand-Archive -Path $archive -DestinationPath $stage
-  Remove-Item $archive -Force
-  Push-Location $stage
-  try {
-    # Like Pi's own install: runtime dependencies only, Pi supplies its peers, and the
-    # postinstall fetches the gentle-ai release this gentle-pi is pinned to.
-    Invoke-Checked 'npm install' { npm install --omit=dev --omit=peer --no-audit --no-fund --no-package-lock } | Out-Null
-  } finally {
-    Pop-Location
-  }
-  $describe = '{}' | & node (Join-Path $stage 'bin\gentle-pi-api.mjs') describe | Select-Object -Last 1 | ConvertFrom-Json
-  if ($describe.type -ne 'result') { throw 'the new install does not answer describe' }
-  Set-Content -Path (Join-Path $stage '.t3-version') -Value $version
-
-  # A running Pi keeps gentle-ai.exe open inside the copy, which blocks renaming it;
-  # the next run retries.
-  $previous = "$Install.previous"
-  if (Test-Path $previous) { Remove-Item $previous -Recurse -Force }
-  if (Test-Path $Install) { Move-Item $Install $previous }
-  Move-Item $stage $Install
-  Set-GentlePiDeclaration $Install
-  Write-Log "installed $version (was $(if ($installed) { $installed } else { 'npm:gentle-pi' }))"
+  Invoke-Git push --quiet origin $Branch | Out-Null
+  $version = "$((Get-Content (Join-Path $Repo 'package.json') -Raw | ConvertFrom-Json).version)-t3.$((Invoke-Git rev-parse --short=7 HEAD))"
+  Set-GentlePiDeclaration $source
+  Invoke-Checked "pi update $source" { pi update $source } | Out-Null
+  Write-Log "Pi is on $source at $version"
 } catch {
   Write-Log "FAILED: $_"
   exit 1
