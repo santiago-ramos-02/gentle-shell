@@ -1,0 +1,185 @@
+// Applying a model profile: the multi-file write shared by `/gentle:profiles`
+// and the gentle-pi API. It reports what happened instead of notifying, so each
+// host words the outcome its own way; the live-session model switch stays with
+// the extension, which is the only host that has a session.
+import { writeProfilePinSync, resolveProfilePin, evaluateProfilePin, readProfilePinStatus } from "./agent-profile-pin.ts";
+import { readProfileOrchestrator, setActiveProfile, writeProfilesFileSync, type AgentProfilesFile } from "./agent-profiles.ts";
+import { normalizeModelConfig, type AgentModelConfig, type AgentRoutingEntry } from "./model-routing-authority.ts";
+import {
+	applyModelConfigAsync,
+	gentleAiConfigHome,
+	modelConfigPath,
+	orchestratorSettingsPath,
+	withOmittedAgentsClearedAsync,
+	writeModelConfigAsync,
+} from "./model-routing.ts";
+import { applyOrchestratorSettings, restoreOrchestratorSettings } from "./profiles-orchestrator.ts";
+
+export type ProfileApplyResult =
+	/** A pin governs this repository, so only the clone-local pin moved. */
+	| {
+			status: "pinned";
+			localPath: string;
+			/** The committed declaration this worktree still carries, now outranked by the clone pin. */
+			shadowedDeclaration?: { path: string; profile: string };
+	  }
+	| { status: "pin-failed"; localPath: string; error: unknown }
+	| {
+			status: "applied";
+			file: AgentProfilesFile;
+			updated: number;
+			/** The orchestrator the profile sets, and where it was written when that changed the file. */
+			orchestrator?: { entry: AgentRoutingEntry; writtenTo?: string };
+			/** The repository has a pin layer that does not resolve, so global routing governs it. */
+			unresolvedPin: boolean;
+	  }
+	| { status: "claim-failed"; error: unknown }
+	| {
+			status: "failed";
+			stage: "models" | "materialize" | "orchestrator";
+			/** An error, or for the orchestrator stage the reason Pi's settings were refused. */
+			error: unknown;
+			/** What the rollback put back, in words: "routing and active marker", "nothing", ... */
+			restored: string;
+			/** models.json still holds the failed profile: no previously active profile was recorded. */
+			unrestoredModelsPath?: string;
+	  };
+
+function hasOwnProfile(profiles: Record<string, unknown>, name: string): boolean {
+	return Object.prototype.hasOwnProperty.call(profiles, name);
+}
+
+/**
+ * Applies `name` from `file` (the store at `profilesPath`). When a pin wins in `cwd`,
+ * applying is repo-scoped unless `global` is set: it re-pins this clone and writes no
+ * global routing, no materialized stores, and no orchestrator. Otherwise it claims the
+ * profile in the store, writes models.json, materializes the routing, and sets the
+ * orchestrator, rolling back what it wrote when a later step fails.
+ */
+export async function applyProfile(options: {
+	cwd: string;
+	profilesPath: string;
+	file: AgentProfilesFile;
+	name: string;
+	global?: boolean;
+}): Promise<ProfileApplyResult | undefined> {
+	const { cwd, profilesPath: path, file, name } = options;
+	if (!hasOwnProfile(file.profiles, name)) return undefined;
+	// A pinned repository resolves its subagent routing from the profile at launch,
+	// so a global apply would move global state this repository never reads. When a
+	// pin wins, applying is repo-scoped: re-pin this clone and write no global
+	// routing, no materialized stores, and no orchestrator. The committed
+	// declaration is never rewritten behind a commit.
+	const pinResolution = options.global ? undefined : resolveProfilePin({ cwd, configHome: gentleAiConfigHome() });
+	if (pinResolution) {
+		const localPath = pinResolution.status.localPath;
+		try {
+			writeProfilePinSync(localPath, name);
+		} catch (error) {
+			return { status: "pin-failed", localPath, error };
+		}
+		return pinResolution.source === "repo" && pinResolution.path !== localPath
+			? { status: "pinned", localPath, shadowedDeclaration: { path: pinResolution.path, profile: pinResolution.profile } }
+			: { status: "pinned", localPath };
+	}
+	const normalized = normalizeModelConfig(file.profiles[name]) ?? {};
+	const orchestratorEntry = readProfileOrchestrator(normalized);
+	// Applying spans three files — the store, models.json, and Pi's global
+	// settings.json — and there is no cross-file rename, so order the writes to
+	// keep the store truthful and compensate on failure: claim the profile in
+	// the store first, then materialise routing, then the orchestrator. A claim
+	// that fails leaves routing untouched; anything that fails after the claim
+	// restores the previous claim and, when the previously active profile is
+	// known, the routing that profile implies.
+	const claimed = setActiveProfile(file, name);
+	try {
+		writeProfilesFileSync(path, claimed);
+	} catch (error) {
+		return { status: "claim-failed", error };
+	}
+	const previousActiveConfig: AgentModelConfig | undefined =
+		file.active !== undefined && hasOwnProfile(file.profiles, file.active)
+			? normalizeModelConfig(file.profiles[file.active]) ?? {}
+			: undefined;
+	// Set only when the orchestrator write succeeded, so the revert knows it has
+	// something to undo. A rollback closure (not a previous-bytes value) is used
+	// because "the file did not exist before" is a real state that must restore
+	// by removing the file, and `undefined` bytes cannot carry that distinction.
+	let orchestratorRollback: (() => void) | undefined;
+	const revertClaim = async (
+		stage: "models" | "materialize" | "orchestrator",
+		error: unknown,
+		routingWritten: boolean,
+	): Promise<ProfileApplyResult> => {
+		let restored = previousActiveConfig === undefined ? "" : "routing";
+		if (routingWritten && previousActiveConfig !== undefined) {
+			try {
+				await writeModelConfigAsync(cwd, previousActiveConfig);
+				// Materialize the previous profile again with the same
+				// replacement semantics, so the failed profile's routes do not
+				// linger in subagents.json or the agent frontmatter.
+				await applyModelConfigAsync(cwd, await withOmittedAgentsClearedAsync(cwd, previousActiveConfig));
+			} catch {
+				restored = "";
+			}
+		}
+		if (orchestratorRollback) {
+			try {
+				orchestratorRollback();
+				restored = restored === "" ? "settings" : `${restored} and settings`;
+			} catch {
+				restored = restored === "" ? "" : restored;
+			}
+		}
+		try {
+			writeProfilesFileSync(path, file);
+			restored = restored === "" ? "active marker" : `${restored} and active marker`;
+		} catch {
+			restored = restored === "" ? "nothing" : restored;
+		}
+		return {
+			status: "failed",
+			stage,
+			error,
+			restored,
+			...(routingWritten && previousActiveConfig === undefined
+				? { unrestoredModelsPath: modelConfigPath(cwd) }
+				: {}),
+		};
+	};
+	try {
+		await writeModelConfigAsync(cwd, normalized);
+	} catch (error) {
+		return revertClaim("models", error, false);
+	}
+	// models.json holds the profile as written; the padding with clear
+	// entries only drives materialization, so agents the profile omits
+	// return to inherit instead of keeping a previously materialized route.
+	let applyResult: { updated: number; skipped: number };
+	try {
+		applyResult = await applyModelConfigAsync(cwd, await withOmittedAgentsClearedAsync(cwd, normalized));
+	} catch (error) {
+		return revertClaim("materialize", error, true);
+	}
+	let orchestrator: { entry: AgentRoutingEntry; writtenTo?: string } | undefined;
+	if (orchestratorEntry !== undefined) {
+		const settingsPath = orchestratorSettingsPath();
+		const written = applyOrchestratorSettings(settingsPath, orchestratorEntry);
+		if (written.status === "invalid") return revertClaim("orchestrator", written.reason, true);
+		if (written.status === "written") {
+			const previous = written.previous;
+			orchestratorRollback = () => restoreOrchestratorSettings(settingsPath, previous);
+			orchestrator = { entry: orchestratorEntry, writtenTo: settingsPath };
+		} else orchestrator = { entry: orchestratorEntry };
+	}
+	// A pin that does not resolve changes nothing at launch, so the global apply
+	// above is what governs this repository.
+	const pinEvaluation = evaluateProfilePin(readProfilePinStatus(cwd), file.profiles);
+	return {
+		status: "applied",
+		file: claimed,
+		updated: applyResult.updated,
+		...(orchestrator === undefined ? {} : { orchestrator }),
+		unresolvedPin: pinEvaluation.stale.length > 0 || pinEvaluation.invalid.length > 0,
+	};
+}
