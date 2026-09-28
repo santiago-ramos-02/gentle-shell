@@ -1,0 +1,71 @@
+name: T3 fork release
+
+# Publishes a release of this fork for every new commit on main, versioned as
+# the package version plus the fork commit, such as 3.7.0-t3.232bfd4. Pi
+# installs a release straight from its tag, so the release is the tag and its
+# install notes. main gets upstream's changes from scripts/t3-update.ps1, which
+# merges them and pushes.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: t3-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: meta
+        name: Resolve version
+        run: |
+          version="$(node -p 'require("./package.json").version')-t3.$(git rev-parse --short=7 HEAD)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" > /dev/null 2>&1; then echo "exists=true" >> "$GITHUB_OUTPUT"; fi
+
+      - if: steps.meta.outputs.exists != 'true'
+        uses: pnpm/action-setup@v4
+
+      - if: steps.meta.outputs.exists != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - if: steps.meta.outputs.exists != 'true'
+        name: Check the fork's additions
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          node scripts/build-runtime-modules.mjs --check
+          node scripts/check-types.mjs
+          node --experimental-strip-types --test tests/gentle-pi-api.test.ts tests/model-routing-authority.test.ts tests/profile-pin.test.ts tests/profiles-orchestrator.test.ts tests/agent-profiles.test.ts
+
+      - if: steps.meta.outputs.exists != 'true'
+        name: Publish
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          gentle-pi from upstream main as of $(git log -1 --format=%cs), plus this fork's API that T3 Code uses to manage profiles and persona.
+
+          **Install in Pi,** replacing any other gentle-pi:
+
+          \`\`\`
+          pi remove npm:gentle-pi
+          pi install git:github.com/${GITHUB_REPOSITORY}
+          \`\`\`
+
+          \`pi update\` then keeps it on the newest release of this fork. To stay on this one instead, install \`git:github.com/${GITHUB_REPOSITORY}@v${VERSION}\`. To go back to the official package, \`pi remove git:github.com/${GITHUB_REPOSITORY}\` and \`pi install npm:gentle-pi\`.
+          EOF
+          gh release create "v$VERSION" --target "$GITHUB_SHA" \
+            --title "gentle-pi $VERSION" --notes-file notes.md --latest
