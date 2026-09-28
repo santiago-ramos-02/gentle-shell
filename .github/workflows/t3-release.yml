@@ -3,8 +3,7 @@ name: T3 fork release
 # Publishes a release of this fork for every new commit on main, versioned as
 # the package version plus the fork commit, such as 3.7.0-t3.232bfd4. Pi
 # installs a release straight from its tag, so the release is the tag and its
-# install notes. main gets upstream's changes from scripts/t3-update.ps1, which
-# merges them and pushes.
+# install notes. main gets upstream's changes from t3-sync.yml.
 on:
   push:
     branches: [main]

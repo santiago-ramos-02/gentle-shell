@@ -1,0 +1,69 @@
+name: T3 fork sync
+
+# Merges upstream main into this fork's main every few hours, regenerates the
+# runtime modules the fork's API loads, checks the fork's additions, and pushes,
+# which publishes a release (t3-release.yml) and is what `pi update` installs.
+# Merging (never rebasing) keeps main pushable without a force push. A conflict
+# or a failing check fails this run and leaves main as it was.
+#
+# Needs a SYNC_TOKEN secret: a token with the repo and workflow scopes. The
+# built-in token cannot push upstream's workflow changes, and its pushes would
+# not start the release.
+on:
+  schedule:
+    - cron: "47 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: t3-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - id: merge
+        name: Merge upstream main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --quiet https://github.com/Gentleman-Programming/gentle-shell.git main
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "Already up to date with upstream."
+            exit 0
+          fi
+          git merge --no-edit -m "chore(fork): sync upstream" FETCH_HEAD
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      - if: steps.merge.outputs.merged == 'true'
+        uses: pnpm/action-setup@v4
+
+      - if: steps.merge.outputs.merged == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - if: steps.merge.outputs.merged == 'true'
+        name: Check and push
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          # Upstream changes to a library the API loads leave its generated module stale.
+          node scripts/build-runtime-modules.mjs --write
+          if [ -n "$(git status --porcelain runtime)" ]; then
+            git add runtime
+            git commit -m "chore(fork): regenerate runtime modules"
+          fi
+          node scripts/check-types.mjs
+          node --experimental-strip-types --test tests/gentle-pi-api.test.ts tests/model-routing-authority.test.ts tests/profile-pin.test.ts tests/profiles-orchestrator.test.ts tests/agent-profiles.test.ts
+          git push origin HEAD:main
