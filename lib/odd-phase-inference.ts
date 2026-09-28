@@ -38,6 +38,9 @@ const CHECKING_COMMANDS: readonly RegExp[] = [
 	/^go\s+(test|build|vet)\b/,
 	/^cargo\s+(test|build|check|clippy)\b/,
 	/^make\b/,
+	// Waiting on or reading CI results verifies work; it is not exploration.
+	/^gh\s+pr\s+checks\b/,
+	/^gh\s+run\s+(view|watch|list)\b/,
 ];
 
 // Git listing flags that may take one non-flag argument (`--contains <rev>`)
@@ -51,7 +54,7 @@ const EXPLORING_COMMANDS: readonly RegExp[] = [
 	/^git\s+remote(\s+(-v|--verbose|show|get-url)\b.*)?$/,
 	/^git\s+(worktree|stash)\s+list\b/,
 	/^git\s+config\s+(--get|--get-all|--get-regexp|-l|--list)\b/,
-	/^gh\s+(pr|issue|run|repo|release)\s+(view|list|diff|checks|status)\b/,
+	/^gh\s+(pr|issue|repo|release)\s+(view|list|diff|status)\b/,
 	/^(ls|cat|head|tail|grep|egrep|rg|wc|pwd|tree|stat|file|which|type|readlink|realpath|dirname|basename|cut|uniq|tr|nl|column|strings|diff|cmp|od|xxd|hexdump|shasum|sha256sum|md5|md5sum|du|df|date|uname|whoami|ps|pgrep|lsof|jq|awk)\b/,
 	/^command\s+-v\b/,
 	/^(\[\[?|test)\s/,

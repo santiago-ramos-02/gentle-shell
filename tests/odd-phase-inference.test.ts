@@ -63,6 +63,22 @@ test("shell test, typecheck, lint, and build commands infer checking", () => {
 	assert.equal(inferOddPhase("powershell", { command: "npm test" }), "checking");
 });
 
+test("waiting on or reading CI results infers checking", () => {
+	for (const command of [
+		"gh pr checks 1511",
+		"gh pr checks 1511 --repo owner/name --watch --interval 20",
+		"sleep 30; gh pr checks 1511 --watch 2>&1 | tail -10",
+		"gh run watch 123",
+		"gh run view 123 --log-failed",
+		"gh run list --branch main",
+	]) {
+		assert.equal(inferOddPhase("bash", { command }), "checking", command);
+	}
+	for (const command of ["gh pr view 1511", "gh pr diff 1511", "gh issue list"]) {
+		assert.equal(inferOddPhase("bash", { command }), "exploring", command);
+	}
+});
+
 test("read-only shell inspection infers exploring", () => {
 	for (const command of [
 		"git status",
