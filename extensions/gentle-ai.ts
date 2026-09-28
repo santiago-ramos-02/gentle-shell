@@ -181,7 +181,7 @@ import {
 import { GentleAiElapsedTimingLedger } from "../lib/gentle-ai-elapsed-store.ts";
 import { renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
-import { BASE_REF_ACCEPTED_FORMS, CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, readCandidateContextManifestPage, resolveCanonicalCandidateBase, type CandidateView } from "../lib/review-candidate-view.ts";
+import { BASE_REF_ACCEPTED_FORMS, CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, readCandidateContextManifestPage, resolveCanonicalCandidateBase, isProviderCandidateBaseTree, type CandidateView } from "../lib/review-candidate-view.ts";
 import {
 	GentleAiDevBinaryOverrideError,
 	GENTLE_AI_INSTALL_RECOVERY_COMMAND,
@@ -4861,7 +4861,7 @@ function nativeStartRejection(reason: string, field?: string): Record<string, un
 							? "native-start-committed-only-required"
 							: reason === "committed-only-invalid"
 								? "native-start-committed-only-invalid"
-								: reason === "unknown-field" || reason === "focus-invalid" || reason === "untracked-selection-invalid"
+								: reason === "unknown-field" || reason === "focus-invalid" || reason === "untracked-selection-invalid" || reason === "provider-base-offer-invalid" || reason === "provider-base-tree-mismatch"
 									? "native-start-input-invalid"
 									: "native-start-policy-path-invalid",
 		reason,
@@ -5223,18 +5223,26 @@ function consentBindingRepositoryMismatchOutcome(operation: ReviewControllerOper
 // wants, so a plain START can adopt the route the provider just rendered
 // instead of making the caller hand-copy `base-ref` into its input. Only the
 // provider's own offered argument is read -- never a guess, a persisted value,
-// or a stale transition -- and anything that is not a full commit id paired
-// with committed-only is refused, so every other STATUS keeps today's
-// behaviour byte-for-byte.
+// or a stale transition. Full object ids paired with committed-only may name
+// commits or trees; only provider trees enter the separate frozen tree-base
+// path. Caller-supplied tree selectors remain invalid.
+// The worktree anchor is always a commit, but a provider-offered range can
+// have a tree selector. Transport and lineage replay must use the latter.
+function nativeCommittedRangeSelector(target: { baseCommit: string; providerBaseTree?: string }): string {
+	return target.providerBaseTree ?? target.baseCommit;
+}
+
 const OFFERED_COMMITTED_RANGE_BASE_REF = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
 function offeredCommittedRangeBaseRef(target: ReviewStatusV3): string | undefined {
 	const execute = target.nextTransition?.kind === "execute" ? target.nextTransition.execute : undefined;
 	if (execute?.operation !== "review.start") return undefined;
-	if (execute.arguments.some((argument) => argument.name === "workspace-overlay")) return undefined;
-	const baseRef = execute.arguments.find((argument) => argument.name === "base-ref")?.value;
-	if (baseRef === undefined || !OFFERED_COMMITTED_RANGE_BASE_REF.test(baseRef)) return undefined;
-	if (execute.arguments.find((argument) => argument.name === "committed-only")?.value !== "true") return undefined;
+	const selectors = execute.arguments.filter((argument) => argument.name === "base-ref" || argument.name === "committed-only");
+	if (selectors.length !== 2 || new Set(selectors.map((argument) => argument.name)).size !== 2) return undefined;
+	if (selectors.some((argument) => argument.token !== undefined && argument.token !== `--${argument.name}=${argument.value}`)) return undefined;
+	const baseRef = selectors.find((argument) => argument.name === "base-ref")!.value;
+	if (!OFFERED_COMMITTED_RANGE_BASE_REF.test(baseRef)) return undefined;
+	if (selectors.find((argument) => argument.name === "committed-only")!.value !== "true") return undefined;
 	return baseRef;
 }
 
@@ -6733,6 +6741,9 @@ function hydrateDispatchBindingFromStatus(candidateViews: CandidateViewRegistry 
 	const lenses = pendingReviewerLenses(status);
 	if (lenses.length === 0) return undefined;
 	try {
+		// STATUS proves the current target, not the historical START offer.
+		// Resolve an existing commit-backed range by its reachable frozen tree;
+		// never pass descriptor.baseTree as a provider-owned tree selector.
 		candidateViews.restoreCurrentForDispatchFromNative(lineageId, contributorRoot, status.projection, lenses);
 		return { hydrated: true, lineage_id: lineageId, lenses };
 	} catch (error) {
@@ -7021,7 +7032,7 @@ async function executeReviewControllerOperation(
 		const statusRequest = {
 			cwd: defaultCwd,
 			lineageId: String(input.predecessorLineage),
-			...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit, committedOnly: true } : {}),
+			...(frozenTarget?.committedOnly === true ? { baseRef: nativeCommittedRangeSelector(frozenTarget), committedOnly: true } : {}),
 			...(signal === undefined ? {} : { signal }),
 		};
 		let status: ReviewStatusV3;
@@ -7095,11 +7106,11 @@ async function executeReviewControllerOperation(
 		const frozenTarget = parameters.lineageId === undefined || !candidateViews?.hasProjection(parameters.lineageId, defaultCwd) ? undefined : candidateViews.resolveProjection(parameters.lineageId, defaultCwd);
 		let status: ReviewStatusV3;
 		try {
-			status = await nativeReviewCli.targetStatus({ cwd: defaultCwd, ...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }), ...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit, committedOnly: true } : {}), ...(signal === undefined ? {} : { signal }) });
+			status = await nativeReviewCli.targetStatus({ cwd: defaultCwd, ...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }), ...(frozenTarget?.committedOnly === true ? { baseRef: nativeCommittedRangeSelector(frozenTarget), committedOnly: true } : {}), ...(signal === undefined ? {} : { signal }) });
 		} catch (error) {
 			return nativeStatusFailed(parameters.operation, error);
 		}
-		clearRetainedNativeStatusSelectionsOnTerminal(retainedUntrackedSelections, defaultCwd, status.authority?.lineageId, status.authority?.state); retainNativeCaptureRoutes(retainedUntrackedSelections, defaultCwd, status, frozenTarget?.committedOnly === true ? frozenTarget.baseCommit : undefined);
+		clearRetainedNativeStatusSelectionsOnTerminal(retainedUntrackedSelections, defaultCwd, status.authority?.lineageId, status.authority?.state); retainNativeCaptureRoutes(retainedUntrackedSelections, defaultCwd, status, frozenTarget?.committedOnly === true ? nativeCommittedRangeSelector(frozenTarget) : undefined);
 		if (status.authority?.version === "compact-v2") return { operation: parameters.operation, repaired: false, compact_authority: "immutable-untouched", status: mapNativeTargetStatus(parameters.operation, status, parameters.lineageId) };
 		if (status.authority?.version !== "legacy-v1") return mapNativeTargetStatus(parameters.operation, status, parameters.lineageId);
 		const store = ReviewTransactionStore.forRepository(defaultCwd);
@@ -7139,7 +7150,7 @@ async function executeReviewControllerOperation(
 		const target = {
 			cwd: defaultCwd,
 			lineageId: parameters.lineageId,
-			...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit, committedOnly: true } : {}),
+			...(frozenTarget?.committedOnly === true ? { baseRef: nativeCommittedRangeSelector(frozenTarget), committedOnly: true } : {}),
 			...readRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId),
 			...(signal === undefined ? {} : { signal }),
 		};
@@ -7319,7 +7330,7 @@ async function executeReviewControllerOperation(
 			if (value.mutationOutcome === "none") pending.cleanupCandidate();
 			return await reconcileNativeMutationFailure(parameters.operation, error, nativeReviewCli, {
 				cwd: pending.authorityCwd,
-				...(pending.candidateView.committedOnly ? { baseRef: pending.candidateView.baseCommit, committedOnly: true } : {}),
+				...(pending.candidateView.committedOnly ? { baseRef: nativeCommittedRangeSelector(pending.candidateView), committedOnly: true } : {}),
 				projection: "workspace",
 			}, retainedUntrackedSelections);
 		}
@@ -7384,6 +7395,7 @@ async function executeReviewControllerOperation(
 						)
 					: undefined;
 			let canonicalBaseRef: string | undefined;
+			let providerBaseTree: string | undefined;
 			if (baseRef !== undefined) {
 				try {
 					canonicalBaseRef = resolveCanonicalCandidateBase(defaultCwd, baseRef).commit;
@@ -7459,7 +7471,7 @@ async function executeReviewControllerOperation(
 				target = negotiated.status!;
 				// gentle-pi#874: the STATUS this START already fetched can itself
 				// offer the committed-range START for an empty workspace candidate.
-				// Adopt its own base commit *here*, before the candidate view and the
+				// Adopt its own base selector *here*, before the candidate view and the
 				// native START are resolved, and re-derive the target for that range,
 				// so all three agree on one base-diff identity. Adopting the offer
 				// later left the workspace target and the base-diff candidate view
@@ -7471,6 +7483,7 @@ async function executeReviewControllerOperation(
 				// the base-less view that tripped candidate-target-projection-drift.
 				if (canonicalBaseRef === undefined) {
 					const offeredBaseRef = offeredCommittedRangeBaseRef(target);
+					if (offeredBaseRef === undefined && target.nextTransition?.kind === "execute" && target.nextTransition.execute.operation === "review.start" && target.nextTransition.execute.arguments.some((argument) => argument.name === "base-ref")) return nativeStartRejection("provider-base-offer-invalid");
 					if (offeredBaseRef !== undefined) {
 						const renegotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
 							cwd: defaultCwd,
@@ -7482,7 +7495,12 @@ async function executeReviewControllerOperation(
 							...(signal === undefined ? {} : { signal }),
 						}, retainedUntrackedSelections, defaultCwd);
 						if (renegotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, renegotiated.transport);
-						canonicalBaseRef = offeredBaseRef;
+						if (isProviderCandidateBaseTree(defaultCwd, offeredBaseRef)) {
+							if (renegotiated.status!.projection.baseTree !== offeredBaseRef) return nativeStartRejection("provider-base-tree-mismatch");
+							providerBaseTree = offeredBaseRef;
+						} else {
+							canonicalBaseRef = offeredBaseRef;
+						}
 						target = renegotiated.status!;
 					}
 				}
@@ -7513,7 +7531,7 @@ async function executeReviewControllerOperation(
 			// recovery. Folding in currentCandidateTree makes a content change
 			// mint a fresh replay key -- and therefore a fresh candidate view --
 			// instead of reusing the stale one.
-			const replayKey = JSON.stringify({ cwd: defaultCwd, lineageId: parameters.lineageId ?? null, input: parameters.input ?? null, inputPath: parameters.inputPath ?? null, candidateTree: target.projection.currentCandidateTree });
+			const replayKey = JSON.stringify({ cwd: defaultCwd, lineageId: parameters.lineageId ?? null, input: parameters.input ?? null, inputPath: parameters.inputPath ?? null, candidateTree: target.projection.currentCandidateTree, providerBaseTree: providerBaseTree ?? null });
 			// Synchronously drop any binding whose TTL has already elapsed
 			// before reusing its retained candidate view, so a fresh-candidate
 			// retry cannot reuse a view tied to an expired binding and trip
@@ -7524,7 +7542,7 @@ async function executeReviewControllerOperation(
 			let candidateView: ReturnType<CandidateViewRegistry["create"]> | undefined;
 			let nativeStartAttempted = false;
 			try {
-				const candidateRequest = { contributorRoot: defaultCwd, replayKey, ...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef, committedOnly: true }) };
+				const candidateRequest = { contributorRoot: defaultCwd, replayKey, ...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef, committedOnly: true }), ...(providerBaseTree === undefined ? {} : { providerBaseTree, committedOnly: true }) };
 				candidateView = candidateViews?.createOrReuse({ ...candidateRequest, intendedUntracked: candidateIntendedUntracked });
 				if (candidateView !== undefined) assertNativeStartCandidateBinding(candidateView, target);
 				let result: NativeStartResult;
@@ -7535,6 +7553,7 @@ async function executeReviewControllerOperation(
 						...(canonicalBaseRef === undefined
 							? {}
 							: { baseRef: candidateView?.baseCommit ?? canonicalBaseRef, committedOnly: true }),
+						...(providerBaseTree === undefined ? {} : { baseRef: providerBaseTree, committedOnly: true }),
 						targetIdentity: target.targetIdentity,
 						projection: target.projection.projection,
 						...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
@@ -7624,6 +7643,7 @@ async function executeReviewControllerOperation(
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(canonicalBaseRef === undefined ? {} : { baseRef: candidateView?.baseCommit ?? canonicalBaseRef, committedOnly: true }),
+					...(providerBaseTree === undefined ? {} : { baseRef: providerBaseTree, committedOnly: true }),
 					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
 					projection: "workspace",
 				}, retainedUntrackedSelections);
@@ -7731,7 +7751,7 @@ async function executeReviewControllerOperation(
 		const retainedCommittedTarget = rawStatus === undefined && parameters.lineageId !== undefined && candidateViews?.hasProjection(parameters.lineageId, defaultCwd)
 			? candidateViews.resolveProjection(parameters.lineageId, defaultCwd)
 			: undefined;
-		const effectiveBaseRef = baseRef ?? (retainedCommittedTarget?.committedOnly === true ? retainedCommittedTarget.baseCommit : undefined);
+		const effectiveBaseRef = baseRef ?? (retainedCommittedTarget?.committedOnly === true ? nativeCommittedRangeSelector(retainedCommittedTarget) : undefined);
 		if (nativeReviewCli?.targetStatus !== undefined) {
 			try {
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {

@@ -497,6 +497,10 @@ Contract `/v2` replaces the Base64 `candidate_diff` reviewer transport of `/v1` 
 
 Target status owns `current_target`, `unrelated`, `ambiguous`, and `corrupted` applicability and returns one native action. Pi does not reconstruct ordinary authority from provider-private files or choose a lineage from repository-wide history. Restart recovery rebuilds only the derived candidate view from the native Git/content projection, including intended-untracked paths, symlinks, and immutable gitlink identities. Native failure envelopes retain their exact mutation outcome, replayability, required inputs, request digest, and next action. After an unknown or lost mutating result, Pi calls target status before any replay decision and returns only the provider-declared action.
 
+Candidate views materialize tracked Git symlinks from their frozen blobs even when `core.symlinks=false`, including unchanged links outside the changed scope. Unsafe targets fail before any link is created; a host without native symlink capability fails closed with `symlink-materialization-failed`. Pi does not alter the contributor's Git configuration or install symlink privileges.
+
+On POSIX, if START rejects a group- or world-accessible `.git/gentle-ai/candidate-views` parent, Pi reports `candidate-owner-parent-privacy` before native START. Inspect that parent's ownership and permissions and correct them out of band before retrying; Pi does not change them automatically. Other owner-preparation failures retain a generic diagnostic rather than exposing filesystem errors.
+
 Once the source checkout's pinned gentle-ai runtime (currently v3.7.0) has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
 
 ### FINALIZE wrapper input
