@@ -5,7 +5,8 @@
 	"license": "MIT",
 	"type": "module",
 	"bin": {
-		"gentle-shell": "bin/gentle-shell.mjs"
+		"gentle-shell": "bin/gentle-shell.mjs",
+		"gentle-pi-api": "bin/gentle-pi-api.mjs"
 	},
 	"keywords": [
 		"pi-package",
