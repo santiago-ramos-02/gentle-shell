@@ -131,9 +131,15 @@ test("technical reference declares the tested Pi minimum required for agent_sett
 	assert.match(readFileSync(join(PACKAGE_ROOT, "README.md"), "utf8"), /\]\(docs\/readme-reference\.md(?:#[^)]+)?\)/);
 });
 
-test("packed runtime declares its pi-ai compat import as a direct exact dependency", () => {
+// Pi supplies these to extensions and warns when a package installs its own copy, which
+// npm can hoist over the host's. A plain npm install still gets them as peers.
+test("host-provided Pi modules are peers, never installed copies", () => {
 	const manifest = readPackageJson();
-	assert.equal(manifest.dependencies?.["@earendil-works/pi-ai"], "0.87.1");
+	for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-tui"]) {
+		assert.equal(manifest.dependencies?.[name], undefined, `${name} must not be a dependency`);
+		assert.equal(manifest.peerDependencies?.[name], "*", `${name} must be a "*" peer`);
+		assert.equal(manifest.devDependencies?.[name], "0.87.1", `${name} stays pinned for tests`);
+	}
 });
 
 test("package manifest has no obsolete native activation build surface", () => {
