@@ -170,6 +170,45 @@ function isDirectory(path) {
 	}
 }
 
+// Reuse Herdr's managed bridge, never its transport. This process-boundary
+// lookup is deliberately best-effort and does not modify either agent home.
+function managedHerdrExtensionArgs(home, args) {
+	const env = process.env;
+	if (home.mode !== "isolated" || args.piSubcommand !== undefined || args.passthrough[0] === "mcp") return [];
+	if (env.HERDR_ENV !== "1" || !env.HERDR_SOCKET_PATH?.trim() || !env.HERDR_PANE_ID?.trim()) return [];
+	if (env.GENTLE_PI_AGENTS_CHILD === "1" || !process.stdin.isTTY || !process.stdout.isTTY) return [];
+	// Only automatic interactive loading: a user opt-out must not become an
+	// explicit -e (which Pi loads even under --no-extensions). Conservatively
+	// skip ambiguous mode flags too; --mode text alone still allows a TUI.
+	const forwarded = args.passthrough;
+	if (forwarded.some((arg) => ["--no-extensions", "-ne", "--print", "-p", "--export", "--list-models", "-v"].includes(arg))) return [];
+	if (forwarded.some((arg, i) => (arg === "--mode" && forwarded[i + 1] !== "text") || arg.startsWith("--mode="))) return [];
+	try {
+		if (!statSync(env.HERDR_SOCKET_PATH).isSocket()) return [];
+	} catch {
+		return [];
+	}
+	// Prefer a bridge in the selected home over adding a competing copy; keep
+	// the incoming Pi home override before falling back to Herdr's usual home.
+	const agentHomes = [home.dir, env.PI_CODING_AGENT_DIR, join(homedir(), ".pi", "agent")];
+	for (const agentHome of agentHomes) {
+		if (!agentHome) continue;
+		const bridge = join(agentHome, "extensions", "herdr-agent-state.ts");
+		try {
+			if (!statSync(bridge).isFile()) continue;
+			accessSync(bridge, fsConstants.R_OK);
+			// Pi's package-manager.toResolvedPaths and resource-loader.mergePaths
+			// dedupe canonical files across discovery, explicit -e and manifests.
+			// Existence alone is NOT proof of loading: declare the resource and
+			// let that resolver dedupe it, including explicit aliases from argv.
+			return ["-e", realpathSync(bridge)];
+		} catch {
+			// An absent/unreadable bridge never prevents the ordinary launch.
+		}
+	}
+	return [];
+}
+
 // Real-fs adapter for discoverLooseExtensionEntries (lib/gentle-shell-launcher.ts):
 // statSync-based isFile/isDirectory (not readdirSync's Dirent, which uses
 // lstat and so would treat a symlinked file or directory as neither) so a
@@ -1236,7 +1275,7 @@ async function main() {
 		takeOver,
 		otherPackagePaths,
 		looseExtensionEntries,
-		passthrough: args.passthrough,
+		passthrough: [...managedHerdrExtensionArgs(home, args), ...args.passthrough],
 		piSubcommand: args.piSubcommand,
 		baseEnv: process.env,
 	});

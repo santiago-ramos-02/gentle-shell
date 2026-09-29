@@ -106,6 +106,133 @@ function run(env: NodeJS.ProcessEnv, args: string[], options: { cwd?: string } =
 	return spawnSync(process.execPath, [binPath, ...args], { encoding: "utf8", env, ...options });
 }
 
+// Herdr tests model terminal/socket metadata only: no socket is opened and the
+// real managed bridge is never imported. The fake pi records launch resources.
+function herdrFixture(t: test.TestContext) {
+	const f = fixture(t);
+	const bridge = join(f.home, ".pi", "agent", "extensions", "herdr-agent-state.ts");
+	mkdirSync(dirname(bridge), { recursive: true });
+	writeFileSync(bridge, "export default function () {}\n");
+	const socket = join(f.root, "mock-herdr.sock");
+	const preload = join(f.root, "terminal-and-socket.cjs");
+	writeFileSync(preload, [
+		"const fs = require('node:fs');",
+		"const { syncBuiltinESMExports } = require('node:module');",
+		"const originalStat = fs.statSync;",
+		"fs.statSync = (path, ...args) => path === process.env.HERDR_SOCKET_PATH",
+		"  ? { isSocket: () => process.env.TEST_SOCKET_VALID === '1' } : originalStat(path, ...args);",
+		"process.stdin.isTTY = process.env.TEST_STDIN_TTY === '1';",
+		"process.stdout.isTTY = process.env.TEST_STDOUT_TTY === '1';",
+		"require('node:net').createConnection = () => { throw new Error('Live socket forbidden'); };",
+		"syncBuiltinESMExports();",
+	].join("\n"));
+	const env: NodeJS.ProcessEnv = {
+		...f.env,
+		HERDR_ENV: "1", HERDR_SOCKET_PATH: socket, HERDR_PANE_ID: "mock-pane",
+		TEST_SOCKET_VALID: "1", TEST_STDIN_TTY: "1", TEST_STDOUT_TTY: "1",
+	};
+	delete env.GENTLE_PI_AGENTS_CHILD;
+	// Keep parent agent-home inheritance out of every portable test fixture.
+	delete env.PI_CODING_AGENT_DIR;
+	const launch = (args: string[] = [], overrides: NodeJS.ProcessEnv = {}) => {
+		const result = spawnSync(process.execPath, ["--require", preload, binPath, ...args], {
+			encoding: "utf8", env: { ...env, ...overrides }, cwd: f.root,
+		});
+		assert.equal(result.status, 0, result.stderr);
+		return JSON.parse(result.stdout).args as string[];
+	};
+	return { ...f, bridge, env, launch };
+}
+
+function extensionPaths(args: string[]): string[] {
+	return args.flatMap((arg, i) => arg === "-e" || arg === "--extension" ? [args[i + 1]] : []);
+}
+
+test("Herdr isolated TUI launch explicitly loads the canonical managed bridge", (t) => {
+	const f = herdrFixture(t);
+	assert.ok(extensionPaths(f.launch()).includes(realpathSync(f.bridge)));
+	assert.equal(readFileSync(f.bridge, "utf8"), "export default function () {}\n");
+});
+
+test("Herdr prefers the incoming agent-home bridge and falls back to the conventional home", (t) => {
+	const f = herdrFixture(t);
+	const previousHome = join(f.root, "previous-agent");
+	const previousBridge = join(previousHome, "extensions", "herdr-agent-state.ts");
+	mkdirSync(dirname(previousBridge), { recursive: true });
+	writeFileSync(previousBridge, "export default function () {}\n");
+	const previousPaths = extensionPaths(f.launch([], { PI_CODING_AGENT_DIR: previousHome }));
+	assert.ok(previousPaths.includes(realpathSync(previousBridge)));
+	assert.ok(!previousPaths.includes(realpathSync(f.bridge)));
+	assert.ok(extensionPaths(f.launch([], { PI_CODING_AGENT_DIR: f.gentleShellHome })).includes(realpathSync(f.bridge)));
+	const selectedBridge = join(f.gentleShellHome, "extensions", "herdr-agent-state.ts");
+	mkdirSync(dirname(selectedBridge), { recursive: true });
+	writeFileSync(selectedBridge, "export default function () {}\n");
+	const selectedPaths = extensionPaths(f.launch([], { PI_CODING_AGENT_DIR: previousHome }));
+	assert.ok(selectedPaths.includes(realpathSync(selectedBridge)));
+	assert.ok(!selectedPaths.includes(realpathSync(previousBridge)));
+	assert.ok(!selectedPaths.includes(realpathSync(f.bridge)));
+});
+
+test("Herdr bridge injection respects disabled extensions, headless modes and child launches", (t) => {
+	const f = herdrFixture(t);
+	for (const args of [["--no-extensions"], ["-ne"], ["-p", "prompt"], ["--print", "prompt"],
+		["--mode", "rpc"], ["--mode", "json"], ["--export", "session.jsonl"], ["--list-models"],
+		["--link"], ["--home", f.gentleShellHome], ["list"]]) {
+		assert.ok(!extensionPaths(f.launch(args)).includes(realpathSync(f.bridge)), JSON.stringify(args));
+	}
+	for (const overrides of [{ HERDR_ENV: "0" }, { HERDR_ENV: undefined }, { HERDR_PANE_ID: "" },
+		{ HERDR_SOCKET_PATH: "" }, { TEST_SOCKET_VALID: "0" }, { TEST_STDIN_TTY: "0" },
+		{ TEST_STDOUT_TTY: "0" }, { GENTLE_PI_AGENTS_CHILD: "1" }]) {
+		assert.ok(!extensionPaths(f.launch([], overrides)).includes(realpathSync(f.bridge)), JSON.stringify(overrides));
+	}
+	assert.ok(extensionPaths(f.launch(["--mode", "text"])).includes(realpathSync(f.bridge)));
+});
+
+test("Herdr absent bridge is nonfatal and explicit resources are preserved", (t) => {
+	const f = herdrFixture(t);
+	const absentHome = join(f.root, "empty-home");
+	mkdirSync(absentHome);
+	assert.ok(!extensionPaths(f.launch([], { HOME: absentHome, USERPROFILE: absentHome })).includes(realpathSync(f.bridge)));
+	const alias = join(f.root, "bridge-alias.ts");
+	symlinkSync(f.bridge, alias);
+	const args = f.launch(["-e", alias]);
+	assert.ok(extensionPaths(args).includes(alias));
+	assert.ok(extensionPaths(args).includes(realpathSync(f.bridge)));
+	const disabled = f.launch(["--no-extensions", "-e", alias]);
+	assert.ok(extensionPaths(disabled).includes(alias));
+	assert.ok(!extensionPaths(disabled).includes(realpathSync(f.bridge)));
+});
+
+test("Pi real resource loader deduplicates the bridge across discovery, explicit files and package directories", async (t) => {
+	const { DefaultResourceLoader, SettingsManager, createEventBus } = await import("@earendil-works/pi-coding-agent");
+	for (const scenario of ["discovered", "explicit", "directory"] as const) {
+		const f = fixture(t);
+		const agentDir = join(f.home, ".pi", "agent");
+		const bridge = join(agentDir, "extensions", "herdr-agent-state.ts");
+		mkdirSync(dirname(bridge), { recursive: true });
+		writeFileSync(bridge, "export default function (pi) { pi.events.emit('mock:bridge-loaded', {}); }\n");
+		const canonical = realpathSync(bridge);
+		const alias = join(f.root, "alias.ts");
+		symlinkSync(bridge, alias);
+		writeFileSync(join(agentDir, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions/herdr-agent-state.ts"] } }));
+		const eventBus = createEventBus();
+		let factoryCalls = 0;
+		eventBus.on("mock:bridge-loaded", () => { factoryCalls++; });
+		const additionalExtensionPaths = scenario === "explicit" ? [alias, canonical, canonical]
+			: scenario === "directory" ? [agentDir, canonical] : [canonical];
+		const loader = new DefaultResourceLoader({ cwd: f.root, agentDir, eventBus,
+			settingsManager: SettingsManager.inMemory({ extensions: ["-builtin:mcp", "-builtin:llama.cpp", "-builtin:codemode", "-builtin:tool-search"] }),
+			additionalExtensionPaths, noExtensions: scenario !== "discovered", noSkills: true,
+			noPromptTemplates: true, noThemes: true, noContextFiles: true,
+		});
+		await loader.reload();
+		const loaded = loader.getExtensions();
+		assert.deepEqual(loaded.errors, [], scenario);
+		assert.equal(loaded.extensions.length, 1, scenario);
+		assert.equal(factoryCalls, 1, scenario);
+	}
+});
+
 // Test/development-only stub for the setup subcommand's gentle-ai binary:
 // records its argv and the environment gentle-shell sets around it, instead
 // of running the real package-local gentle-ai (whose supply-chain integrity

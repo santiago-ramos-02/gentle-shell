@@ -1682,6 +1682,7 @@ function evaluateSensitivePathTool(
 }
 
 const ASK_USER_CHOICE_BLOCKED_EVENT = "gentle-pi:ask-user-choice:blocked";
+const ASK_USER_QUESTION_BLOCKED_EVENT = "gentle-pi:ask-user-question:blocked";
 
 const HERDR_BLOCKER_LABEL = {
 	CHOICE: "Choice awaiting input",
@@ -1699,17 +1700,20 @@ type HerdrConfirmationLifecycle = {
 function createHerdrConfirmationLifecycle(events: ExtensionAPI["events"]): HerdrConfirmationLifecycle {
 	let pending = 0;
 	let choiceActive = false;
-	let questionnaireActive = false;
+	let nativeQuestionnaireActive = false;
+	let legacyQuestionnaireActive = false;
 	let emittedLabel: HerdrBlockerLabel | undefined;
 	const emitEffectiveBlocker = (): void => {
 		const nextLabel = choiceActive
 			? HERDR_BLOCKER_LABEL.CHOICE
-			: questionnaireActive
+			: nativeQuestionnaireActive || legacyQuestionnaireActive
 				? HERDR_BLOCKER_LABEL.QUESTIONNAIRE
 				: pending > 0
 					? HERDR_BLOCKER_LABEL.GUARDED_CONFIRMATION
 					: undefined;
-		if (nextLabel === emittedLabel) return;
+		// Herdr bridges count active/inactive edges. Keep the first label until
+		// every source releases; relabel activations would leak a blocked count.
+		if ((nextLabel === undefined) === (emittedLabel === undefined)) return;
 		emittedLabel = nextLabel;
 		if (nextLabel === undefined) events.emit("herdr:blocked", { active: false });
 		else events.emit("herdr:blocked", { active: true, label: nextLabel });
@@ -1721,9 +1725,15 @@ function createHerdrConfirmationLifecycle(events: ExtensionAPI["events"]): Herdr
 		emitEffectiveBlocker();
 	});
 
+	events?.on?.(ASK_USER_QUESTION_BLOCKED_EVENT, (event) => {
+		if (!isRecord(event) || typeof event.active !== "boolean" || event.active === nativeQuestionnaireActive) return;
+		nativeQuestionnaireActive = event.active;
+		emitEffectiveBlocker();
+	});
+
 	events?.on?.("rpiv:ask-user:blocked", (event) => {
-		if (!isRecord(event) || typeof event.active !== "boolean" || event.active === questionnaireActive) return;
-		questionnaireActive = event.active;
+		if (!isRecord(event) || typeof event.active !== "boolean" || event.active === legacyQuestionnaireActive) return;
+		legacyQuestionnaireActive = event.active;
 		emitEffectiveBlocker();
 	});
 
