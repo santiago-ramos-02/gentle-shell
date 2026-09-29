@@ -39,7 +39,15 @@ interface PrivateEditor {
 }
 
 const SUPPORTED_VERSIONS = new Set(["0.85.1", "0.87.1"]);
-const importedTuiMetadata: unknown = createRequire(import.meta.url)("@earendil-works/pi-tui/package.json");
+// Pi provides pi-tui to extensions through its loader, so there may be no copy on disk
+// beside this package; an unknown version keeps vim editing off (fail closed).
+const importedTuiMetadata: unknown = (() => {
+	try {
+		return createRequire(import.meta.url)("@earendil-works/pi-tui/package.json");
+	} catch {
+		return undefined;
+	}
+})();
 const IMPORTED_TUI_VERSION = typeof importedTuiMetadata === "object" && importedTuiMetadata !== null &&
   "version" in importedTuiMetadata ? importedTuiMetadata.version : undefined;
 
