@@ -1,7 +1,7 @@
 name: T3 fork sync
 
-# Merges upstream main into this fork's main every few hours, regenerates the
-# runtime modules the fork's API loads, checks the fork's additions, and pushes,
+# Merges upstream main into this fork's main every few hours, rebuilds the
+# API's runtime (runtime-t3/), checks the fork's additions, and pushes,
 # which publishes a release (t3-release.yml) and is what `pi update` installs.
 # Merging (never rebasing) keeps main pushable without a force push. A conflict
 # or a failing check fails this run and leaves main as it was.
@@ -58,11 +58,11 @@ jobs:
         name: Check and push
         run: |
           pnpm install --frozen-lockfile --ignore-scripts
-          # Upstream changes to a library the API loads leave its generated module stale.
-          node scripts/build-runtime-modules.mjs --write
-          if [ -n "$(git status --porcelain runtime)" ]; then
-            git add runtime
-            git commit -m "chore(fork): regenerate runtime modules"
+          # Upstream changes to a library the API loads leave the API's runtime stale.
+          node scripts/t3-build-api.mjs --write
+          if [ -n "$(git status --porcelain runtime-t3)" ]; then
+            git add runtime-t3
+            git commit -m "chore(fork): rebuild the API runtime"
           fi
           node scripts/check-types.mjs
           node --experimental-strip-types --test tests/gentle-pi-api.test.ts tests/model-routing-authority.test.ts tests/profile-pin.test.ts tests/profiles-orchestrator.test.ts tests/agent-profiles.test.ts

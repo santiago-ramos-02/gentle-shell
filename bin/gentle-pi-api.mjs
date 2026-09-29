@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Process glue for the gentle-pi API (lib/gentle-pi-api.ts, built to
-// runtime/gentle-pi-api.mjs): `gentle-pi-api <method>` reads the parameters as
+// runtime-t3/gentle-pi-api.mjs): `gentle-pi-api <method>` reads the parameters as
 // JSON on stdin and writes newline-delimited JSON ending in one result or error
 // line, the same framing as `gentle-ai api`.
-import { runGentlePiApi } from "../runtime/gentle-pi-api.mjs";
+import { runGentlePiApi } from "../runtime-t3/gentle-pi-api.mjs";
 
 const SCHEMA = "gentle-pi.api/v1";
 

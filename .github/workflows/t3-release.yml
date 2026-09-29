@@ -45,7 +45,7 @@ jobs:
         name: Check the fork's additions
         run: |
           pnpm install --frozen-lockfile --ignore-scripts
-          node scripts/build-runtime-modules.mjs --check
+          node scripts/t3-build-api.mjs --check
           node scripts/check-types.mjs
           node --experimental-strip-types --test tests/gentle-pi-api.test.ts tests/model-routing-authority.test.ts tests/profile-pin.test.ts tests/profiles-orchestrator.test.ts tests/agent-profiles.test.ts
 
