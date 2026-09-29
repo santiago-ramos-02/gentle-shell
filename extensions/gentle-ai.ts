@@ -56,6 +56,7 @@ import {
 	updateFrontmatterRouting,
 	readEffectiveModelConfig,
 	readGlobalEffectiveModelConfig,
+	pinnedEffectiveModelConfig,
 	readEffectiveModelConfigAsync,
 	listAgentsFromDir,
 	listAgentsFromDirAsync,
