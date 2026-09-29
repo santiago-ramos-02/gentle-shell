@@ -5859,7 +5859,12 @@ async function executeReviewHostRelayCapture(
 			// live model registry; the relay validates and refuses a missing
 			// registry or a routing entry with no configured model typed before
 			// anything launches, never a fallback to a child.
-			const launch = reviewHostRelaySelection(slot.routingKey ?? slot.lens, readModelConfig(cwd));
+			// gentle-shell#1544: a repository profile pin re-anchors the whole reviewer
+			// routing, so the relay resolves the pinned profile wholesale before the
+			// global routing. A pin that omits a required role stays omitted: the
+			// typed reviewer-config-invalid refusal below is fail-closed, never a
+			// silent per-role fallback to another account's routing.
+			const launch = reviewHostRelaySelection(slot.routingKey ?? slot.lens, pinnedEffectiveModelConfig(cwd) ?? readModelConfig(cwd));
 			return {
 				captureArgumentTokens: slot.captureArgumentTokens,
 				targetCwd: cwd,
@@ -6683,11 +6688,15 @@ async function executeReviewCaptureGroupOperation(
 			mutation_outcome: "none",
 		};
 	}
+	// One routing snapshot for the whole group: the pin-over-global precedence
+	// is identical for every slot, so resolving it once before the map avoids
+	// re-running the pin resolver and config reads per slot.
+	const reviewerRouting = pinnedEffectiveModelConfig(cwd) ?? readModelConfig(cwd);
 	const requests: readonly ReviewHostRelayRequest[] = group.slots.map((slot) => ({
 		captureArgumentTokens: slot.captureArgumentTokens,
 		targetCwd: cwd,
 		submission: slot.submission!,
-		...reviewHostRelaySelection(slot.lens, readModelConfig(cwd)),
+		...reviewHostRelaySelection(slot.lens, reviewerRouting),
 		...(modelRegistry === undefined ? {} : { reviewerRegistry: modelRegistry }),
 		...(reviewerSessionId === undefined ? {} : { reviewerSessionId }),
 		...(signal === undefined ? {} : { signal }),
@@ -8357,8 +8366,10 @@ function createGentleAiExtensionForTesting(
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		const isNamedAgent = isNamedAgentStartEvent(event);
+		const isChildSession = permissionEnvironment.GENTLE_PI_AGENTS_CHILD === "1";
+		const isPrimarySession = !isNamedAgent && !isChildSession;
 		const subagentDepthKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
-		if (isNamedAgent) {
+		if (isNamedAgent || isChildSession) {
 			processAgentEndSubagentDepth.set(subagentDepthKey, (processAgentEndSubagentDepth.get(subagentDepthKey) ?? 0) + 1);
 		} else {
 			processAgentEndSubagentDepth.set(subagentDepthKey, 0);
@@ -8369,7 +8380,7 @@ function createGentleAiExtensionForTesting(
 		// process regardless of how many primary-session before_agent_start
 		// events this process observes; a missing/old binary or a spawn error
 		// must never affect activation, so every failure is swallowed silently.
-		if (!isNamedAgent && !processTelemetryTriggerAttempted) {
+		if (isPrimarySession && !processTelemetryTriggerAttempted) {
 			processTelemetryTriggerAttempted = true;
 			try {
 				const executable = resolveTelemetryTriggerBinary();
@@ -8390,7 +8401,7 @@ function createGentleAiExtensionForTesting(
 		// resolveRddStatusLine never throws and never hangs past
 		// RDD_STATUS_TIMEOUT_MS: an absent/timed-out/aborted/failing native
 		// binary renders the fail-closed "unknown" line instead.
-		const gentlePrompt = isNamedAgent
+		const gentlePrompt = !isPrimarySession
 			? ""
 			: `\n\n${buildGentlePrompt(
 					readPersonaMode(ctx.cwd),
@@ -8402,7 +8413,7 @@ function createGentleAiExtensionForTesting(
 		// contract bundle's review execution contract for the primary session
 		// only, and only when a native review CLI is actually present.
 		const reviewContractPrompt =
-			!isNamedAgent && nativeReviewCli !== null
+			isPrimarySession && nativeReviewCli !== null
 				? (() => {
 					const fragment = loadReviewContractPromptFragment(ctx);
 					return fragment === null ? "" : `\n\n${fragment}`;
@@ -8422,6 +8433,7 @@ function createGentleAiExtensionForTesting(
 	// consent, or chooses a partial candidate. Durable own-mutation receipts
 	// gate STATUS and consume only the generation captured before that await.
 	pi.on("agent_end", async (_event, ctx) => {
+		if (permissionEnvironment.GENTLE_PI_AGENTS_CHILD === "1") return;
 		if (nativeReviewCli?.reviewMode === undefined || nativeReviewCli.targetStatus === undefined) return;
 		if (ctx.hasUI !== true || !reminderSessionActive) return;
 		const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
