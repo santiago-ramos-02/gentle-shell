@@ -219,54 +219,23 @@ The [v3.5.1 release](https://github.com/Gentleman-Programming/gentle-shell/relea
 
 ## Get started
 
-> **Naming transition:** The product is called `gentle-shell`; the current npm package and repository remain `gentle-pi` until migration.
+> **This is [santiago-ramos-02](https://github.com/santiago-ramos-02)'s fork of [gentle-pi](https://github.com/Gentleman-Programming/gentle-shell).** It follows upstream `main` and adds the API [T3 Code](https://github.com/santiago-ramos-02/t3code) uses to manage profiles and persona. Every push to `main` publishes a release.
 
-### Path A: standalone `gentle-shell` (recommended, no pi changes)
+The simplest way is to let [the forked gentle-ai](https://github.com/santiago-ramos-02/gentle-ai#get-started) set up Pi: in T3 Code, open **Settings > Gentle AI**, pick **Pi**, and choose **Set up**, or run `gentle-ai` and select Pi. It installs this fork and replaces any other gentle-pi.
 
-`gentle-shell` opens Pi with the Gentle Shell package loaded, without installing it into your pi agent or editing its `settings.json`.
-
-```bash
-npm i -g gentle-pi
-
-# Own home, never touches your pi install
-gentle-shell
-
-# Reuse your pi sign-ins, models and chats instead
-gentle-shell --link
-```
-
-`gentle-shell` alone starts in its own home, `~/.gentle-shell/agent`, and sets that home up on first run — no separate step. Gentle Shell keeps its own home with the Gentle AI companion packages and no conflicting plugins; gentle-pi itself always stays this launcher's own copy, never one installed into the home; your pi install is untouched. That home also defaults to the Gentleman-Cute theme unless you set your own. `gentle-shell --link` reuses `~/.pi/agent` as-is, is never auto-provisioned, and never has its theme touched.
+To install it into an existing Pi by hand:
 
 ```bash
-# Re-run provisioning by hand, e.g. to see the full install output
-gentle-shell setup
-```
+# Replace the official package if you have it
+pi remove npm:gentle-pi
 
-`gentle-shell setup` installs the same companion packages gentle-ai provisions into a regular Pi, into this home only, then removes the one package that conflicts with gentle-pi's own `ask_user_question` tool (gentle-ai #4820). The first `gentle-shell` launch in a home already runs this automatically; `setup` is for re-running it by hand. See **[First run](docs/readme-reference.md#first-run-in-an-isolated-or-custom-home)** for the opt-out (`GENTLE_SHELL_NO_AUTO_SETUP=1`) and failure behavior.
-
-```bash
-# Make --link the default
-gentle-shell home link
-```
-
-Every other argument is forwarded to pi unchanged, for example `gentle-shell --mode rpc` or `gentle-shell -p "..."`. Full flags, env vars, and modes: **[launcher reference](docs/readme-reference.md#gentle-shell-launcher)**.
-
-### Path B: inside an existing pi
-
-Install the stable release into an existing pi agent, restart Pi, then synchronize the installed assets.
-
-```bash
-# Published stable release: v3.5.1
-pi install npm:gentle-pi@3.5.1
+pi install git:github.com/santiago-ramos-02/gentle-shell
 
 # Restart Pi, then run:
 gentle-ai sync
-
-# Start Pi in your project
-pi
 ```
 
-See the [v3.5.1 release notes](https://github.com/Gentleman-Programming/gentle-shell/releases/tag/v3.5.1) for version-specific changes.
+`pi update` keeps it on this fork's latest `main`. To stay on one release, install `git:github.com/santiago-ramos-02/gentle-shell@<tag>` from [the releases](https://github.com/santiago-ramos-02/gentle-shell/releases) instead. To go back to the official package, `pi remove git:github.com/santiago-ramos-02/gentle-shell` and `pi install npm:gentle-pi`.
 
 ```text
 /gentle:status
@@ -275,11 +244,9 @@ See the [v3.5.1 release notes](https://github.com/Gentleman-Programming/gentle-s
 
 > **RDD is opt-in:** enable native receipt-driven development only through an explicit `/gentle:review-mode enable` decision.
 
-> **Fullscreen installation note:** a recognized global installation persists Pi’s `"tuiMode": "fullscreen"` setting. Project-local and other install paths do not receive that change.
+> **Interactive RPC hosts:** T3 Code sets `GENTLE_SHELL_INTERACTIVE_HOST=1` automatically, without touching your Pi config — see the [installation reference](docs/readme-reference.md#interactive-rpc-hosts).
 
-> **Interactive RPC hosts:** the desktop app sets `GENTLE_SHELL_INTERACTIVE_HOST=1` automatically, without touching your Pi config — see the [installation reference](docs/readme-reference.md#interactive-rpc-hosts).
-
-For prerequisites, source-checkout instructions, full install behavior, and release policy, use the **[installation reference](docs/readme-reference.md#install)**. For everyday work, describe the outcome and follow [ODD](#odd--the-everyday-workflow).
+For everyday work, describe the outcome and follow [ODD](#odd--the-everyday-workflow).
 
 <p align="right"><a href="#top">Back to top ↑</a></p>
 
