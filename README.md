@@ -170,6 +170,14 @@ Model, effort, and who does what should be choices, not accidents. Named profile
 
 ---
 
+### YOLO — Session permission, destructive guards intact
+
+`/yolo on` supplies standing permission for ordinary already-scoped implementation, checks, commits, non-force pushes and PR creation. Default **OFF**, interactive primary TUI only, bound to the live session and Git clone; `/yolo off` revokes it, `/yolo status` checks it, and `/yolo` toggles. Reload and session replacement reset it. Active status plus a separate widget show **YOLO ON — destructive confirmations remain**. Explicit restrictions, configured confirmations/blocks, consequential unresolved choices, destination/credential ambiguity and native consent/recovery decisions remain mandatory. Children get no independent delivery grant. This is not a sandbox.
+
+Or open `/gentle:customize` → **Editor** and select **YOLO: OFF · session only**, immediately below Vim. Enter or Space toggles the same live-session permission as `/yolo`; browsing and previews never activate it. Unlike Vim, YOLO is not saved in preferences or visual profiles.
+
+**[Use and limits →](docs/yolo-mode.md)**
+
 ### Command palette — Every command, one keystroke away
 
 Extension commands are only useful if you can find them. `alt+k` opens a curated, grouped palette — Configuration, Session, Diagnostics, and Skills — searchable by label, command name, or description, showing entries only when they are actually registered.

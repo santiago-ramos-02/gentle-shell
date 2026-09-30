@@ -14,6 +14,7 @@ import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment
 import { CARD_TONE, renderCard, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { CommandPalette, commandsKey, type CommandPaletteResult } from "../lib/command-palette.ts";
 import { buildCommandPaletteGroups } from "../lib/command-palette-catalog.ts";
+import { discoverYoloUiAdapter, YOLO_DISPLAY, type YoloDisplay, type YoloUiAdapter } from "../lib/yolo-session-policy.ts";
 import { VisualCustomizeView, type CustomizeCategory, type CustomizeRow, type ProfileActions } from "../lib/visual-customize-view.ts";
 import { deleteVisualProfile, getVisualProfile, listVisualProfiles, resetVisualProfiles, saveVisualProfile } from "../lib/visual-profiles.ts";
 import { sourcePalettePreview } from "../lib/theme-customization.ts";
@@ -1424,6 +1425,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	if (!shellEnabled(env)) return;
 	const profileReader = createActiveProfileReader(env);
 	const deps: ShellDeps = { ...defaultShellDeps, activeProfile: profileReader, ...overrides };
+	let closeCustomize: (() => void) | undefined;
 	let profilePoll: ReturnType<typeof setInterval> | undefined;
 	const stopProfilePoll = () => {
 		if (profilePoll) clearInterval(profilePoll);
@@ -1725,6 +1727,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		},
 	});
 	pi.on("session_start", async (_event, ctx) => {
+		closeCustomize?.();
 		if (review) {
 			review = undefined;
 			redrawReview();
@@ -1833,6 +1836,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		applyChanges(ctx, tracker.model);
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
+		closeCustomize?.();
 		if (review) {
 			review = undefined;
 			redrawReview();
@@ -1889,16 +1893,29 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		});
 	}
 	pi.registerCommand("gentle:customize", {
-		description: "Configure animations, banner, themes, layout, global Vim prompt editing and prompt history capture.",
+		description: "Configure appearance, global Vim prompt editing, session-only YOLO permission and prompt history capture.",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui" || !ctx.hasUI) {
 				if (ctx.hasUI) ctx.ui.notify("Visual customization requires an interactive terminal.", "warning");
 				return;
 			}
+			closeCustomize?.();
+			let closed = false;
+			let adapter: YoloUiAdapter | undefined;
+			let unobserve: (() => void) | undefined;
+			let finish: (() => void) | undefined;
+			const close = () => {
+				if (closed) return;
+				closed = true;
+				unobserve?.(); adapter?.dispose(); finish?.();
+				if (closeCustomize === close) closeCustomize = undefined;
+			};
+			closeCustomize = close;
 			const home = { gentlePiConfigHome: doubleEscCancelConfigHome };
 			const rows: CustomizeRow[] = [];
 			const bannerHome = doubleEscCancelConfigHome;
-			let banner = await readBannerConfig(bannerHome);
+			let banner = await readBannerConfig(bannerHome).catch(error => { close(); throw error; });
+			if (closed) return;
 			let activeTheme = ctx.ui.theme.name;
 			let customizeView: VisualCustomizeView | undefined;
 			let category: CustomizeCategory = "Animations";
@@ -1997,6 +2014,40 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					vimPolicy = result.policy;
 					prompt?.setVimPolicy(vimPolicy);
 					reportVim(ctx, result);
+				},
+			});
+			let yoloDisplay: YoloDisplay = YOLO_DISPLAY.unavailable;
+			let requestYoloRender = () => {};
+			let refreshing: Promise<void> | undefined;
+			let refreshAgain = false;
+			// One in-flight read and one dirty bit coalesce slash/action/revocation
+			// changes. Labels and previews only read the authority-free snapshot.
+			const refreshYolo = (): Promise<void> => {
+				refreshAgain = true;
+				if (refreshing) return refreshing;
+				refreshing = (async () => {
+					while (refreshAgain && !closed) {
+						refreshAgain = false;
+						const next = await adapter?.read().catch(() => YOLO_DISPLAY.unavailable) ?? YOLO_DISPLAY.unavailable;
+						if (closed) return;
+						yoloDisplay = next;
+						requestYoloRender();
+					}
+				})().finally(() => { refreshing = undefined; });
+				return refreshing;
+			};
+			rows.push({
+				category,
+				label: () => `YOLO: ${yoloDisplay} · session only`,
+				preview: () => ({ title: "YOLO · session permission", sample: "ordinary scoped commits/push/PR · destructive confirmations remain · review consent unchanged · reset on reload" }),
+				action: async () => {
+					if (closed) return;
+					if (!adapter || yoloDisplay === YOLO_DISPLAY.unavailable) {
+						ctx.ui.notify("YOLO is unavailable in this live primary session.", "warning");
+						return;
+					}
+					await adapter.toggle();
+					await refreshYolo();
 				},
 			});
 			category = "History";
@@ -2113,10 +2164,27 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				delete: (name) => { deleteVisualProfile(name, home); ctx.ui.notify(`Visual profile ${name} deleted.`, "info"); },
 				reset: () => { resetVisualProfiles(home); ctx.ui.notify("Visual profile catalog cleared; active settings unchanged.", "info"); },
 			};
-			await ctx.ui.custom<null>((tui, theme, _keys, done) => {
-				customizeView = new VisualCustomizeView({ rows, profiles, theme, requestRender: () => tui.requestRender(), rowsAvailable: () => Math.max(0, Math.floor(tui.terminal.rows * 0.85) - 2), onError: (error) => ctx.ui.notify(`Visual customization: ${error.message}`, "error"), onClose: () => done(null) });
-				return customizeView;
-			}, { overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" } });
+			try {
+				adapter = await discoverYoloUiAdapter(pi, ctx);
+				if (closed) { adapter?.dispose(); return; }
+				unobserve = adapter?.observe(() => { void refreshYolo(); });
+				await refreshYolo();
+				if (closed) return;
+				await ctx.ui.custom<null>((tui, theme, _keys, done) => {
+					finish = () => done(null);
+					if (closed) done(null);
+					requestYoloRender = () => { if (!closed) tui.requestRender(); };
+					customizeView = new VisualCustomizeView({ rows, profiles, theme, requestRender: requestYoloRender, rowsAvailable: () => Math.max(0, Math.floor(tui.terminal.rows * 0.85) - 2), onError: (error) => { if (!closed) ctx.ui.notify(`Visual customization: ${error.message}`, "error"); }, onClose: close });
+					const view = customizeView;
+					// Own interaction lifetime here, leaving the shared view unchanged.
+					return {
+						render: (width) => closed ? [] : view.render(width),
+						handleInput: (data) => { if (!closed) view.handleInput(data); },
+						invalidate: () => { if (!closed) view.invalidate(); },
+						dispose: close,
+					};
+				}, { overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" } });
+			} finally { close(); }
 		},
 	});
 	pi.registerCommand("gentle:vim", {

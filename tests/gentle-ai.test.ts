@@ -1583,7 +1583,12 @@ test(`${channel} emits only a private, balanced Herdr projection`, () => {
 		registerTool() {},
 	} as unknown as ExtensionAPI;
 	createGentleAiExtension({ nativeReviewCli: null })(pi);
-	assert.equal(eventHandlers.size, 3);
+	const privateHostDiscovery = "gentle:yolo:host-ui";
+	assert.equal(eventHandlers.has(privateHostDiscovery), true);
+	assert.deepEqual([...eventHandlers.keys()].filter(name => name !== privateHostDiscovery).sort(), [
+		"gentle-pi:ask-user-choice:blocked", "gentle-pi:ask-user-question:blocked", "rpiv:ask-user:blocked",
+	], "only the original three blocked channels remain besides the known private host adapter");
+	assert.deepEqual(published, [], "registering host discovery emits no public event or private payload");
 	assert.equal(eventHandlers.has("gentle-pi:ask-user-choice:blocked"), true);
 	assert.equal(eventHandlers.has("rpiv:ask-user:blocked"), true);
 	assert.equal(eventHandlers.has("gentle-pi:ask-user-question:blocked"), true);
@@ -1596,10 +1601,16 @@ test(`${channel} emits only a private, balanced Herdr projection`, () => {
 		command: "private questionnaire command",
 		arbitrary: { nested: "private questionnaire field" },
 	};
+	eventHandlers.get(privateHostDiscovery)!(source);
+	assert.deepEqual(published, [], "private discovery ignores questionnaire data instead of relaying it");
+	assert.deepEqual(herdrEvents, []);
 	pi.events.emit(channel, source);
 	assert.strictEqual(published[0]?.data, source, "the questionnaire event remains the source event");
 	assert.deepEqual(herdrEvents, [{ active: true, label: "Questionnaire awaiting input" }]);
 	assert.doesNotMatch(JSON.stringify(herdrEvents), /private questionnaire|questionnaire-path/i);
+	assert.deepEqual(published.filter(event => event.channel !== channel), [
+		{ channel: "herdr:blocked", data: { active: true, label: "Questionnaire awaiting input" } },
+	], "host discovery adds no new public projection or sensitive-content leakage");
 
 	pi.events.emit(channel, { active: true, duplicate: true });
 	pi.events.emit(channel, { active: "true" });
