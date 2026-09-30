@@ -25,6 +25,7 @@ interface Harness {
 	asks: Array<{ taskId: string; method: string }>;
 	finishes: string[];
 	spawnOptions: Array<{ env: NodeJS.ProcessEnv; stdio?: string[] }>;
+	advance(ms: number): void;
 }
 
 function harness(options: { failStart?: boolean; process?: RunnerDeps["process"]; pid?: number; maxConcurrency?: number; stallTimeoutMs?: number; toolStallTimeoutMs?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
@@ -34,6 +35,7 @@ function harness(options: { failStart?: boolean; process?: RunnerDeps["process"]
 	const finishes: string[] = [];
 	const spawnOptions: Harness["spawnOptions"] = [];
 	let clock = 1000;
+	const deadlines = new Map<Harness["timers"][number], number>();
 	const deps: RunnerDeps = {
 		process: options.process,
 		spawn: (_command, _args, launchOptions) => {
@@ -56,6 +58,7 @@ function harness(options: { failStart?: boolean; process?: RunnerDeps["process"]
 		schedule: (fn, ms) => {
 			const timer = { fn, ms, cancelled: false };
 			timers.push(timer);
+			deadlines.set(timer, clock + ms);
 			return () => {
 				timer.cancelled = true;
 			};
@@ -72,12 +75,110 @@ function harness(options: { failStart?: boolean; process?: RunnerDeps["process"]
 		onNotification: options.onNotification,
 		onSuccessfulMutation: options.onSuccessfulMutation,
 	});
-	return { store, runner, children, timers, asks, finishes, spawnOptions };
+	return { store, runner, children, timers, asks, finishes, spawnOptions, advance(ms) {
+		clock += ms;
+		for (const timer of timers) {
+			if (!timer.cancelled && deadlines.get(timer)! <= clock) {
+				timer.cancelled = true;
+				timer.fn();
+			}
+		}
+	} };
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 const FOUR_MIN_MS = 4 * 60_000;
+
+function argumentUpdate(type: string, fields: Record<string, unknown> = {}): Record<string, unknown> {
+	return { type: "message_update", usage: { totalTokens: 999, cost: { total: 99 } }, assistantMessageEvent: { type, contentIndex: 0, ...fields } };
+}
+
+function beginArguments(child: FakeChild, timestamp = 1000): void {
+	child.emit({ type: "message_start", message: { role: "assistant", timestamp, content: [] } });
+	child.emit(argumentUpdate("toolcall_start", { id: "call-1", toolName: "write" }));
+}
+
+test("fresh argument streaming renews idle liveness without execution or provisional usage", async () => {
+	const h = harness({ stallTimeoutMs: 100, toolStallTimeoutMs: 1000 });
+	const task = h.runner.run(request());
+	await tick();
+	const child = h.children[0];
+	beginArguments(child);
+	// Each chunk arrives before the current idle deadline. Four renewals allow
+	// generation to outlast the original budget; only the latest timer can fire.
+	for (const delta of ['{"path":', '"private-path",', '"content":', '"private-arguments"}']) {
+		h.advance(80);
+		assert.equal(h.store.get(task.id)?.status, TASK_STATUS.RUNNING);
+		const before = h.timers.filter(timer => !timer.cancelled).at(-1)!;
+		child.emit(argumentUpdate("toolcall_delta", { delta }));
+		assert.equal(before.cancelled, true, "fresh argument data cancels the prior idle deadline");
+		assert.equal(h.timers.filter(timer => !timer.cancelled).at(-1)?.ms, 100);
+	}
+	const current = h.store.get(task.id)!;
+	assert.equal(current.toolCalls, 0);
+	assert.equal(current.tokens, 0);
+	assert.equal(current.cost, 0);
+	assert.equal(current.lastStep, "generating tool arguments");
+	assert.doesNotMatch(JSON.stringify(h.store.thread(task.id)), /private/);
+	h.advance(101);
+	await tick();
+	assert.equal(h.store.get(task.id)?.status, TASK_STATUS.TIMED_OUT, "later silence still times out");
+	assert.doesNotMatch(h.store.get(task.id)?.error ?? "", /private/);
+});
+
+test("empty, replayed, malformed and unrelated argument traffic cannot renew idle liveness", async () => {
+	const h = harness({ stallTimeoutMs: 100 });
+	const task = h.runner.run(request());
+	await tick();
+	const child = h.children[0];
+	beginArguments(child);
+	const fresh = argumentUpdate("toolcall_delta", { delta: "private-chunk" });
+	child.emit(fresh);
+	const timer = h.timers.filter(timer => !timer.cancelled).at(-1)!;
+	for (const event of [fresh, argumentUpdate("toolcall_delta", { delta: "" }),
+		argumentUpdate("toolcall_delta", { delta: 123 }), argumentUpdate("toolcall_delta", { delta: "new", contentIndex: -1 }),
+		argumentUpdate("toolcall_delta", { delta: "new", contentIndex: 1 }),
+		argumentUpdate("toolcall_start", { id: "call-1", toolName: "write" }), fresh,
+		{ type: "message_start", message: { role: "assistant", timestamp: 1000 } }, fresh,
+		{ type: "queue_update" }, { type: "extension_ui_request", method: "setWidget", widgetLines: ["noise"] },
+		{ type: "bash_execution_update", delta: "noise" }]) child.emit(event);
+	assert.equal(timer.cancelled, false);
+	timer.fn();
+	await tick();
+	assert.equal(h.store.get(task.id)?.status, TASK_STATUS.TIMED_OUT);
+});
+
+test("argument generation closes at message end, preserves final usage and execution budgets", async () => {
+	const h = harness({ stallTimeoutMs: 100, toolStallTimeoutMs: 1000 });
+	const task = h.runner.run(request());
+	await tick();
+	const child = h.children[0];
+	beginArguments(child);
+	child.emit(argumentUpdate("toolcall_delta", { delta: "private-chunk" }));
+	child.emit({ type: "message_end", message: { role: "assistant", usage: { totalTokens: 12, cost: { total: 0.1 } } } });
+	const idle = h.timers.filter(timer => !timer.cancelled).at(-1)!;
+	child.emit(argumentUpdate("toolcall_delta", { delta: "late" }));
+	assert.equal(idle.cancelled, false);
+	assert.equal(h.store.get(task.id)?.tokens, 12);
+	assert.equal(h.store.get(task.id)?.cost, 0.1);
+	child.emit({ type: "tool_execution_start", toolCallId: "call-1", toolName: "write", args: {} });
+	assert.equal(h.store.get(task.id)?.toolCalls, 1);
+	assert.equal(h.timers.filter(timer => !timer.cancelled).at(-1)?.ms, 1000);
+	child.emit({ type: "tool_execution_end", toolCallId: "call-1", result: { content: [] }, isError: false });
+	assert.equal(h.timers.filter(timer => !timer.cancelled).at(-1)?.ms, 100);
+	beginArguments(child, 1001);
+	child.emit(argumentUpdate("toolcall_delta", { delta: "private-chunk" }));
+	assert.equal(h.store.get(task.id)?.lastStep, "generating tool arguments", "a new generation admits the same chunk");
+	h.runner.cancel(task.id, "cancelled during arguments");
+	const timerCount = h.timers.length;
+	child.emit(argumentUpdate("toolcall_delta", { delta: "after cancellation" }));
+	await tick();
+	assert.equal(h.timers.length, timerCount);
+	assert.equal(h.store.get(task.id)?.status, TASK_STATUS.CANCELLED);
+	assert.equal(h.store.get(task.id)?.toolCalls, 1);
+	assert.equal(h.store.get(task.id)?.tokens, 12);
+});
 
 // A child that never answers the launch RPC commands (get_state, prompt), so
 // the task's lastStep never leaves its initial "starting" stage. Used to
