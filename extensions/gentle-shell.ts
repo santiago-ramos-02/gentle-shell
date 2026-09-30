@@ -48,7 +48,7 @@ export function resolveVimRuntime(entry = process.argv[1], customClass: typeof C
 	const editorPrototype = Object.getPrototypeOf(customClass.prototype) as typeof Editor.prototype | undefined;
 	const editorClass = editorPrototype?.constructor as typeof Editor | undefined;
 	const candidates: string[] = [];
-	// The 0.87.1 CLI uses the bundled virtual module graph. Its public index
+	// The audited 0.99.1 CLI uses the bundled virtual module graph. Its public index
 	// exports the very CustomEditor class supplied to extensions by that graph.
 	try {
 		if (entry) {
@@ -60,7 +60,7 @@ export function resolveVimRuntime(entry = process.argv[1], customClass: typeof C
 					const requireFromBundle = createRequire(bundlePath);
 					const bundled = requireFromBundle(bundlePath) as { CustomEditor?: typeof CustomEditor; VERSION?: string };
 					const metadata = requireFromBundle(resolve(root, "package.json")) as { name?: string; version?: string };
-					if (metadata.name === "@earendil-works/pi-coding-agent" && metadata.version === "0.87.1" &&
+					if (metadata.name === "@earendil-works/pi-coding-agent" && metadata.version === "0.99.1" &&
 						bundled.VERSION === metadata.version && bundled.CustomEditor === customClass &&
 						typeof editorClass === "function" && editorClass.name === "Editor" &&
 						editorPrototype === editorClass.prototype &&
@@ -94,7 +94,7 @@ export function resolveVimRuntime(entry = process.argv[1], customClass: typeof C
 			const tuiMetadata = requireFromRuntime(resolve(tuiRoot, "package.json")) as { version?: string; name?: string };
 			if (agent.CustomEditor === customClass && tui.Editor === editorClass &&
 				agentMetadata.name === "@earendil-works/pi-coding-agent" && tuiMetadata.name === "@earendil-works/pi-tui" &&
-				(agentMetadata.version === "0.85.1" || agentMetadata.version === "0.87.1") &&
+				agentMetadata.version === "0.99.1" &&
 				agentMetadata.version === tuiMetadata.version) return { version: tuiMetadata.version, editorClass };
 		} catch { /* Unknown package or constructor: ordinary editing stays active. */ }
 	}

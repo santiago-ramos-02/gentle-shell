@@ -214,7 +214,7 @@ test("mandatory delegation triggers are behavioral in the lazy canonical port an
 		"**Mapping trigger",
 		"**Writer trigger",
 		"**Preparation trigger:**",
-		"**Long-session backstop",
+		"**Context backstop:**",
 		"pause and delegate the next bounded unit of work",
 		"**Route declaration:**",
 		"record the chosen route per task",
@@ -235,19 +235,19 @@ test("mandatory delegation triggers are behavioral in the lazy canonical port an
 
 test("core and lazy canonical trigger lists agree in numbering and semantics", () => {
 	for (const entry of [
-		"1. **4-file rule**",
+		"1. **Evidence-budget rule**",
 		"2. **Multi-file write rule**",
 		"3. **Incident rule**",
-		"4. **Long-session rule**",
+		"4. **Context backstop**",
 		"5. **Verification rule**",
 	]) {
 		assert.ok(core.includes(entry), `always-on core trigger list is missing: ${entry}`);
 	}
 	for (const entry of [
-		"1. **Mapping trigger (4-file rule):**",
+		"1. **Mapping trigger (Evidence-budget rule):**",
 		"2. **Writer trigger (Multi-file write rule):**",
 		"3. **Incident rule:**",
-		"4. **Long-session backstop (Long-session rule):**",
+		"4. **Context backstop:**",
 		"5. **Verification rule**",
 	]) {
 		assert.ok(delegation.includes(entry), `lazy canonical trigger list is missing: ${entry}`);
@@ -259,6 +259,32 @@ test("core and lazy canonical trigger lists agree in numbering and semantics", (
 		"**Per-action rule**",
 	]) {
 		assert.ok(!delegation.includes(stale), `reconciled canonical list retains stale trigger framing: ${stale}`);
+	}
+});
+
+// Evidence-budget rule (gentle-shell#1587, measured in gentle-ai#5139): every
+// routing surface states the same numbers, and the retired file-count and
+// tool-call triggers are gone from all of them.
+test("evidence-budget numbers agree across routing surfaces and retired triggers are gone", () => {
+	const surfaces: Record<string, string> = {
+		"assets/orchestrator.md": core,
+		"assets/orchestrator-delegation.md": delegation,
+		"skills/gentle-ai/SKILL.md": read("skills/gentle-ai/SKILL.md"),
+	};
+	for (const [path, text] of Object.entries(surfaces)) {
+		containsAll(text, [
+			"**Evidence-budget rule**",
+			"at most 3 calls",
+			"~10k tokens",
+			"at most ~2k tokens",
+			"`path:line`",
+			"~150k tokens",
+			"Context backstop",
+		]);
+		assert.doesNotMatch(text, /4-file rule|20 tool calls|5 exploratory (?:file )?reads/, `${path} keeps a retired trigger`);
+	}
+	for (const agent of ["assets/agents/gentle-ai-explore.md", "assets/agents/gentle-ai-verify.md"]) {
+		containsAll(read(agent), ["at most ~2k tokens", "`path:line`"]);
 	}
 });
 

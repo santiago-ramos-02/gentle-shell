@@ -1,4 +1,4 @@
-import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import {
 	createBashTool,
 	createEditTool,
@@ -15,6 +15,7 @@ import { isAbsolute } from "node:path";
 import { resolveGentleAiDevBinaryOverride, type GentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { GentleAiElapsedTimingLedger } from "../lib/gentle-ai-elapsed-store.ts";
 import { quietToolsEnabled } from "../lib/quiet-tools-config.ts";
+import { registerCompactCodemode } from "../lib/codemode-renderer.ts";
 import { getGentleAiRenderState, renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import { CARD_GLYPH, CARD_TONE, cardBottom, cardInnerWidth, cardLine, type CardTheme } from "../lib/shell-card.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
@@ -756,7 +757,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 	});
 }
 
-export default function quietTools(pi: ExtensionAPI, resolveOverride: GentleAiDevBinaryOverrideResolver = () => resolveGentleAiDevBinaryOverride()): void {
+export default function quietTools(pi: ExtensionAPI, resolveOverride: GentleAiDevBinaryOverrideResolver = () => resolveGentleAiDevBinaryOverride()): ReturnType<ExtensionFactory> {
 	if (!quietToolsEnabled()) return;
 	let elapsedTiming: GentleAiElapsedTimingLedger | undefined;
 	pi.on("session_start", (_event, ctx) => {
@@ -779,4 +780,5 @@ export default function quietTools(pi: ExtensionAPI, resolveOverride: GentleAiDe
 	for (const toolName of Object.keys(TOOL_CREATORS) as QuietToolName[]) {
 		registerQuietTool(pi, toolName, () => createGentleAiCommandArguments(resolveQuietToolsDevBinaryPath(resolveOverride)), () => elapsedTiming);
 	}
+	return registerCompactCodemode(pi);
 }

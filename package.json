@@ -5,8 +5,7 @@
 	"license": "MIT",
 	"type": "module",
 	"bin": {
-		"gentle-shell": "bin/gentle-shell.mjs",
-		"gentle-pi-api": "bin/gentle-pi-api.mjs"
+		"gentle-shell": "bin/gentle-shell.mjs"
 	},
 	"keywords": [
 		"pi-package",
@@ -34,7 +33,6 @@
 		"lib/",
 		"prompts/",
 		"runtime/",
-		"runtime-t3/",
 		"skills/",
 		"scripts/",
 		"tests/",
@@ -77,22 +75,31 @@
 		"@heyhuynhgiabuu/pi-pretty": "0.6.27"
 	},
 	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.99.1",
 		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": ">=0.85.1",
 		"@earendil-works/pi-tui": "*",
 		"typebox": "*"
 	},
 	"peerDependenciesMeta": {
 		"@earendil-works/pi-coding-agent": {
 			"optional": true
+		},
+		"@earendil-works/pi-ai": {
+			"optional": true
+		},
+		"@earendil-works/pi-tui": {
+			"optional": true
 		}
 	},
 	"devDependencies": {
-		"@earendil-works/pi-ai": "0.87.1",
-		"@earendil-works/pi-coding-agent": "0.87.1",
-		"@earendil-works/pi-tui": "0.87.1",
+		"@earendil-works/pi-coding-agent": "0.99.1",
+		"@earendil-works/pi-ai": "0.99.1",
+		"@earendil-works/pi-tui": "0.99.1",
 		"@types/node": "^24.13.3",
 		"typescript": "^5.9.3"
+	},
+	"engines": {
+		"node": ">=22.19.0"
 	},
 	"packageManager": "pnpm@11.1.1"
 }

@@ -161,7 +161,7 @@ This checkout declares `gentle-pi` `3.7.0` with a package-local Gentle AI `v3.7.
 
 ### Pi compatibility
 
-The current package requires Pi 0.85.1 or newer (development tests pin 0.87.1). Use the latest Pi release; gentle-pi does not update your installed Pi automatically. Children, including any `GENTLE_PI_AGENTS_PI` override, must emit `agent_settled`: `agent_end` records a run's output but is not completion because retries or queued continuations may follow.
+The current package requires Pi 0.99.1 or newer and Node >=22.19.0 (development tests pin Pi 0.99.1). Use the latest Pi release; gentle-pi does not update your installed Pi automatically. Children, including any `GENTLE_PI_AGENTS_PI` override, must emit `agent_settled`: `agent_end` records a run's output but is not completion because retries or queued continuations may follow.
 
 The [`v2.6.0` release](https://github.com/Gentleman-Programming/gentle-shell/releases/tag/v2.6.0) added persistent registered worktrees and grouped `/gentle:changes` views; fuller workspace interaction details are in the [Gentle Shell reference](gentle-shell.md). It also adds named atomic `/gentle:profiles`, native review intended-untracked selection and provider continuations, and opt-in custom ask responses. Pi recognizes its global Git-managed package path; subsystems install with explicit recovery guidance when npm lifecycle work was skipped. Windows keeps child consoles hidden and fixes ownership mode; Gentle Todo keeps the next pending task visible when collapsed.
 
@@ -295,7 +295,9 @@ gentle-ai's managed Pi stack always declares `npm:gentle-pi` itself in the home'
 2. The bundled `@earendil-works/pi-coding-agent` resolved next to gentle-pi (`dist/bundle/cli.js`, run with the current `node`), when installed as its optional peer dependency.
 3. `pi` on `PATH`.
 
-If none resolve, `gentle-shell` exits 1 naming all three options. Once a runtime is found, its `pi --version` must be at least `0.85.1` (the pinned peer minimum): an older version exits 1 naming the found and required versions, and unparsable `--version` output exits 1 naming the required minimum.
+Adjacent resolution uses Pi's public ESM entry, then verifies the canonical package root, package name and declared `pi` bin. Only a genuinely absent optional peer permits PATH fallback; an invalid installed package fails rather than silently selecting another runtime. Pi AI and TUI are optional `"*"` host peers, not runtime dependencies, so managed extensions use the host's classes and registries. The launcher still gates the actual runtime version before home bootstrap. This is a one-time baseline upgrade, not an auto-updater.
+
+If none resolve, `gentle-shell` exits 1 naming all three options. Once a runtime is found, its `pi --version` must be at least `0.99.1` (the coding-agent peer minimum): an older version exits 1 naming the found and required versions, and unparsable `--version` output exits 1 naming the required minimum.
 
 ### Environment variables
 
@@ -418,11 +420,11 @@ Size and uncertainty can call for scoped exploration or delegation within ODD. T
 
 | Trigger                                                                                                                     | Required behavior                                                             |
 | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Reading 4+ files to understand a flow                                                                                       | Launch `scout`, `context-builder`, or the closest read-only mapping subagent. |
+| Reading beyond the evidence budget (one parallel batch of at most 3 calls, ~10k tokens), more than ~5 sequential lookups, or a long session ahead | Launch `scout`, `context-builder`, or the closest read-only mapping subagent; it returns a handoff of at most ~2k tokens with `path:line` evidence. Never force delegation for a small targeted question. |
 | Touching 2+ non-trivial code files                                                                                          | Delegate one writer; do not continue inline unless delegation is unavailable. |
 | Commit, push, or PR after code changes                                                                                      | Follow the loaded native instruction, or ordinary repository policy when none is supplied. |
 | Wrong cwd, worktree/git accident, merge recovery, confusing test/env issue                                                  | Stop, preserve the affected scope, and investigate separately before resuming. |
-| Long monolithic session with accumulating complexity, roughly 20 tool calls, 5 exploratory reads, or 2 non-mechanical edits | Pause and delegate the remaining work, or stop and explain the exact blocker. |
+| Parent context past ~150k tokens | Pause and delegate the next bounded unit of work, or stop and explain the exact blocker. Keep command output bounded; send full suites and builds to a verifier. |
 
 The intended balanced loop for a bounded bugfix is:
 
@@ -977,7 +979,7 @@ The frame labels INSERT, NORMAL, VISUAL (characterwise), or VISUAL LINE (linewis
 
 **Deliberate `/` divergence from Claude Code:** NORMAL `/` hands off to **Pi's native slash commands and skills**, enters INSERT, and inserts `/` at the existing cursor. Pi offers slash completion only at the start of the first line; elsewhere it inserts a literal slash without moving or replacing the draft. There is **no reverse prompt-history search**. Pi's explicit history shortcuts still work, transferring to INSERT first. Unknown NORMAL printable input, encoded text and bracketed paste do not silently insert; application shortcuts can transfer to INSERT before acting.
 
-This is a bounded command subset, not full Claude Code/Vim parity. The private editor adapter supports only the proven Pi coding-agent/TUI `0.85.1` and `0.87.1` package pairs: version metadata must come from a canonical candidate host package root whose actual `CustomEditor` and `Editor` classes match the loaded classes, never from the extension's local metadata or CLI path alone. Unknown versions, mismatched prototypes, or invalid layouts fail closed: a single compatibility warning is shown and the prompt continues with ordinary editing instead of silently entering inert NORMAL mode. Operations that would cross a registered collapsed paste marker, or encounter duplicate occurrences of a registered marker ID, are rejected without editing it. Visual highlighting relies on Pi's render layout and may be omitted if its geometry cannot be validated. No live-terminal proof of every layout or complete parity is claimed.
+This is a bounded command subset, not full Claude Code/Vim parity. The private editor adapter supports only the audited Pi coding-agent/TUI `0.99.1` package pair, tested through both its bundled host and unbundled development graph: version metadata must come from a canonical candidate host package root whose actual `CustomEditor` and `Editor` classes match the loaded classes, never from the extension's local metadata or CLI path alone. Unknown versions, mismatched prototypes, or invalid layouts fail closed: a single compatibility warning is shown and the prompt continues with ordinary editing instead of silently entering inert NORMAL mode. Operations that would cross a registered collapsed paste marker, or encounter duplicate occurrences of a registered marker ID, are rejected without editing it. Visual highlighting relies on Pi's render layout and may be omitted if its geometry cannot be validated. No live-terminal proof of every layout or complete parity is claimed.
 
 Startup banner settings remain global in `banner.json` under `GENTLE_PI_CONFIG_HOME` (default `~/.pi/gentle-ai`). Existing `showRose` and `showTextLogo` opt-outs independently control the main startup artwork; both default to enabled. Changes apply on the next session or `/reload`. Color presets are `pink` (default), `cyan`, `yellow`, and `green`. The static sidebar heading is independent of these preferences and follows the active theme.
 

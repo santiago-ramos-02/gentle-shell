@@ -20,7 +20,6 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { createRequire } from "node:module";
 import { constants as osConstants, homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve as resolvePath } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -80,17 +79,30 @@ function readJsonIfExists(path) {
 	}
 }
 
-// @earendil-works/pi-coding-agent ships as an optional peer dependency: it may
-// not be installed at all, so a resolution failure here is expected, not an error.
+// Resolve the public ESM entry without importing the agent or reaching through
+// its exports map. Only an absent optional peer permits PATH fallback; malformed
+// installed metadata must not silently select a different runtime.
 function resolveBundledCli() {
+	let publicEntry;
 	try {
-		const require = createRequire(import.meta.url);
-		const pkgJsonPath = require.resolve("@earendil-works/pi-coding-agent/package.json");
-		const cliPath = join(dirname(pkgJsonPath), "dist", "bundle", "cli.js");
-		return existsSync(cliPath) ? cliPath : undefined;
-	} catch {
-		return undefined;
+		publicEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+	} catch (error) {
+		if (error.code === "ERR_MODULE_NOT_FOUND") return undefined;
+		throw error;
 	}
+	const entry = realpathSync(publicEntry);
+	const root = dirname(dirname(entry));
+	const expectedEntry = join(root, "dist", "index.js");
+	const metadata = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+	if (entry !== expectedEntry || metadata.name !== "@earendil-works/pi-coding-agent" ||
+		metadata.bin?.pi !== "dist/bundle/cli.js") {
+		throw new Error("Unsupported adjacent Pi package entry/name/bin metadata");
+	}
+	const cliPath = join(root, metadata.bin.pi);
+	if (realpathSync(cliPath) !== cliPath || !statSync(cliPath).isFile()) {
+		throw new Error("Unsupported adjacent Pi CLI path");
+	}
+	return cliPath;
 }
 
 function findOnPath(name) {

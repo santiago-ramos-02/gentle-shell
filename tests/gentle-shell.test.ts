@@ -1647,7 +1647,7 @@ test("focused framed empty logical line keeps hardware cursor at column zero ins
 		editor.setVimPolicy("on");
 		editor.setText("a\n\nb");
 		editor.focused = true;
-		const adapter = createVimEditorAdapter(editor, "0.87.1");
+		const adapter = createVimEditorAdapter(editor, "0.99.1");
 		adapter.move({ line: 0, col: 0 });
 		editor.handleInput("\x1b");
 		editor.handleInput("v");
@@ -1671,7 +1671,7 @@ test("framed scrolled paste marker paints exactly its split visible cells", () =
 		editor.handleInput(`\x1b[200~${"z".repeat(1001)}\x1b[201~`);
 		const pasteEnd = editor.getText().length;
 		editor.insertTextAtCursor("TAIL");
-		const adapter = createVimEditorAdapter(editor, "0.87.1");
+		const adapter = createVimEditorAdapter(editor, "0.99.1");
 		adapter.move({ line: 0, col: 100 });
 		editor.handleInput("\x1b");
 		editor.handleInput("v");
@@ -1897,7 +1897,7 @@ test("vim command distinguishes persisted preference from rejected live editor a
 
 test("compatible vim command reports live activation and disable returns ordinary editing", async () => {
  const { pi, handlers, commands } = fakePi();
- gentleShell(pi, { GENTLE_PI_CONFIG_HOME: mkdtempSync(join(tmpdir(), "gentle-vim-compatible-")) }, { vimRuntimeVersion: () => "0.87.1" });
+ gentleShell(pi, { GENTLE_PI_CONFIG_HOME: mkdtempSync(join(tmpdir(), "gentle-vim-compatible-")) }, { vimRuntimeVersion: () => "0.99.1" });
  const { ctx, ui } = fakeContext();
  const editor = installedPrompt(ctx, ui, handlers);
  try {
@@ -1921,7 +1921,7 @@ test("vim NORMAL slash uses Pi's command and skill completion without displacing
 		matches: (data: string, action: string) => action === "app.interrupt" && data === "\x1b",
 	} as never, {
 		fg: (_color, text) => text, bold: (text) => text, requestRender() {}, pending: () => false,
-		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.87.1",
+		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.99.1",
 	});
 	const entries = ["gentle:vim", "gentle:models", "skill:example"];
 	const requests: string[] = [];
@@ -2037,7 +2037,7 @@ test("vim NORMAL blocks Kitty and emoji text, handles encoded motions and ignore
 test("vim bracketed paste frames split across editor events never run NORMAL commands", () => {
 	const editor = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, {
 		fg: (_color, text) => text, bold: (text) => text, requestRender() {}, pending: () => false,
-		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.87.1",
+		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.99.1",
 	});
 	try {
 		editor.setVimPolicy("on");
@@ -2060,7 +2060,7 @@ test("bracketed paste replaces native selection atomically while Vim VISUAL over
 	const payload = "z".repeat(1024 * 1024 + 1);
 	const deps = {
 		fg: (_color: string, text: string) => text, bold: (text: string) => text, requestRender() {}, pending: () => false,
-		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.87.1",
+		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.99.1",
 	};
 	const editor = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, deps);
 	try {
@@ -2092,7 +2092,7 @@ test("incomplete bracketed paste buffered up to exactly the 16 MiB bound still c
 	const BOUND = 16 * 1024 * 1024;
 	const deps = {
 		fg: (_color: string, text: string) => text, bold: (text: string) => text, requestRender() {}, pending: () => false,
-		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.87.1",
+		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.99.1",
 	};
 	const editor = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, deps);
 	try {
@@ -2112,7 +2112,7 @@ test("a complete bracketed paste larger than the 16 MiB incomplete-frame bound, 
 	const BOUND = 16 * 1024 * 1024;
 	const deps = {
 		fg: (_color: string, text: string) => text, bold: (text: string) => text, requestRender() {}, pending: () => false,
-		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.87.1",
+		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.99.1",
 	};
 	const editor = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, deps);
 	try {
@@ -2130,7 +2130,7 @@ test("an incomplete bracketed paste that crosses the 16 MiB bound without a term
 	const BOUND = 16 * 1024 * 1024;
 	const deps = {
 		fg: (_color: string, text: string) => text, bold: (text: string) => text, requestRender() {}, pending: () => false,
-		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.87.1",
+		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.99.1",
 	};
 	const editor = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, deps);
 	try {
@@ -2148,7 +2148,7 @@ test("an incomplete bracketed paste that crosses the 16 MiB bound without a term
 test("vim paste overflow and policy cancellation discard partial frames without leaking modal commands", () => {
 	const editor = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, {
 		fg: (_color, text) => text, bold: (text) => text, requestRender() {}, pending: () => false,
-		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.87.1",
+		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => "0.99.1",
 	});
 	try {
 		editor.setVimPolicy("on");
@@ -2239,7 +2239,7 @@ test("vim NORMAL motions and insert/open commands use Unicode and multiline curs
 		editor.setVimPolicy("on");
 		editor.setText("a👩‍💻z\n  snow");
 		editor.handleInput("\x1b");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 0, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 0, col: 0 });
 		for (const key of ["l", "l", "j", "k", "g", "g", "G", "0", "^", "$"]) editor.handleInput(key);
 		assert.deepEqual(editor.getCursor(), { line: 1, col: 6 });
 		editor.handleInput("O");
@@ -2278,10 +2278,10 @@ test("NORMAL first non-whitespace motion and insert land after a combining graph
 		editor.setVimPolicy("on");
 		editor.setText(" \u0301a");
 		editor.handleInput("\x1b");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 0, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 0, col: 0 });
 		editor.handleInput("^");
 		assert.deepEqual(editor.getCursor(), { line: 0, col: 2 });
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 0, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 0, col: 0 });
 		editor.handleInput("I");
 		assert.deepEqual(editor.getCursor(), { line: 0, col: 2 });
 		assert.match(editor.render(30).join("\n"), /INSERT/);
@@ -2318,7 +2318,7 @@ test("vim NORMAL counted find and repeats remain Unicode/paste-safe and do not c
 		editor.setVimPolicy("on");
 		editor.setText("a👩‍💻x👩‍💻x\nnext");
 		editor.handleInput("\x1b");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 0, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 0, col: 0 });
 		for (const key of ["2", "f", "👩‍💻"]) editor.handleInput(key);
 		assert.deepEqual(editor.getCursor(), { line: 0, col: 7 });
 		editor.handleInput(",");
@@ -2342,7 +2342,7 @@ test("vim operator session edits, cancels, and restores the draft with Pi undo",
 		editor.setVimPolicy("on");
 		editor.setText("👩‍💻 hello\nnext");
 		editor.handleInput("\x1b");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 0, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 0, col: 0 });
 		for (const key of ["d", "w"]) editor.handleInput(key);
 		assert.equal(editor.getText(), "hello\nnext");
 		editor.handleInput("u");
@@ -2364,7 +2364,7 @@ test("vim join and shift are single undo units and Escape cancels pending shift"
 		editor.setVimPolicy("on");
 		editor.setText("👩‍💻 one\n  two\nthird");
 		editor.handleInput("\x1b");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 0, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 0, col: 0 });
 		editor.handleInput(">");
 		editor.handleInput("\x1b");
 		editor.handleInput("J");
@@ -2388,7 +2388,7 @@ test("vim operator survives an unhandled extension shortcut probe", () => {
 		editor.setText("abc def");
 		editor.onExtensionShortcut = () => false;
 		editor.handleInput("\x1b");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 0, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 0, col: 0 });
 		editor.handleInput("d");
 		editor.handleInput("w");
 		assert.equal(editor.getText(), "def");
@@ -2405,20 +2405,20 @@ test("vim final-line yy/P, cc and empty S keep line boundaries and INSERT state"
 		editor.setVimPolicy("on");
 		editor.setText("one\ntwo");
 		editor.handleInput("\x1b");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 1, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 1, col: 0 });
 		for (const key of ["y", "y", "P"]) editor.handleInput(key);
 		assert.equal(editor.getText(), "one\ntwo\ntwo");
 		assert.deepEqual(editor.getCursor(), { line: 1, col: 0 });
 		editor.handleInput("u");
 		assert.equal(editor.getText(), "one\ntwo");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 1, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 1, col: 0 });
 		for (const key of ["c", "c"]) editor.handleInput(key);
 		assert.equal(editor.getText(), "one\n");
 		assert.deepEqual(editor.getCursor(), { line: 1, col: 0 });
 		assert.match(editor.render(40).join("\n"), /INSERT/);
 		editor.setText("one");
 		editor.handleInput("\x1b");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 0, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 0, col: 0 });
 		for (const key of ["c", "c"]) editor.handleInput(key);
 		assert.equal(editor.getText(), "");
 		assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
@@ -2439,7 +2439,7 @@ test("vim NORMAL Escape cancels pending find without inserting the next characte
 		editor.setVimPolicy("on");
 		editor.setText("ax");
 		editor.handleInput("\x1b");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 0, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 0, col: 0 });
 		editor.handleInput("f");
 		editor.handleInput("\x1b");
 		editor.handleInput("l");
@@ -2461,7 +2461,7 @@ test("vim NORMAL k at the first visual line does not recall history", () => {
 		editor.addToHistory("previous prompt");
 		editor.setText("draft\nsecond line");
 		editor.handleInput("\x1b");
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 1, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 1, col: 0 });
 		editor.handleInput("k");
 		assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
 		const before = editor.getText();
@@ -2469,11 +2469,11 @@ test("vim NORMAL k at the first visual line does not recall history", () => {
 		assert.equal(editor.getText(), before, "top-edge k must not replace the draft with history");
 		assert.deepEqual(editor.getCursor(), { line: 0, col: 0 });
 		assert.match(editor.render(40).join("\n"), /NORMAL/);
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 1, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 1, col: 0 });
 		editor.handleInput("j");
 		assert.equal(editor.getText(), before, "bottom-edge j must not browse history");
 		assert.deepEqual(editor.getCursor(), { line: 1, col: 0 });
-		createVimEditorAdapter(editor, "0.87.1").move({ line: 0, col: 0 });
+		createVimEditorAdapter(editor, "0.99.1").move({ line: 0, col: 0 });
 		editor.handleInput("\x1b[A");
 		assert.equal(editor.getText(), "previous prompt", "explicit Pi history binding still works");
 		assert.match(editor.render(40).join("\n"), /INSERT/);
@@ -2865,7 +2865,7 @@ test("customize History rows refuse to overwrite a malformed preference and repo
 test("external Vim preference change while customize is open never implies a compatibility failure", async (t) => {
 	const home = scopedDoubleEscCancelConfigHome(t);
 	const { pi, handlers, commands } = fakePi();
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home }, { vimRuntimeVersion: () => "0.87.1" });
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home }, { vimRuntimeVersion: () => "0.99.1" });
 	const { ctx, ui, overlayReady } = fakeContext();
 	const editor = installedPrompt(ctx, ui, handlers);
 	try {
@@ -2885,7 +2885,7 @@ test("external Vim preference change while customize is open never implies a com
 });
 
 test("customize updates live Vim prompt and reports unsupported effective state without attributing its cause", async (t) => {
-	for (const version of ["0.87.1", "unsupported"]) {
+	for (const version of ["0.99.1", "unsupported"]) {
 		const home = scopedDoubleEscCancelConfigHome(t);
 		const { pi, handlers, commands } = fakePi();
 		gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home }, { vimRuntimeVersion: () => version });
@@ -4076,6 +4076,30 @@ test("captured changes update the widget and bar without repository scans", asyn
 const onlyHeadLabels = (git: readonly string[][]) => git.every((args) => {
  const command = args[0] === "-C" ? args.slice(2) : args;
  return command[0] === "symbolic-ref" || (command[0] === "rev-parse" && command.includes("--verify"));
+});
+
+test("same-session explicit registration after bootstrap does not claim Changes", async () => {
+	const { pi, handlers, commands, tools, git } = fakePi();
+	let bootstrapped = false;
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, {
+		resolveWorktree: (path) => bootstrapped ? { root: path === "." ? "/repo" : path, commonDir: path === "/foreign" ? "/foreign/git" : "/repo/.git" } : undefined,
+	});
+	const { ctx, ui } = fakeContext();
+	const manager = ctx.sessionManager;
+	await fire(handlers, "session_start", ctx);
+	const register = tools.get("session_worktree_register")!;
+	await assert.rejects(register.execute("before", { path: "/repo" }, undefined, undefined, ctx), /same Git clone/);
+	bootstrapped = true;
+	await register.execute("after", { path: "/repo" }, undefined, undefined, ctx);
+	await register.execute("dedup", { path: "/repo" }, undefined, undefined, ctx);
+	await assert.rejects(register.execute("foreign", { path: "/foreign" }, undefined, undefined, ctx), /same Git clone/);
+	assert.equal(ctx.sessionManager, manager);
+	assert.equal(ctx.sessionManager.getEntries().length, 1);
+	await commands.get("gentle:changes")!.handler("", ctx);
+	assert.match(ui.notices.join("\n"), /No captured agent changes/);
+	assert.equal(ui.overlay, undefined);
+	assert.deepEqual(git, []);
+	await fire(handlers, "session_shutdown", ctx);
 });
 
 test("Changes opens only for captured mutations, not registered dirty roots", async () => {

@@ -208,25 +208,55 @@ function restoreWorkspaceWritePermissions(cwd) {
 	}
 }
 
-async function loadExtensions(pi) {
+const ownedFixtureRoots = [];
+const previousFixtureEnvironment = new Map([
+	"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "PI_CODING_AGENT_DIR",
+	"GENTLE_PI_CONFIG_HOME", "GENTLE_PI_AGENT_HOME", "GENTLE_PI_TEST_ASSETS_DIR",
+	"GENTLE_PI_AGENTS_PARENT_PERMISSION_FD",
+].map((key) => [key, process.env[key]]));
+
+async function loadExtensions(pi, fixtureDependencies) {
 	for (const [index, rel] of EXTENSIONS.entries()) {
 		const mod = await import(`${pathToFileURL(join(ROOT, rel)).href}?runtime-harness=${index}`);
 		assert.equal(typeof mod.default, "function", `${rel} must export a default function`);
-		mod.default(pi);
+		if (rel === "extensions/gentle-ai.ts") createGentleAiExtension(fixtureDependencies)(pi);
+		else mod.default(pi);
 	}
 }
 
 async function run() {
 	const globalConfigHome = await tempWorkspace();
+	ownedFixtureRoots.push(globalConfigHome);
 	const globalAgentHome = await tempWorkspace();
+	ownedFixtureRoots.push(globalAgentHome);
 	const ambientTestAssetsDir = await tempWorkspace();
+	ownedFixtureRoots.push(ambientTestAssetsDir);
 	process.env.GENTLE_PI_CONFIG_HOME = globalConfigHome;
 	process.env.GENTLE_PI_AGENT_HOME = globalAgentHome;
 	process.env.GENTLE_PI_TEST_ASSETS_DIR = ambientTestAssetsDir;
+	process.env.HOME = globalAgentHome;
+	process.env.USERPROFILE = globalAgentHome;
+	process.env.XDG_CONFIG_HOME = join(globalAgentHome, "xdg");
+	process.env.PI_CODING_AGENT_DIR = join(globalAgentHome, "pi");
+	// Discovery still exercises the default exports under the actual worker
+	// role, but must never acquire the worker's parent-permission channel.
+	delete process.env.GENTLE_PI_AGENTS_PARENT_PERMISSION_FD;
+	const fixtureDependencies = {
+		nativeReviewCli: {},
+		processEnv: {
+			HOME: globalAgentHome, USERPROFILE: globalAgentHome,
+			GENTLE_PI_CONFIG_HOME: globalConfigHome, GENTLE_PI_AGENT_HOME: globalAgentHome,
+			PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+			XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+			GENTLE_PI_AGENTS_CHILD: "0", GENTLE_AI_TELEMETRY: "0",
+		},
+		resolveTelemetryTriggerBinary: () => join(globalAgentHome, "never-executed"),
+		telemetryTriggerSpawn: () => assert.fail("Runtime fixtures must not spawn telemetry"),
+	};
 	const globalModelsPath = join(globalConfigHome, "models.json");
 	const globalSubagentsPath = join(globalAgentHome, "subagents.json");
 	const { pi, hooks, commands, providers, flags, tools, emittedEvents } = createPi();
-	await loadExtensions(pi);
+	await loadExtensions(pi, fixtureDependencies);
 	assert.equal(providers.get("nan")?.getModels()[0]?.api, "openai-completions", "runtime extension loading registers the NaN provider");
 
 	// gentle-pi#404: a collect binding that returns the native last-event
@@ -305,7 +335,7 @@ async function run() {
 			},
 		};
 		const lastEventPi = createPi();
-		createGentleAiExtension({ nativeReviewCli })(lastEventPi.pi);
+		createGentleAiExtension({ ...fixtureDependencies, nativeReviewCli })(lastEventPi.pi);
 		const controller = lastEventPi.tools.get("gentle_review");
 		const capture = lastEventPi.tools.get("gentle_review_capture");
 		assert.ok(controller, "runtime must register the public status controller");
@@ -366,6 +396,14 @@ async function run() {
 	for (const toolName of ["read", "bash", "grep", "find", "ls", "edit", "write"]) {
 		assert.ok(tools.has(toolName), `missing quiet built-in tool renderer ${toolName}`);
 	}
+	const codemode = tools.get("codemode");
+	assert.ok(codemode, "quiet-tools must decorate the upstream codemode registration");
+	assert.equal(codemode.defaultActive, false, "rendering must not activate codemode");
+	assert.equal(codemode.renderShell, "self");
+	assert.equal(typeof codemode.renderCall, "function");
+	assert.equal(typeof codemode.renderResult, "function");
+	assert.equal(typeof codemode.prepareLoadout, "function", "upstream loadout policy must survive decoration");
+	assert.deepEqual(pi.getActiveTools(), ["read", "bash", "edit", "write"], "card registration must not change tool activation");
 	assert.ok(tools.has("gentle_review"), "missing registered bounded review controller tool");
 	assert.ok(tools.has("gentle_review_scope"), "missing registered bounded review scope tool");
 	assert.deepEqual(
@@ -832,7 +870,7 @@ async function run() {
 		registry.bindCurrent({ token: view.token, lineageId: "harness-candidate-drift", selectedLenses: ["review-risk"] });
 
 		const dispatchPi = createPi();
-		createGentleAiExtension({ candidateViews: registry })(dispatchPi.pi);
+		createGentleAiExtension({ ...fixtureDependencies, candidateViews: registry })(dispatchPi.pi);
 		const dispatchToolHook = dispatchPi.hooks.get("tool_call")[0];
 
 		// The contributor edits the tracked file strictly after the candidate
@@ -1847,4 +1885,10 @@ async function run() {
 run().catch((error) => {
 	console.error(error);
 	process.exitCode = 1;
+}).finally(async () => {
+	for (const [key, value] of previousFixtureEnvironment) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	for (const root of ownedFixtureRoots) await rm(root, { recursive: true, force: true });
 });
