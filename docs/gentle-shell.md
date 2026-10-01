@@ -142,22 +142,45 @@ Gentle notices are drawn as cards: the same rounded frame as the prompt. An info
 
 ```text
 ╭─ ✿ Gentle AI · review preflight ─────────────────────────────────────╮
-│ Receipt-driven development is enabled, and this worktree holds an…   │
+│ Receipt-driven development is enabled, and this worktree holds an    │
+│ unreviewed candidate (target sha256:…). First determine whether the  │
+│ user explicitly left this exact target unreviewed. If yes, do not    │
 ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
-- Every call into the gentle-ai binary and every `gentle_review` tool renders as a card under the rose, `🌹︎ Gentle AI`: the rail is amber while it runs, green when it finished, red when it failed; the expand key sits in the top rule once the tool finished, and the collapsed result shows only its line count. Reviewer captures name their lens (`review capture · risk`; the group lists all four).
-- The review preflight reminder renders as a card in the transcript with the expand key in its top rule.
-- An active dev-binary override shows above the editor at startup, in amber, naming the binary and its digest, and leaves with the first prompt; an invalid override shows in red with the reason.
+- Quiet tools use thin rounded cards with their actual name in the top rule (`read`, `bash`, `grep`, `find`, `ls`, `edit`, `write`); bash keeps its command visible. Collapsed results show up to three physical preview rows, including search/list entries or changed diff lines alongside useful totals. Expand with the configured key shown in the top rule for complete available output and image handling.
+- Every call into the gentle-ai binary and every `gentle_review` tool draws a rose card titled like the quiet `read` card: the colored 🌹 emoji, a short name, then the operation (`🌹 rdd inspect`, `🌹 gentle-ai version`), with `running`/`preparing`/`failed` shown until the call completes (`🌹 rdd running · start`). The rail uses the existing theme roles: warning while running/partial, success on completion, error on failure. Collapsed results show up to three useful physical rows, not just a line count. A JSON envelope instead collapses to one summary line of its key fields (status, outcome, risk, action, reason code, diagnostic message, e.g. `blocked · start · fresh_target_ready`) and expands as pretty-printed JSON. The expand key sits in the top rule once finished, and elapsed timing stays on the closing rule. Reviewer captures name their lens (`rdd capture · risk`; the group lists all four).
+- The review preflight reminder renders as a card in the transcript with the expand key in its top rule. Collapsed, it previews up to three non-blank physical rows of the reminder; expanded, it shows the full text.
+- An active dev-binary override shows above the editor at startup as a 🌹 gentle-ai card, in amber, naming the binary and its digest, and leaves with the first prompt; an invalid override shows in red with the reason.
 - Subagents draw their own card; see Gentle Agents below.
+
+### Card style
+
+Pick how conversation cards look in `/gentle:customize` → **Cards**. The choice applies immediately and is saved in `card-style.json` in the Gentle Pi config home; it is not part of visual profiles or visual reset.
+
+| Style | Look |
+|-------|------|
+| `neon` | The outlined rounded card shown above. |
+| `float` (default) | A borderless panel on the tone's tool background (success/info, pending, error), with a tone-colored `▎` accent bar, a one-column margin on each side, a blank row above the heading and at the bottom, and a blank row between the heading and the body. |
+
+```text
+ ▎
+ ▎ ⌖ find *.md in .                                  ctrl+o to expand
+ ▎
+ ▎ README.md
+ ▎
+```
+
+- `float` applies to tool, Code and 🌹 cards, Agent result and stale cards, the review preflight reminder, and the dev-binary notice. The Agents, Todos and Status panels keep the outlined frame in both styles.
+- A theme without a tool background, or a card narrower than 10 columns, falls back to `neon`. A malformed `card-style.json` reads as `float` and the panel refuses to overwrite it.
 
 ### Compact Code card
 
-With quiet tools enabled, `codemode` renders as one rounded **Code** card. The collapsed view shows up to eight observed child calls in their original order, including repeats, with Pi's actual `running`, `ok`, `error`, or `cancelled` status and available nonnegative duration. Additional calls are counted; errors and cancellations outside the preview remain visible in that count.
+With quiet tools enabled, `codemode` uses the same rounded **Code** card. The collapsed view shows up to eight observed child calls in their original order, including repeats, with Pi's actual status and available nonnegative duration. Additional calls and failures are counted. Error payloads have a separate two-row preview even when their child falls outside the first eight; final output has a three-row physical budget, and a full-output locator remains visible when available.
 
-- Collapsed rows do not echo JavaScript, child arguments, output, paths, or error payloads. Expand with the key shown in the top rule to inspect the actual script, all observed children, error text, and complete available text output.
-- Overall `running`/`finished`/`failed` labels follow the host render context. `finished` does not promise that every child succeeded or that effects were rolled back. No inferred children, progress percentage, or aggregate duration is added. Pi's final wall-time text remains available in expanded output.
-- Missing metadata is reported honestly. Terminal controls are stripped from displayed text; this is terminal-spoofing protection, **not secret redaction**. Expanded content can contain sensitive data.
+- JavaScript and child arguments stay out of the collapsed preview. Expand with the configured key shown in the top rule for the actual script, all observed children, complete available error/output text, image fallback and full-output locator.
+- Host failure/partial flags and observed child failures retain their existing semantic colors; no generic `finished` heading, inferred children, progress percentage, or aggregate duration is added. Pi's final status/wall-time header stays in expanded output rather than displacing useful collapsed content. Child success does not promise rollback or overall success.
+- Missing metadata is reported honestly. Terminal controls are stripped from displayed text; this is terminal-spoofing protection, **not secret redaction**. Both collapsed previews and expanded content can contain sensitive data.
 - Only presentation changes: upstream execution, schema, loadout, exposure and inactive-by-default behavior stay intact. `GENTLE_PI_QUIET_TOOLS=0` leaves the upstream presentation alone and does not change tool activation.
 
 ### Native interactive tools
@@ -196,7 +219,7 @@ Delegated children (`GENTLE_PI_AGENTS_CHILD=1`) load the same context files as t
 - `subagent_run.workspace_root` selects the parent's main worktree or an existing linked worktree in the parent's Git clone only. Validation happens before queueing; the child runs at that canonical root. Successful OS spawn registers it in the originating parent's same-clone registry, including delayed queued launches; failed spawns do not register.
 - Alternatively, `subagent_run.repository_root` selects an explicit canonical root of an independent Git repository; the two root selectors cannot be combined. A direct interactive parent must grant that clone before queue or child session-directory writes. The grant belongs to the live parent session and canonical Git common directory: subsequent launches there can reuse it, but denial, cancellation, lost UI, reload, or changed session/repository identity fails closed. Print, RPC, and child callers cannot request a foreign target; foreign remediation launches are unsupported. Task and background launches still obey their ordinary mode restrictions. Queued tasks revalidate immediately before spawn; `subagent_continue` retains the target cwd and revalidates the grant rather than prompting to restore a lost one. Status and task details expose the cwd. Foreign children never enter the same-clone registry or its footer/widget counts. A delegation grant is not permission to review, commit, push, or deliver in the target repository.
 - Background work requires a live interactive/RPC parent. Both `subagent_run` and `subagent_continue` reject background mode in `pi -p` before creating or spawning a task: the parent exits before it can receive a later result. Use task mode for bounded print-mode work.
-- A background task's result comes back to the model as a `gentle-agents.result` message, drawn as a rose card, and starts a new turn when the agent is idle; the model never polls.
+- A background task's result comes back to the model as a `gentle-agents.result` message and starts a new turn when the agent is idle; the model never polls. Its **Agent result** card uses the success color when the task completed and the error color otherwise. Collapsed, it previews up to three non-blank rows of the answer or error, leaving out the `Subagent … (task …) <outcome>.` bookkeeping line the model reads; older results without that line preview their full text. Expanded, it shows the complete message, header included. A result held past the stale window becomes a transcript-only **Stale agent result** card in the warning color: it previews up to three rows of its warning and never shows an answer it does not have (use `subagent_result` for that).
 - A configured child can call `subagent_parent_message` with bounded, well-formed Unicode text. Notifications retain their existing admission semantics. A `kind: "query"` waits for one strictly correlated `subagent_reply` for at most 30 seconds; each child has at most four pending queries, and disconnect, timeout, stop, and send failure settle each request once. The current parent session alone can reply. The first admitted task-mode query ends the original tool response while its child keeps running; its eventual non-cancelled completion returns once as a follow-up only if that same session is still active. Channel closure prevents later sends and automatic retry is not provided. Peer transport, offline delivery, retries, and broadcasts are unsupported.
 - The card shows the active session's tasks only: after `/new` or `/resume` the earlier session's tasks leave it and come back with their session. Finished rows stay for one minute (three at most), and the card spends at most a quarter of the terminal (three to eight rows) on tasks; beyond that the rest fold into one `… N more · alt+a to view` line so the editor never leaves the screen. Questions and running work keep their rows first.
 - `/gentle:agents` or `alt+a` opens a full-terminal overlay. At 60+ columns, the split view shows groups/tasks beside the retained semantic thread; uppercase `F` or **Fullscreen** expands that thread. At 12–59 columns, click a current subagent directly to inspect its thread; in All sessions, first select its orchestrator. `Enter`/`Tab` also enter a narrow selection. **Back** or `Escape` returns one level, closing only at the root; **Close** or `q` closes globally without cancelling children. Selection and manual thread scrolling survive Back and resize.

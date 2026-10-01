@@ -11,7 +11,8 @@ import { buildShellHeaderModel, renderShellBar, renderShellBottomOnlyBar, render
 import { CHANGE_STATUS, RootBranchLabels, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
-import { CARD_TONE, renderCard, type Card, type CardTheme } from "../lib/shell-card.ts";
+import { CARD_STYLE, CARD_TONE, renderCard, setCardStyle, type Card, type CardTheme } from "../lib/shell-card.ts";
+import { resolveCardStyle, writeCardStyle } from "../lib/card-style-policy.ts";
 import { CommandPalette, commandsKey, type CommandPaletteResult } from "../lib/command-palette.ts";
 import { buildCommandPaletteGroups } from "../lib/command-palette-catalog.ts";
 import { discoverYoloUiAdapter, YOLO_DISPLAY, type YoloDisplay, type YoloUiAdapter } from "../lib/yolo-session-policy.ts";
@@ -1334,6 +1335,7 @@ function messageText(content: string | Array<{ type: string; text?: string }>): 
 
 interface CardComponentOptions {
 	expanded: boolean;
+	previewRows?: number;
 	hint?: string;
 }
 
@@ -1357,15 +1359,19 @@ function spaced(component: { render(width: number): string[]; invalidate(): void
 	};
 }
 
+// Same rose identity as the Gentle AI tool cards (lib/gentle-ai-renderer.ts).
+const GENTLE_AI_GLYPH = "\u{1F339}";
+
 export function devBinaryCard(notice: DevBinaryNotice): Card {
 	if (notice.state === "invalid") {
-		return { title: "Gentle AI", subtitle: "dev binary override invalid", body: [notice.reason], tone: CARD_TONE.ERROR };
+		return { title: "gentle-ai", subtitle: "dev binary override invalid", body: [notice.reason], tone: CARD_TONE.ERROR, glyph: GENTLE_AI_GLYPH };
 	}
 	return {
-		title: "Gentle AI",
+		title: "gentle-ai",
 		subtitle: "dev binary override · field-test only",
 		body: [`${notice.path} · sha256:${notice.sha256.slice(0, SHA_PREFIX_LENGTH)}`],
 		tone: CARD_TONE.WARNING,
+		glyph: GENTLE_AI_GLYPH,
 	};
 }
 
@@ -1599,9 +1605,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		renderHost?.requestRender();
 	});
 	pi.registerMessageRenderer(REVIEW_PREFLIGHT_TYPE, (message, options, theme) => {
-		const body = messageText(message.content as string | Array<{ type: string; text?: string }>).split("\n");
+		const lines = messageText(message.content as string | Array<{ type: string; text?: string }>).split("\n");
+		const body = options.expanded ? lines : lines.filter((line) => line.trim() !== "");
 		const hint = keyHint("app.tools.expand", options.expanded ? "collapse" : "expand");
-		return cardComponent({ title: "Gentle AI", subtitle: "review preflight", body, tone: CARD_TONE.INFO }, theme, { expanded: options.expanded, hint });
+		return cardComponent({ title: "Gentle AI", subtitle: "review preflight", body, tone: CARD_TONE.INFO }, theme, { expanded: options.expanded, previewRows: 3, hint });
 	});
 	const openUsage = (ctx: ExtensionContext) =>
 		ctx.ui.custom<null>(
@@ -1653,6 +1660,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	const animationOptions = { gentlePiConfigHome: doubleEscCancelConfigHome };
 	let animationPolicy = resolveAnimationPolicy(animationOptions).policy;
 	let vimPolicy = resolveVimPolicy(animationOptions).policy;
+	// Conversation cards read the style from a process-wide slot; the saved
+	// preference fills it at startup and again on every session start.
+	const applyCardStyle = () => setCardStyle(resolveCardStyle(animationOptions).style);
+	applyCardStyle();
 	const reportVim = (ctx: ExtensionContext, result: ReturnType<typeof resolveVimPolicy>) => {
 		const source = result.source === "default" ? "built-in default" : `global file ${result.globalFile}`;
 		const effective = prompt?.effectiveVimPolicy;
@@ -1738,6 +1749,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		changes = undefined;
 		registry = new SessionWorktreeRegistry(pi, ctx.sessionManager, ctx.cwd, deps.resolveWorktree);
 		registry.start();
+		applyCardStyle();
 		if (!ctx.hasUI) return;
 		visualSettings = resolveVisualSettings(animationOptions).settings;
 		if (!overrides.activeProfile) {
@@ -1828,7 +1840,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		ctx.ui.setWidget(
 			DEV_BINARY_WIDGET_KEY,
 			notice
-				? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true }))
+				? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true, previewRows: 3 }))
 				: undefined,
 		);
 		if (changes !== tracker) return;
@@ -1918,6 +1930,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			if (closed) return;
 			let activeTheme = ctx.ui.theme.name;
 			let customizeView: VisualCustomizeView | undefined;
+			let requestCustomizeRender: (() => void) | undefined;
 			let category: CustomizeCategory = "Animations";
 			const add = (label: CustomizeRow["label"], notice: string, action: () => void | false | Promise<void | false>, preview?: CustomizeRow["preview"]) => rows.push({ category, label, preview, action: async () => {
 				if (await action() === false) return;
@@ -2079,6 +2092,22 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			for (const value of Object.values(STATUS_PLACEMENT)) add(() => `Status placement: ${value}${visual().statusPlacement === value ? " (current)" : ""}`, pending, () => updateVisual((settings) => ({ ...settings, statusPlacement: value })), () => layoutPreview({ ...visual(), statusPlacement: value }));
 			for (const value of Object.values(HEADER_PLACEMENT)) add(() => `Header placement: ${value}${visual().headerPlacement === value ? " (current)" : ""}`, pending, () => updateVisual((settings) => ({ ...settings, headerPlacement: value })), () => layoutPreview({ ...visual(), headerPlacement: value }));
 			for (const value of Object.values(DENSITY)) add(() => `Density: ${value}${visual().density === value ? " (current)" : ""}`, pending, () => updateVisual((settings) => ({ ...settings, density: value })), () => layoutPreview({ ...visual(), density: value }));
+			category = "Cards";
+			// Conversation cards only; the Agents, Todos and Status panels keep their frame.
+			const cardStylePreview = { [CARD_STYLE.NEON]: "╭─ ✿ read package.json ─╮  outlined card", [CARD_STYLE.FLOAT]: "▎ ✿ read package.json     borderless panel" };
+			for (const style of Object.values(CARD_STYLE)) add(
+				() => {
+					const current = resolveCardStyle(home);
+					return `Card style: ${style}${current.style === style && !current.malformed ? " (current)" : ""}`;
+				},
+				`Card style: ${style}. Conversation cards redraw now.`,
+				() => {
+					writeCardStyle(style, home);
+					setCardStyle(style);
+					requestCustomizeRender?.();
+				},
+				() => ({ title: `Cards · ${style}`, sample: `${cardStylePreview[style]}${resolveCardStyle(home).malformed ? " · malformed or unreadable file" : ""}` }),
+			);
 			category = "Sections";
 			for (const key of VISUAL_SECTION_KEYS) add(
 				() => `Section ${key}: ${visual().visibility[key] ? "shown" : "hidden"}`,
@@ -2174,6 +2203,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					finish = () => done(null);
 					if (closed) done(null);
 					requestYoloRender = () => { if (!closed) tui.requestRender(); };
+					requestCustomizeRender = requestYoloRender;
 					customizeView = new VisualCustomizeView({ rows, profiles, theme, requestRender: requestYoloRender, rowsAvailable: () => Math.max(0, Math.floor(tui.terminal.rows * 0.85) - 2), onError: (error) => { if (!closed) ctx.ui.notify(`Visual customization: ${error.message}`, "error"); }, onClose: close });
 					const view = customizeView;
 					// Own interaction lifetime here, leaving the shared view unchanged.

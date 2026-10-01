@@ -283,10 +283,22 @@ export function resolveDefaultSubagentMode(input: {
 }
 
 // What the model reads when a background task ends: the outcome first, then
-// the answer itself. The card renderer shows the same text.
+// the answer itself. The expanded card shows the same text.
 export function completionText(task: TaskRecord): string {
 	const outcome = task.status === "completed" ? "finished" : task.status.replace("_", " ");
 	return `Subagent ${task.agent} (task ${task.id}, "${task.label}") ${outcome}.\n\n${finishedText(task)}`;
+}
+
+const COMPLETION_HEADER = /^Subagent [^\n]+ \(task [^\n]*\) [^\n]+\.$/;
+
+// The collapsed card leads with the answer or error: completionText's
+// bookkeeping paragraph stays for the model and the expanded card. Entries
+// without that header (older sessions) preview their full text.
+export function agentResultPreview(text: string): string {
+	const split = text.indexOf("\n\n");
+	if (split < 0 || !COMPLETION_HEADER.test(text.slice(0, split))) return text;
+	const rest = text.slice(split + 2);
+	return rest.trim() === "" ? text : rest;
 }
 
 // Host-side answer to a child's dialog: the same ctx.ui the human already
@@ -780,12 +792,13 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	pi.registerMessageRenderer(AGENTS_RESULT_TYPE, (message, options, theme) => {
 		const details = (message.details as { gentleAgents?: { agent?: string; status?: string } } | undefined)?.gentleAgents;
 		const content = message.content as string | Array<{ type: string; text?: string }>;
-		const body = (typeof content === "string" ? content : content.map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("\n")).split("\n");
+		const text = typeof content === "string" ? content : content.map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("\n");
+		const body = options.expanded ? text.split("\n") : agentResultPreview(text).split("\n").filter((line) => line.trim() !== "");
 		const tone = details?.status === "completed" ? CARD_TONE.SUCCESS : CARD_TONE.ERROR;
 		const hint = expandHint(options.expanded);
 		return {
 			render(width: number) {
-				return renderCard({ title: "Agent result", subtitle: details?.agent, body, tone, glyph: AGENTS_GLYPH }, theme, width, { expanded: options.expanded, hint });
+				return renderCard({ title: "Agent result", subtitle: details?.agent, body, tone, glyph: AGENTS_GLYPH }, theme, width, { expanded: options.expanded, previewRows: 3, hint });
 			},
 			invalidate() {},
 		};
@@ -807,7 +820,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		];
 		return {
 			render(width: number) {
-				return renderCard({ title: "Stale agent result", subtitle: `${agent} · task ${taskId}`, body, tone: CARD_TONE.WARNING, glyph: AGENTS_GLYPH }, theme, width, { expanded: options.expanded, hint: expandHint(options.expanded) });
+				return renderCard({ title: "Stale agent result", subtitle: `${agent} · task ${taskId}`, body, tone: CARD_TONE.WARNING, glyph: AGENTS_GLYPH }, theme, width, { expanded: options.expanded, previewRows: 3, hint: expandHint(options.expanded) });
 			},
 			invalidate() {},
 		};
