@@ -1,8 +1,10 @@
 import { CURSOR_MARKER, Editor, visibleWidth } from "@earendil-works/pi-tui";
 import { createRequire } from "node:module";
 
-// Private shape audited against @earendil-works/pi-tui 0.99.1: editor.js
+// Private shape audited against @earendil-works/pi-tui 0.99.1 and 0.99.2: editor.js
 // layoutText/render/setCursorCol and undo-stack.js clone-on-push snapshots.
+// Both releases ship byte-identical dist/components/editor.js (SHA-256 fde684ba…)
+// and dist/undo-stack.js (SHA-256 7fbb318d…).
 // Both the bundled host and unbundled development pair exercise this contract.
 // Never silently adapt another build: undo also owns the paste registry.
 interface Position { line: number; col: number }
@@ -40,7 +42,14 @@ interface PrivateEditor {
   exitHistoryBrowsing(): void;
 }
 
-const SUPPORTED_VERSIONS = new Set(["0.99.1"]);
+// The single audited-release source for the adapter and Gentle Shell's runtime
+// identity gates. Add a release only after re-auditing the files named above.
+export const AUDITED_PI_EDITOR_VERSIONS = Object.freeze(["0.99.1", "0.99.2"] as const);
+export type AuditedPiEditorVersion = (typeof AUDITED_PI_EDITOR_VERSIONS)[number];
+
+export function isAuditedPiEditorVersion(version: unknown): version is AuditedPiEditorVersion {
+  return typeof version === "string" && (AUDITED_PI_EDITOR_VERSIONS as readonly string[]).includes(version);
+}
 // Pi aliases only ES imports of host packages. This raw require walks
 // node_modules from the extension, which a git install lacks (#1586), so an
 // unresolved host leaves the version unknown and the identity gate closed.
@@ -53,7 +62,7 @@ const IMPORTED_TUI_VERSION = typeof importedTuiMetadata === "object" && imported
 // The caller supplies the Editor constructor from the same Pi/TUI package pair
 // as the version metadata. An arbitrary object with matching fields is not an editor.
 function hasEditorIdentity(value: unknown, version: string, editorClass: typeof Editor, verifiedVersion?: string): boolean {
-  if (!SUPPORTED_VERSIONS.has(version) || typeof value !== "object" || value === null ||
+  if (!isAuditedPiEditorVersion(version) || typeof value !== "object" || value === null ||
       (verifiedVersion !== undefined ? version !== verifiedVersion :
         editorClass === Editor ? version !== IMPORTED_TUI_VERSION : true) || !(value instanceof editorClass)) return false;
   let prototype: unknown = Object.getPrototypeOf(value);
