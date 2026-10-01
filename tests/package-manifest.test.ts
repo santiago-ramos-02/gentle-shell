@@ -133,16 +133,18 @@ test("public docs and metadata advertise ODD and review without retired phase wo
 test("technical reference declares the tested Pi minimum required for agent_settled", () => {
 	const manifest = readPackageJson();
 	assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], ">=0.99.1");
-	assert.equal(manifest.devDependencies?.["@earendil-works/pi-coding-agent"], ">=0.99.2");
+	assert.equal(manifest.devDependencies?.["@earendil-works/pi-coding-agent"], ">=1.0.0");
 	assert.equal(manifest.peerDependenciesMeta?.["@earendil-works/pi-coding-agent"]?.optional, true);
 	assert.equal(manifest.engines?.node, ">=22.19.0");
 	for (const path of ["docs/readme-reference.md", "docs/gentle-shell.md"]) {
 		const source = readFileSync(join(PACKAGE_ROOT, path), "utf8");
 		assert.match(source, /Pi 0\.99\.1 or newer/, path);
-		assert.match(source, /open `>=0\.99\.2` development range/, path);
+		assert.match(source, /open `>=1\.0\.0` development range/, path);
 		assert.doesNotMatch(source, /development tests pin Pi/, path);
 		// Docs name exactly the audited Vim editor releases, never a future one.
-		assert.match(source, new RegExp(`audited Pi ${AUDITED_PI_EDITOR_VERSIONS.map(v => `\`${v.replace(/\./g, "\\.")}\``).join(" and ")}`), path);
+		const auditedReleases = new Intl.ListFormat("en", { style: "long", type: "conjunction" })
+			.format(AUDITED_PI_EDITOR_VERSIONS.map(v => `\`${v.replace(/\./g, "\\.")}\``));
+		assert.match(source, new RegExp(`audited Pi ${auditedReleases}`), path);
 	}
 	const reference = readFileSync(join(PACKAGE_ROOT, "docs", "readme-reference.md"), "utf8");
 	assert.match(reference, /agent_settled/);
@@ -159,7 +161,7 @@ test("packed runtime uses optional Pi host peers with one open development range
 	// one exact release shared by every Pi host package.
 	const installed = new Set<string>();
 	for (const name of ["@earendil-works/pi-coding-agent", "@earendil-works/pi-ai", "@earendil-works/pi-tui"]) {
-		assert.equal(manifest.devDependencies?.[name], ">=0.99.2", name);
+		assert.equal(manifest.devDependencies?.[name], ">=1.0.0", name);
 		const metadata = JSON.parse(readFileSync(join(PACKAGE_ROOT, "node_modules", name, "package.json"), "utf8")) as { name: string; version: string };
 		assert.equal(metadata.name, name);
 		installed.add(metadata.version);
@@ -409,20 +411,20 @@ test("package manifest installs pi-pretty through a wrapper without bundling nat
 	);
 });
 
-test("package verification binds the published Gentle AI v3.7.0 runtime pin", () => {
+test("package verification binds the published Gentle AI v4.0.0 runtime pin", () => {
 	const installer = readFileSync(join(PACKAGE_ROOT, "scripts", "gentle-ai-installer.mjs"), "utf8");
 	const binary = readFileSync(join(PACKAGE_ROOT, "lib", "gentle-ai-binary.ts"), "utf8");
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
 
-	assert.match(installer, /INSTALLER_VERSION = "3\.7\.0"/);
+	assert.match(installer, /INSTALLER_VERSION = "4\.0\.0"/);
 	assert.match(installer, /GENTLE_AI_WINDOWS_SOURCE_PACKAGE.*GENTLE_AI_WINDOWS_SOURCE_MODULE/);
-	assert.match(installer, /GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM = "h1:MQbzHlLdPklUQn0rVE9Mz94UygHsN2OPe7xMfPn9aGw="/);
+	assert.match(installer, /GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM = "h1:pZ\/XZ2Pk3U9lgXigOTY62zlxxFOHnc9CjQhLgaV\/Hfc="/);
 	assert.match(installer, /GOTOOLCHAIN: "local"/);
 	assert.match(installer, /GOSUMDB: "sum\.golang\.org"/);
 	assert.match(binary, /GENTLE_AI_VERSION = INSTALLER_VERSION/);
 	assert.match(binary, /GO_SUMDB_SOURCE_BUILD/);
 	assert.match(binary, /GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM/);
-	assert.match(verifier, /v3\.7\.0/);
+	assert.match(verifier, /v4\.0\.0/);
 });
 
 
@@ -1703,9 +1705,9 @@ test("pi-pretty wrapper uses cached ESM loading for compiled and pnpm symlink in
 	assert.match(wrapper, /quietToolsEnabled/);
 });
 
-test("Gentle Shell v3.7.0 package manifest declares the release version", () => {
+test("Gentle Shell v4.0.0 package manifest declares the release version", () => {
 	const packageJson = readPackageJson();
-	assert.equal(packageJson.version, "3.7.0", "the release manifest must be explicitly pinned to v3.7.0");
+	assert.equal(packageJson.version, "4.0.0", "the release manifest must be explicitly pinned to v4.0.0");
 	assert.equal(packageJson.scripts?.test, "node scripts/run-test-suite.mjs");
 	assert.ok(packageJson.files?.includes("assets/"));
 	assert.ok(packageJson.files?.includes("contracts/"));

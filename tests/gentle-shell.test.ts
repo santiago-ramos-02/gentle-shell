@@ -1895,7 +1895,8 @@ test("visual customization and Vim register once and remain independently discov
 	assert.equal(JSON.parse(readFileSync(join(home, "vim.json"), "utf8")).policy, "on");
 });
 
-test("vim command enables a live prompt and INSERT Escape enters NORMAL without clearing", async (t) => {
+test("actual Pi 1.0.0 enables a live prompt and enters NORMAL without a compatibility fallback", async () => {
+ assert.equal(INSTALLED_PI, "1.0.0", "the shell audit must run against actual installed Pi 1.0.0");
  const configHome = mkdtempSync(join(tmpdir(), "gentle-vim-shell-"));
  const { pi, handlers, commands } = fakePi();
  gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome });
@@ -1906,6 +1907,9 @@ test("vim command enables a live prompt and INSERT Escape enters NORMAL without 
  editor.handleInput("\x1b");
  assert.equal(editor.getText(), "hello");
  assert.match(editor.render(60).join("\n"), /NORMAL/);
+ assert.match(ui.notices.at(-1)!, /Prompt applies now/);
+ assert.ok(ui.notices.every((notice) => !/unsupported|ordinary editing remains active|compatibility/i.test(notice)),
+  "actual installed runtime must not report fallback");
  editor.handleInput("i");
  assert.match(editor.render(60).join("\n"), /INSERT/);
  editor.dispose();

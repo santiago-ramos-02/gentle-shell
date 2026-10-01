@@ -1,11 +1,14 @@
 import { CURSOR_MARKER, Editor, visibleWidth } from "@earendil-works/pi-tui";
 import { createRequire } from "node:module";
 
-// Private shape audited against @earendil-works/pi-tui 0.99.1 and 0.99.2: editor.js
-// layoutText/render/setCursorCol and undo-stack.js clone-on-push snapshots.
-// Both releases ship byte-identical dist/components/editor.js (SHA-256 fde684ba…)
-// and dist/undo-stack.js (SHA-256 7fbb318d…).
-// Both the bundled host and unbundled development pair exercise this contract.
+// Private shape audited against @earendil-works/pi-tui 0.99.1, 0.99.2 and 1.0.0:
+// editor.js state/pastes/history, sticky cursor reset, layoutText/render geometry,
+// autocomplete cancellation and { state, pastes, pasteCounter } undo restoration;
+// undo-stack.js clone-on-push/pop snapshots. The two 0.99 releases ship identical
+// editor/undo-stack sources; 1.0.0 is a touched-contract audit, not byte identity.
+// Actual 1.0.0 bundled and unbundled tests exercise identity, edit/undo, paste,
+// selection, wrapping/scroll and autocomplete; fabricated metadata tests only
+// prove exact-version admission for the older audited releases.
 // Never silently adapt another build: undo also owns the paste registry.
 interface Position { line: number; col: number }
 interface State { lines: string[]; cursorLine: number; cursorCol: number }
@@ -44,7 +47,7 @@ interface PrivateEditor {
 
 // The single audited-release source for the adapter and Gentle Shell's runtime
 // identity gates. Add a release only after re-auditing the files named above.
-export const AUDITED_PI_EDITOR_VERSIONS = Object.freeze(["0.99.1", "0.99.2"] as const);
+export const AUDITED_PI_EDITOR_VERSIONS = Object.freeze(["0.99.1", "0.99.2", "1.0.0"] as const);
 export type AuditedPiEditorVersion = (typeof AUDITED_PI_EDITOR_VERSIONS)[number];
 
 export function isAuditedPiEditorVersion(version: unknown): version is AuditedPiEditorVersion {

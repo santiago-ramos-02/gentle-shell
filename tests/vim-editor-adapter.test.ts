@@ -181,16 +181,30 @@ test("runtime identity resolves only the matching installed coding-agent/TUI pai
   assert.deepEqual(resolveVimRuntime("/nonexistent/cli.js", runtimeAgent.CustomEditor), { version: INSTALLED_PI, editorClass: Editor });
 });
 
-function assertInstalledPiPairBehavior(version: string, EditorClass: typeof Editor, CustomClass: { prototype: unknown } | undefined): void {
+function assertInstalledPiPairBehavior(version: string, EditorClass: typeof Editor, CustomClass: { prototype: unknown } | undefined, verifiedVersion?: string): void {
   assert.equal(CustomClass ? Object.getPrototypeOf(CustomClass.prototype) : EditorClass.prototype, EditorClass.prototype);
   const e = new EditorClass({ terminal: { rows: 6, columns: 22 }, requestRender() {} } as never, { borderColor: (s: string) => s } as never);
   e.setText("alpha beta\nthird line");
-  const adapter = createVimEditorAdapter(e, version, EditorClass);
+  const adapter = createVimEditorAdapter(e, version, EditorClass, verifiedVersion);
   adapter.move({ line: 0, col: 6 });
   adapter.replace({ line: 0, col: 6 }, { line: 0, col: 10 }, "snow");
   assert.equal(e.getText(), "alpha snow\nthird line");
   adapter.undo();
   assert.equal(e.getText(), "alpha beta\nthird line");
+  e.addToHistory("earlier draft");
+  e.setText("");
+  e.handleInput(`\x1b[200~${"z".repeat(1001)}\x1b[201~`);
+  e.insertTextAtCursor("\ntail");
+  const pastedText = e.getText();
+  const expandedText = e.getExpandedText();
+  adapter.replace({ line: 1, col: 0 }, { line: 1, col: 4 }, "snow");
+  assert.equal(e.getExpandedText(), expandedText.replace("tail", "snow"), `${version}: real paste survives edit`);
+  adapter.undo();
+  assert.equal(e.getText(), pastedText, `${version}: undo restores collapsed marker`);
+  assert.equal(e.getExpandedText(), expandedText, `${version}: undo restores paste registry`);
+  e.setText("");
+  e.handleInput("\x1b[A");
+  assert.equal(e.getText(), "earlier draft", `${version}: history survives private edit`);
   e.setText("[paste #1 3 chars] wrapping text\nthird line");
   (e as unknown as { pastes: Map<number, string> }).pastes.set(1, "abc");
   assert.ok(!adapter.motionBoundaries()[0]!.includes(4), `${version}: paste marker atomic`);
@@ -214,6 +228,11 @@ function assertInstalledPiPairBehavior(version: string, EditorClass: typeof Edit
   assert.ok(privateEditor.scrollOffset > 0, `${version}: scrolled wraps`);
   assert.equal(adapter.renderSelection(18, { line: 0, col: 0 }, { line: 0, col: 6 }, scrolled).length, scrolled.length);
 }
+
+test("actual bundled Pi 1.0.0 proves editing, undo, paste, selection, wrap and autocomplete", () => {
+  assert.equal(bundledAgent.VERSION, "1.0.0");
+  assertInstalledPiPairBehavior(bundledAgent.VERSION, BundledEditor, bundledAgent.CustomEditor, bundledAgent.VERSION);
+});
 
 test("installed audited Pi local pair proves version, constructor identity, editing, paste, selection, wrap and autocomplete", () => {
   assertInstalledPiPairBehavior(INSTALLED_PI, Editor, undefined);
@@ -251,18 +270,19 @@ test("resolveVimRuntime resolves local bundle cli entrypoint when provided", () 
 });
 
 test("audited Pi editor releases are one frozen exact allowlist that includes the installed TUI", () => {
-  assert.deepEqual([...AUDITED_PI_EDITOR_VERSIONS], ["0.99.1", "0.99.2"]);
+  assert.deepEqual([...AUDITED_PI_EDITOR_VERSIONS], ["0.99.1", "0.99.2", "1.0.0"]);
+  assert.equal(INSTALLED_PI, "1.0.0", "this audit must exercise actual Pi 1.0.0, not a fabricated release");
   assert.ok(Object.isFrozen(AUDITED_PI_EDITOR_VERSIONS));
   assert.throws(() => (AUDITED_PI_EDITOR_VERSIONS as unknown as string[]).push("0.99.3"), TypeError);
   assert.ok(isAuditedPiEditorVersion(INSTALLED_PI), `installed pi-tui ${INSTALLED_PI} must be audited`);
-  for (const unknown of ["0.99.3", "0.99.10", "0.99", "v0.99.2", " 0.99.2", "0.99.2-rc.1", ">=0.99.2", undefined, 99.2]) {
+  for (const unknown of ["0.99.3", "0.99.10", "0.99", "v0.99.2", " 0.99.2", "0.99.2-rc.1", ">=0.99.2", "1.0.1", ">=1.0.0", "v1.0.0", " 1.0.0", "1.0.0-rc.1", undefined, 99.2]) {
     assert.equal(isAuditedPiEditorVersion(unknown), false, String(unknown));
   }
 });
 
 // A fabricated package root reuses the real installed classes but declares its
 // own release metadata, isolating the audited-version allowlist from identity.
-function fabricatedPiCli(t: test.TestContext, version: string): string {
+function fabricatedPiCli(t: test.TestContext, version: string, tuiVersion = version, bundledVersion = version): string {
   const root = realpathSync(mkdtempSync(resolve(tmpdir(), "gentle-vim-audit-")));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const realBundle = resolve(dirname(realpathSync(target)), "index.js");
@@ -274,31 +294,38 @@ function fabricatedPiCli(t: test.TestContext, version: string): string {
   writeFileSync(resolve(root, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version }));
   writeFileSync(resolve(root, "dist", "bundle", "cli.js"), "");
   writeFileSync(resolve(root, "dist", "bundle", "index.js"),
-    `const real = require(${JSON.stringify(realBundle)});\nmodule.exports = { CustomEditor: real.CustomEditor, VERSION: ${JSON.stringify(version)} };\n`);
+    `const real = require(${JSON.stringify(realBundle)});\nmodule.exports = { CustomEditor: real.CustomEditor, VERSION: ${JSON.stringify(bundledVersion)} };\n`);
   writeFileSync(resolve(root, "dist", "index.js"), `module.exports = { CustomEditor: require(${JSON.stringify(realAgent)}).CustomEditor };\n`);
-  writeFileSync(resolve(tuiRoot, "package.json"), JSON.stringify({ name: "@earendil-works/pi-tui", version, main: "dist/index.js" }));
+  writeFileSync(resolve(tuiRoot, "package.json"), JSON.stringify({ name: "@earendil-works/pi-tui", version: tuiVersion, main: "dist/index.js" }));
   writeFileSync(resolve(tuiRoot, "dist", "index.js"), `module.exports = { Editor: require(${JSON.stringify(realTui)}).Editor };\n`);
   return resolve(root, "dist", "bundle", "cli.js");
 }
 
-test("bundled host admits each audited release and never an unknown 0.99.3", (t) => {
-  for (const version of ["0.99.1", "0.99.2"]) {
+test("bundled host admits each audited release and rejects unknown or mismatched bundle metadata", (t) => {
+  for (const version of ["0.99.1", "0.99.2", "1.0.0"]) {
     assert.deepEqual(resolveVimRuntime(fabricatedPiCli(t, version), bundledAgent.CustomEditor), { version, editorClass: BundledEditor }, version);
   }
-  assert.equal(resolveVimRuntime(fabricatedPiCli(t, "0.99.3"), bundledAgent.CustomEditor), undefined);
+  for (const version of ["0.99.3", "1.0.1", ">=1.0.0", "v1.0.0"]) {
+    assert.equal(resolveVimRuntime(fabricatedPiCli(t, version), bundledAgent.CustomEditor), undefined, version);
+  }
+  assert.equal(resolveVimRuntime(fabricatedPiCli(t, "1.0.0", "1.0.0", "0.99.2"), bundledAgent.CustomEditor), undefined);
 });
 
-test("installed agent/TUI pair admits each audited release and skips an unknown 0.99.3 pair", (t) => {
-  for (const version of ["0.99.1", "0.99.2"]) {
+test("installed agent/TUI pair admits each audited release and skips unknown or mismatched pairs", (t) => {
+  for (const version of ["0.99.1", "0.99.2", "1.0.0"]) {
     assert.deepEqual(resolveVimRuntime(fabricatedPiCli(t, version), runtimeAgent.CustomEditor), { version, editorClass: runtimeTui.Editor }, version);
   }
-  // The unknown pair is never certified; only the real local install still is.
-  assert.deepEqual(resolveVimRuntime(fabricatedPiCli(t, "0.99.3"), runtimeAgent.CustomEditor), { version: INSTALLED_PI, editorClass: runtimeTui.Editor });
+  // Rejected candidates must resolve to the real local pair, not their claim.
+  for (const version of ["0.99.3", "1.0.1", ">=1.0.0", "v1.0.0"]) {
+    assert.deepEqual(resolveVimRuntime(fabricatedPiCli(t, version), runtimeAgent.CustomEditor), { version: INSTALLED_PI, editorClass: runtimeTui.Editor }, version);
+  }
+  assert.deepEqual(resolveVimRuntime(fabricatedPiCli(t, "0.99.2", "1.0.0"), runtimeAgent.CustomEditor),
+    { version: INSTALLED_PI, editorClass: runtimeTui.Editor }, "mismatched pair falls back to verified local metadata");
 });
 
-test("adapter admits each verified audited release and rejects an unknown 0.99.3 claim without mutation", () => {
+test("adapter admits each verified audited release and rejects unknown or mismatched claims without mutation", () => {
   const host = () => new BundledEditor!({ terminal: { rows: 6 }, requestRender() {} } as never, { borderColor: (s: string) => s } as never);
-  for (const version of ["0.99.1", "0.99.2"]) {
+  for (const version of ["0.99.1", "0.99.2", "1.0.0"]) {
     const e = host();
     e.setText("alpha beta");
     const adapter = createVimEditorAdapter(e, version, BundledEditor, version);
@@ -308,9 +335,18 @@ test("adapter admits each verified audited release and rejects an unknown 0.99.3
   }
   const e = host();
   e.setText("untouched");
-  assert.throws(() => createVimEditorAdapter(e, "0.99.3", BundledEditor, "0.99.3"), /unsupported/i);
-  assert.throws(() => createVimEditorAdapter(editor(), "0.99.3"), /unsupported/i);
+  const frame = e.render(30);
+  const cursor = e.getCursor();
+  const snapshots = structuredClone((e as unknown as { undoStack: { stack: unknown[] } }).undoStack.stack);
+  for (const version of ["0.99.3", "1.0.1", ">=1.0.0", "v1.0.0"]) {
+    assert.throws(() => createVimEditorAdapter(e, version, BundledEditor, version), /unsupported/i, version);
+    assert.throws(() => createVimEditorAdapter(editor(), version), /unsupported/i, version);
+  }
+  assert.throws(() => createVimEditorAdapter(e, "1.0.0", BundledEditor, "0.99.2"), /unsupported/i);
   assert.equal(e.getText(), "untouched");
+  assert.deepEqual(e.getCursor(), cursor);
+  assert.deepEqual(e.render(30), frame);
+  assert.deepEqual((e as unknown as { undoStack: { stack: unknown[] } }).undoStack.stack, snapshots);
 });
 
 test("installed audited Pi pair proves version, constructor identity, editing, paste, selection, wrap and autocomplete", { skip: skip0871 }, () => {

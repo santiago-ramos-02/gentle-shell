@@ -634,7 +634,7 @@ test("Pi 0.99.1 baseline and host peers follow the open development range policy
 	// Development ranges are policy specifiers; their floor never drops below
 	// the runtime minimum the launcher enforces.
 	for (const name of ["@earendil-works/pi-coding-agent", "@earendil-works/pi-ai", "@earendil-works/pi-tui"]) {
-		assert.equal(pkg.devDependencies[name], ">=0.99.2", name);
+		assert.equal(pkg.devDependencies[name], ">=1.0.0", name);
 		assert.equal(checkPiVersion(pkg.devDependencies[name].slice(2)).ok, true, name);
 	}
 });
