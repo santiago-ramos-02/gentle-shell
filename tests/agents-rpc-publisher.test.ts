@@ -50,6 +50,9 @@ function rpcTask(id: string, status: TaskStatus, endedAt: number | null, opts: {
 		summary: {
 			id,
 			agent: "a",
+			mode: "task",
+			model: "default",
+			thinking: null,
 			label: "l".repeat(labelLen),
 			prompt: "p",
 			status,
@@ -91,9 +94,13 @@ test("projectRpcActivity whitelists task fields and orders running, waiting, que
 	const runningSummary = activity.tasks[0]!.summary;
 	assert.deepEqual(
 		Object.keys(runningSummary).sort(),
-		["id", "agent", "label", "prompt", "status", "createdAt", "startedAt", "endedAt", "lastStep", "lastActivityAt", "turns", "toolCalls", "error"].sort(),
-		"only the whitelisted fields are projected: cwd, parentSessionId, mode, model, thinking, sessionPath, result, tokens, and cost never leak",
+		["id", "agent", "mode", "model", "thinking", "label", "prompt", "status", "createdAt", "startedAt", "endedAt", "lastStep", "lastActivityAt", "turns", "toolCalls", "error"].sort(),
+		"only the whitelisted fields are projected: cwd, parentSessionId, sessionPath, result, tokens, and cost never leak",
 	);
+	// A host shows which model each subagent runs and whether it runs in the background.
+	assert.equal(runningSummary.mode, "task");
+	assert.equal(runningSummary.model, "gpt");
+	assert.equal(runningSummary.thinking, null);
 	assert.equal(runningSummary.agent, "explore");
 	assert.equal(runningSummary.label, "Explore X");
 	assert.equal(runningSummary.prompt, "short prompt");

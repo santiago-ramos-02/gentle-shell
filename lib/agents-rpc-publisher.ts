@@ -34,6 +34,11 @@ const DEFAULT_COALESCE_MS = 150;
 export interface RpcTaskSummary {
 	id: string;
 	agent: string;
+	/** "task" (the parent waits for it) or "background". */
+	mode: string;
+	/** The resolved `provider/id`, or "default". */
+	model: string;
+	thinking: string | null;
 	label: string;
 	prompt: string;
 	status: TaskStatus;
@@ -111,6 +116,9 @@ function projectTaskSummary(task: TaskRecord): RpcTaskSummary {
 	return {
 		id: task.id,
 		agent: task.agent,
+		mode: task.mode,
+		model: truncate(task.model, SUMMARY_FIELD_LIMIT),
+		thinking: task.thinking ?? null,
 		label: truncate(task.label, SUMMARY_FIELD_LIMIT),
 		prompt: truncate(task.prompt, PROMPT_LIMIT),
 		status: task.status,
