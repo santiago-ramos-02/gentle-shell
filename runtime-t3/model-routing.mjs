@@ -340,7 +340,21 @@ export function readGlobalEffectiveModelConfig(cwd        )                   {
 export async function readEffectiveModelConfigAsync(cwd        )                            {
 	const pinned = pinnedEffectiveModelConfig(cwd);
 	if (pinned) return pinned;
-	const effective = cloneModelConfig(await readModelConfigAsync(cwd));
+	return readGlobalEffectiveModelConfigFromAsync(cwd, await readModelConfigAsync(cwd));
+}
+
+/**
+ * The saved global routing merged with the materialized stores of every
+ * discoverable agent it is silent about — the same effective view
+ * `readEffectiveModelConfigAsync` builds, but starting from an already-read
+ * saved routing so callers that must distinguish an unreadable authority can
+ * keep that distinction while still seeing materialized routes.
+ */
+export async function readGlobalEffectiveModelConfigFromAsync(
+	cwd        ,
+	base                  ,
+)                            {
+	const effective = cloneModelConfig(base);
 	const profilesByPath = new Map                                 ();
 	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
 		if (isProviderReviewRole(agent.name) || agent.name in effective) continue;

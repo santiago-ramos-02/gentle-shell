@@ -62,6 +62,11 @@ export async function applyProfile(options: {
 	file: AgentProfilesFile;
 	name: string;
 	global?: boolean;
+	/** Asked before a global apply writes anything; declining applies nothing. */
+	confirmGlobalApply?: (profile: {
+		normalized: AgentModelConfig;
+		orchestratorEntry: ReturnType<typeof readProfileOrchestrator>;
+	}) => Promise<boolean>;
 }): Promise<ProfileApplyResult | undefined> {
 	const { cwd, profilesPath: path, file, name } = options;
 	if (!hasOwnProfile(file.profiles, name)) return undefined;
@@ -84,6 +89,9 @@ export async function applyProfile(options: {
 	}
 	const normalized = normalizeModelConfig(file.profiles[name]) ?? {};
 	const orchestratorEntry = readProfileOrchestrator(normalized);
+	if (options.confirmGlobalApply && !(await options.confirmGlobalApply({ normalized, orchestratorEntry }))) {
+		return undefined;
+	}
 	// Applying spans three files — the store, models.json, and Pi's global
 	// settings.json — and there is no cross-file rename, so order the writes to
 	// keep the store truthful and compensate on failure: claim the profile in
