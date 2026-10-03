@@ -63,6 +63,15 @@ const TOOL_PREFIX = "subagent_";
 // Wakes an idle parent after child content was stored as a custom message.
 // It names itself as automated so the model never attributes it to the human.
 const PARENT_WAKE_TEXT = "[System-generated Gentle Agents notification, not written by the user] Subagent output was delivered to this session above. Review it and continue.";
+const PARENT_WAKE_TYPE = "gentle-agents.wake";
+const BRIDGE_WAKE_IDENTITY_TYPE = "gentle-agents.wake-identity";
+interface BridgeWakeIdentity {
+	sessionId: string;
+	nonce: string;
+	text: string;
+}
+const bridgeWakeText = (nonce: string): string => `${PARENT_WAKE_TEXT} [gentle-agents wake: ${nonce}]`;
+const NATIVE_PARENT_WAKE_TEXT = "Review the delivered subagent output and continue.";
 // How long a dispatched wake may take to start a parent run before a later
 // delivery may send another one.
 export const PARENT_WAKE_GRACE_MS = 30_000;
@@ -595,6 +604,53 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// session_start context is kept for it and dropped at shutdown; a stale
 	// context throws instead of answering, so delivery fails closed.
 	let parentCtx: ExtensionContext | undefined;
+	let bridgeWakeIdentity: BridgeWakeIdentity | undefined;
+	let wakeVisibilityWarning = false;
+	const restoreBridgeWakeIdentity = (ctx: ExtensionContext | undefined) => {
+		bridgeWakeIdentity = undefined;
+		if (!ctx) return;
+		// Rendering is session-wide, not model/branch state: an identity on an
+		// abandoned branch still owns its generated bubbles in the session tree.
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== BRIDGE_WAKE_IDENTITY_TYPE) continue;
+			const data = entry.data as Partial<BridgeWakeIdentity> | undefined;
+			if (data?.sessionId === ctx.sessionManager.getSessionId() && typeof data.nonce === "string"
+				&& /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(data.nonce)
+				&& data.text === bridgeWakeText(data.nonce)) {
+				bridgeWakeIdentity = data as BridgeWakeIdentity;
+				break;
+			}
+		}
+	};
+	const hasWakeTransformer = typeof pi.registerMarkdownTransformer === "function";
+	if (hasWakeTransformer) {
+		// Register once in this runtime. Reload replaces the runtime; session
+		// replacement changes the identity, never the transformer registration.
+		pi.registerMarkdownTransformer((markdown, context) =>
+			context.messageType === "user" && bridgeWakeIdentity?.sessionId === parentCtx?.sessionManager.getSessionId()
+				&& markdown === bridgeWakeIdentity?.text ? "" : markdown);
+	}
+	const bridgeWake = (): string => {
+		if (!parentCtx) return PARENT_WAKE_TEXT;
+		try {
+			if (!hasWakeTransformer) throw new Error("Markdown transformer API unavailable");
+			if (!bridgeWakeIdentity || bridgeWakeIdentity.sessionId !== parentCtx.sessionManager.getSessionId()) {
+				const nonce = randomUUID();
+				const identity = { sessionId: parentCtx.sessionManager.getSessionId(), nonce, text: bridgeWakeText(nonce) };
+				// Persist before sending so a restart can reconstruct exact ownership.
+				pi.appendEntry(BRIDGE_WAKE_IDENTITY_TYPE, identity);
+				bridgeWakeIdentity = identity;
+			}
+			return bridgeWakeIdentity.text;
+		} catch {
+			// Compatibility fallback preserves continuation, not invisibility.
+			if (!wakeVisibilityWarning) {
+				wakeVisibilityWarning = true;
+				try { parentCtx.ui.notify("Gentle Agents cannot hide Claude Bridge continuation on this runtime; the generated user wake remains visible.", "warning"); } catch { /* UI failure must not drop continuation. */ }
+			}
+			return PARENT_WAKE_TEXT;
+		}
+	};
 	// Mirrors the host's agent run, which spans agent_start through
 	// agent_settled, including post-run retries and in-run compaction. Unlike
 	// activeAgentRuns it stays set between agent_end and agent_settled, where
@@ -629,13 +685,10 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// branch, so a parent that keeps calling tools would see the content only
 	// when the whole run ends — the original #867 delay.
 	//
-	// An idle parent must not get triggerTurn: the host would run the custom
-	// message as a direct turn that skips the prompt lifecycle
-	// (before_agent_start and the prompt refresh), and prompt-capture
-	// integrations such as the Claude bridge reject that turn. The structured
-	// message is stored durably without a turn instead, and a short
-	// system-generated user message wakes the parent through the normal prompt
-	// path. The wake never repeats child content, so the model sees it once.
+	// Idle child content is stored durably without a turn, then a separate
+	// coalesced wake requests continuation without repeating that content.
+	// Claude Bridge needs a user wake through the prompt lifecycle for capture;
+	// native providers can use a hidden custom-message turn instead.
 	//
 	// A parent that is busy without a run (compaction, or a prompt's pre-run
 	// compaction) is not streaming, so steer + triggerTurn would also start a
@@ -688,7 +741,18 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		try {
 			// "steer" matters only when a run started in between: the wake is then
 			// queued into it instead of being rejected as a concurrent prompt.
-			pi.sendUserMessage(PARENT_WAKE_TEXT, { deliverAs: "steer" });
+			// Read the live selection at dispatch, not when child content arrived.
+			// Only Claude Bridge is currently evidenced to require prompt capture;
+			// registering a custom provider alone does not make it a bridge.
+			if (parentCtx?.model?.provider === "claude-bridge") {
+				pi.sendUserMessage(bridgeWake(), { deliverAs: "steer" });
+			} else {
+				pi.sendMessage({
+					customType: PARENT_WAKE_TYPE,
+					content: NATIVE_PARENT_WAKE_TEXT,
+					display: false,
+				}, { deliverAs: "steer", triggerTurn: true });
+			}
 		} catch {
 			// A stale runtime fails closed instead of throwing from a microtask.
 			endPromptStart();
@@ -784,6 +848,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// Session changes discard every pending wake and boundary flush.
 	const resetParentDelivery = (ctx: ExtensionContext | undefined) => {
 		parentCtx = ctx;
+		restoreBridgeWakeIdentity(ctx);
+		wakeVisibilityWarning = false;
 		parentRunActive = false;
 		wakeOwed = false;
 		endPromptStart();
@@ -1065,12 +1131,12 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		} catch {
 			return;
 		}
-		// The session may have moved on while disk was read; a stale restore
-		// must never land in the wrong session's store.
-		if (ctx.sessionManager.getSessionId() !== sessionId) return;
-		// Fire-and-forget from session_start: a throwing summary subscriber must
-		// never surface as an unhandled rejection. History is best-effort.
+		// Fire-and-forget from session_start: a stale SDK context or throwing
+		// summary subscriber must never surface as an unhandled rejection.
 		try {
+			// The session may have moved on while disk was read; a stale restore
+			// must never land in the wrong session's store.
+			if (ctx.sessionManager.getSessionId() !== sessionId) return;
 			for (const { task, thread } of history) {
 				if (task.parentSessionId !== sessionId) continue;
 				if (store.restore(task, thread)) restoredTaskIds.add(task.id);
