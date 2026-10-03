@@ -114,57 +114,62 @@ class CodemodeCard implements Component {
 }
 
 /** Replace presentation only: execute, schema and every loadout/exposure field retain their references. */
+type CodemodeRenderers = Pick<ToolDefinition, "renderShell" | "renderCall" | "renderResult">;
+
+/** How codemode calls draw as compact cards. Pi owns the tool itself: its schema, execution and loadout. */
+export const compactCodemodeRenderers: CodemodeRenderers = {
+	renderShell: "self",
+	renderCall(args, theme, context) {
+		const tone = context.isError ? CARD_TONE.ERROR : context.isPartial ? CARD_TONE.WARNING : CARD_TONE.INFO;
+		const code = record(args).code;
+		const rows = context.expanded && typeof code === "string" ? [safe(code)] : [];
+		const hint = stripAnsi(keyHint("app.tools.expand", context.expanded ? "to collapse" : "to expand"));
+		return new CodemodeCard(theme, tone, (width) => cardBodyRows(rows, tone, theme, width, { expanded: true }), true, hint, false, context);
+	},
+	renderResult(result, options, theme, context) {
+		markCardResult(context?.state);
+		const calls = observedCalls(result.details);
+		const isError = context.isError || record(result).isError === true;
+		const failures = calls.filter(failed).length;
+		const tone = isError || failures > 0 ? CARD_TONE.ERROR : options.isPartial ? CARD_TONE.WARNING : CARD_TONE.INFO;
+		const shown = options.expanded ? calls : calls.slice(0, COLLAPSED_CALL_LIMIT);
+		const output = textOutput(result, context.showImages).flatMap((text) => {
+			const rows = text.split("\n");
+			// Pi prefixes final script output with status/wall-time bookkeeping.
+			// Keep it in expansion, but spend the collapsed budget on the payload.
+			const marker = rows.indexOf("Output:");
+			return !options.expanded && /^Script (?:completed|failed)/.test(rows[0] ?? "") && marker >= 0
+				? rows.slice(marker + 1) : rows;
+		});
+		const path = record(result.details).fullOutputPath;
+		// Mirrors renderCall: an expanded call shows the script as its body.
+		const callHasBody = options.expanded && typeof record(context?.args).code === "string";
+		return new CodemodeCard(theme, tone, (width) => {
+			const rows = shown.flatMap((call) => [
+				childLine(call, theme),
+				...(options.expanded && call.error ? [theme.fg("error", call.error)] : []),
+			]);
+			if (shown.length < calls.length) rows.push(theme.fg("muted", `${failures} errors/cancellations reported · ${calls.length - shown.length} more calls · expand to inspect`));
+			if (isError) rows.push(theme.fg("error", "Script failed"));
+			if (calls.length === 0) rows.push(theme.fg("muted", "No observed child calls"));
+			// Each child gets one collapsed physical row, preserving the observed order.
+			const body = options.expanded
+				? cardBodyRows(rows, tone, theme, width, { expanded: true })
+				: rows.map((row) => cardLine(row, tone, theme, width));
+			if (!options.expanded) {
+				const errors = calls.filter((call) => call.error).map((call) => `${call.name || "name unavailable"}: ${call.error}`);
+				body.push(...cardBodyRows(errors.map((error) => theme.fg("error", error)), tone, theme, width, { expanded: false, previewRows: 2 }));
+			}
+			body.push(...cardBodyRows(output.filter((row) => options.expanded || row.trim().length > 0).map((row) => theme.fg(isError ? "error" : "toolOutput", row)), tone, theme, width, { expanded: options.expanded, previewRows: 3 }));
+			if (typeof path === "string") body.push(...cardBodyRows([theme.fg("muted", `Full output: ${safe(path)}`)], tone, theme, width, { expanded: options.expanded, previewRows: 1 }));
+			return body;
+		}, false, undefined, callHasBody);
+	},
+};
+
+/** A codemode tool definition drawn with the compact cards; everything else stays the tool's own. */
 export function decorateCodemodeTool(tool: ToolDefinition): ToolDefinition {
-	return {
-		...tool,
-		renderShell: "self",
-		renderCall(args, theme, context) {
-			const tone = context.isError ? CARD_TONE.ERROR : context.isPartial ? CARD_TONE.WARNING : CARD_TONE.INFO;
-			const code = record(args).code;
-			const rows = context.expanded && typeof code === "string" ? [safe(code)] : [];
-			const hint = stripAnsi(keyHint("app.tools.expand", context.expanded ? "to collapse" : "to expand"));
-			return new CodemodeCard(theme, tone, (width) => cardBodyRows(rows, tone, theme, width, { expanded: true }), true, hint, false, context);
-		},
-		renderResult(result, options, theme, context) {
-			markCardResult(context?.state);
-			const calls = observedCalls(result.details);
-			const isError = context.isError || record(result).isError === true;
-			const failures = calls.filter(failed).length;
-			const tone = isError || failures > 0 ? CARD_TONE.ERROR : options.isPartial ? CARD_TONE.WARNING : CARD_TONE.INFO;
-			const shown = options.expanded ? calls : calls.slice(0, COLLAPSED_CALL_LIMIT);
-			const output = textOutput(result, context.showImages).flatMap((text) => {
-				const rows = text.split("\n");
-				// Pi prefixes final script output with status/wall-time bookkeeping.
-				// Keep it in expansion, but spend the collapsed budget on the payload.
-				const marker = rows.indexOf("Output:");
-				return !options.expanded && /^Script (?:completed|failed)/.test(rows[0] ?? "") && marker >= 0
-					? rows.slice(marker + 1) : rows;
-			});
-			const path = record(result.details).fullOutputPath;
-			// Mirrors renderCall: an expanded call shows the script as its body.
-			const callHasBody = options.expanded && typeof record(context?.args).code === "string";
-			return new CodemodeCard(theme, tone, (width) => {
-				const rows = shown.flatMap((call) => [
-					childLine(call, theme),
-					...(options.expanded && call.error ? [theme.fg("error", call.error)] : []),
-				]);
-				if (shown.length < calls.length) rows.push(theme.fg("muted", `${failures} errors/cancellations reported · ${calls.length - shown.length} more calls · expand to inspect`));
-				if (isError) rows.push(theme.fg("error", "Script failed"));
-				if (calls.length === 0) rows.push(theme.fg("muted", "No observed child calls"));
-				// Each child gets one collapsed physical row, preserving the observed order.
-				const body = options.expanded
-					? cardBodyRows(rows, tone, theme, width, { expanded: true })
-					: rows.map((row) => cardLine(row, tone, theme, width));
-				if (!options.expanded) {
-					const errors = calls.filter((call) => call.error).map((call) => `${call.name || "name unavailable"}: ${call.error}`);
-					body.push(...cardBodyRows(errors.map((error) => theme.fg("error", error)), tone, theme, width, { expanded: false, previewRows: 2 }));
-				}
-				body.push(...cardBodyRows(output.filter((row) => options.expanded || row.trim().length > 0).map((row) => theme.fg(isError ? "error" : "toolOutput", row)), tone, theme, width, { expanded: options.expanded, previewRows: 3 }));
-				if (typeof path === "string") body.push(...cardBodyRows([theme.fg("muted", `Full output: ${safe(path)}`)], tone, theme, width, { expanded: options.expanded, previewRows: 1 }));
-				return body;
-			}, false, undefined, callHasBody);
-		},
-	};
+	return { ...tool, ...compactCodemodeRenderers };
 }
 
 function textOutput(result: AgentToolResult<unknown>, showImages: boolean): string[] {
@@ -173,8 +178,26 @@ function textOutput(result: AgentToolResult<unknown>, showImages: boolean): stri
 		: item.type === "image" && showImageFallback ? [imageFallback(safe(item.mimeType))] : []);
 }
 
-/** Run the public factory once, intercepting only its registration; all other API access passes through. */
+/** Pi 1.0.1's hook for drawing any tool, built-in or not; older Pi does not have it. */
+type ToolRendererHost = {
+	registerToolRenderer(resolver: (toolName: string, next: () => CodemodeRenderers | undefined) => CodemodeRenderers | undefined): void;
+};
+
+function hasToolRenderers(pi: ExtensionAPI): pi is ExtensionAPI & ToolRendererHost {
+	return "registerToolRenderer" in pi && typeof pi.registerToolRenderer === "function";
+}
+
+/**
+ * Draw codemode calls as compact cards. Pi ships codemode as a built-in extension, so where Pi can
+ * restyle a tool only the renderer is registered: registering codemode again would replace the
+ * built-in and make Pi warn about it. Older Pi gets the public factory, run once with only its
+ * registration intercepted; all other API access passes through.
+ */
 export function registerCompactCodemode(pi: ExtensionAPI, factory: ExtensionFactory = createCodemodeExtension()): ReturnType<ExtensionFactory> {
+	if (hasToolRenderers(pi)) {
+		pi.registerToolRenderer((toolName, next) => (toolName === "codemode" ? compactCodemodeRenderers : next()));
+		return;
+	}
 	const decoratedAPI = new Proxy(pi, {
 		get(target, property, receiver) {
 			if (property === "registerTool") return (tool: ToolDefinition) => pi.registerTool(tool.name === "codemode" ? decorateCodemodeTool(tool) : tool);

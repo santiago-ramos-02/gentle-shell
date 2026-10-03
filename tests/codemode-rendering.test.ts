@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, imageFallback, setCapabilities, visibleWidth } from "@earendil-works/pi-tui";
 import quietTools from "../extensions/quiet-tools.ts";
-import { decorateCodemodeTool, registerCompactCodemode } from "../lib/codemode-renderer.ts";
+import { compactCodemodeRenderers, decorateCodemodeTool, registerCompactCodemode } from "../lib/codemode-renderer.ts";
 import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
@@ -59,6 +59,19 @@ function render(tool: ToolDefinition, value: AgentToolResult<unknown>, ctx = con
 	const body = tool.renderResult!(value, { expanded: ctx.expanded, isPartial: ctx.isPartial }, theme as never, ctx).render(width);
 	return [...call, ...body].map(stripAnsi).join("\n");
 }
+
+test("where Pi can restyle tools, quiet tools draws its built-in codemode instead of replacing it", () => {
+	type Resolver = (toolName: string, next: () => unknown) => unknown;
+	const { tools, pi } = registry();
+	const resolvers: Resolver[] = [];
+	const host = Object.assign(pi, { registerToolRenderer(resolver: Resolver) { resolvers.push(resolver); } });
+	quietTools(host);
+	assert.equal(tools.some((tool) => tool.name === "codemode"), false, "Pi's built-in codemode must stay loaded");
+	assert.equal(resolvers.length, 1);
+	assert.equal(resolvers[0]!("codemode", () => undefined), compactCodemodeRenderers);
+	const builtIn = { renderShell: "default" };
+	assert.equal(resolvers[0]!("read", () => builtIn), builtIn);
+});
 
 test("quiet tools registers an inactive upstream codemode with compact renderers", () => {
 	const tool = registeredCodemode();
