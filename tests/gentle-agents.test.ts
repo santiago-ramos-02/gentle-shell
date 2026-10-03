@@ -3148,6 +3148,11 @@ test("background runs return at once; status, result, send_message, cancel, and 
 	assert.equal((await resumed).content[0].text, "Summary.");
 	assert.match((await tools.get("subagent_cancel")!.execute("c9", { task_id: id }, undefined, undefined, ctx)).content[0].text, /not running/);
 	assert.match((await tools.get("subagent_status")!.execute("c10", { task_id: "nope" }, undefined, undefined, ctx)).content[0].text, /Error: no task nope/);
+	// gentle-shell#1713: a guessed id ("1") must point back to real ids.
+	// Review follow-up: a call without a context still gets the structured error.
+	assert.match((await tools.get("subagent_status")!.execute("c10c", { task_id: "1" }, undefined, undefined, undefined as never)).content[0].text, /^Error: no task 1\./);
+	for (const name of ["subagent_status", "subagent_result"]) assert.match((await tools.get(name)!.execute("c10a", { task_id: "1" }, undefined, undefined, ctx)).content[0].text, new RegExp(`^Error: no task 1\\. Recent task ids: .*${id} \\(explore\\)`), name);
+	assert.match((await tools.get("subagent_continue")!.execute("c10b", { task_id: "1", prompt: "more" }, undefined, undefined, ctx)).content[0].text, new RegExp(`^Error: no task 1\\. Recent task ids: .*${id} \\(explore\\)`));
 	assert.match((await tools.get("subagent_run")!.execute("c11", { agent: "ghost", task: "x" }, undefined, undefined, ctx)).content[0].text, /no subagent named "ghost"\. Known: explore/);
 });
 
@@ -4852,4 +4857,35 @@ test("children receive context and safety extensions, and missing files are omit
 			await tick();
 		}
 	}
+});
+
+// gentle-shell#1713 (review R3-001): prove the subagent_continue wiring end to
+// end, not only the helper. A writer follow-up without its own section reaches
+// the child with the surfaces its original launch was admitted with.
+test("a writer continuation without its own section inherits the admitted surfaces end to end", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	const profile = mkdtempSync(join(tmpdir(), "gentle-agents-continue-"));
+	mkdirSync(join(profile, "agents"), { recursive: true });
+	writeFileSync(join(profile, "agents", "gentle-ai-worker.md"), readFileSync(new URL("../assets/agents/gentle-ai-worker.md", import.meta.url)));
+	writeFileSync(join(profile, "subagents.json"), JSON.stringify({ model_profiles: { "gentle-ai-worker": { model: "openai/gpt-4o", effort: "high" } } }));
+	const env: NodeJS.ProcessEnv = {};
+	gentleAgents(h.pi, env, { ...runtime.deps, env, agentHome: profile });
+	const { ctx } = fakeContext();
+	await h.fire("session_start", ctx);
+	const launched = h.tools.get("subagent_run")!.execute("run", { agent: "gentle-ai-worker", task: "Do T2.\n\n## Allowed edit surfaces\n- src/app.ts\n- `docs/with space.md`\n\n## Return\nReport", mode: "task" }, undefined, undefined, ctx);
+	await tick();
+	runtime.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "partial" }] }] });
+	runtime.children[0].emit({ type: "agent_settled" });
+	const taskId = ((await launched).details.gentleAgents as { taskId: string }).taskId;
+	const continued = h.tools.get("subagent_continue")!.execute("follow", { task_id: taskId, prompt: "Continue with the remaining specs.", mode: "task" }, undefined, undefined, ctx);
+	await tick();
+	assert.equal(runtime.children.length, 2, "the continuation is admitted instead of rejected");
+	const prompt = String(runtime.children[1].written.find(frame => typeof frame.message === "string")?.message);
+	assert.match(prompt, /^Continue with the remaining specs\.\n\n## Allowed edit surfaces\n`docs\/with space\.md`\n`src\/app\.ts`\n/);
+	runtime.children[1].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
+	runtime.children[1].emit({ type: "agent_settled" });
+	await continued;
+	await h.fire("session_shutdown", ctx);
+	rmSync(profile, { recursive: true, force: true });
 });

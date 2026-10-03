@@ -195,21 +195,61 @@ test("user documentation shows recovery and candidate-level consent without clai
 test("one feature document carries intent, accepted rationale and worker context", () => {
 	containsAll(memory, [
 		"one feature document, not a separate plan file or topic",
-		"objective, problem, why, scope, constraints",
-		"progress, verification evidence, and next step",
-		"concise rationale for meaningful accepted changes",
-		"Routine corrections stay with their tasks; no exhaustive decision journal",
+		"verification evidence, progress, and next step",
+		"rationale for meaningful accepted changes",
+		"Routine corrections stay brief; no exhaustive decision journal",
 		"Accepted user, review, or verification changes",
 		"automatically update affected intent and TODOs",
 		"add genuinely new tasks or reopen invalidated items with a reason",
 		"Findings alone never authorize scope expansion or automatic acceptance",
 		"Before implementation or resume, the parent reads both the actual file and full observation",
-		"passes the locator and relevant context; workers read the document before edits",
+		"passes the locator, task IDs, and linked `S#`; workers read the document until `## Log` before edits",
 	]);
 	containsAll(read("assets/agents/gentle-ai-worker.md"), [
 		"Read the parent's ODD feature document locator before edits",
 		"Preserve valid completed work; return proposed intent/task changes and their reasons",
 	]);
+});
+
+// gentle-shell#1713: handoffs paraphrased the user's request, the feature
+// document summarized it, and verify never saw it. The document is now the
+// specification subagents read by reference, in a fixed token-cheap order.
+test("feature document is the verbatim specification subagents read by reference", () => {
+	const always = [
+		"`## Specs`",
+		"`## Tasks`",
+		"`## Log`",
+		"exact strings, error messages, and examples verbatim",
+		"`L1` is the user's original request verbatim",
+		"rewrites only the affected `S#`, and reopens only its task",
+		"Hand off by reference, never by paraphrase",
+		"read until `## Log`",
+		"Without a feature document, include the user's request verbatim",
+		"a verdict per `S#`",
+		"reproduce it before deciding it already works",
+	];
+	for (const persona of ["gentleman", "neutral"] as const) containsAll(__testing.buildGentlePrompt(persona), always);
+	containsAll(memory, [
+		"specification subagents read by reference",
+		"stable content first and the growing log last",
+		"never summarize or reword those fragments",
+		"Do not add requirements the user never asked for",
+		"`L1` holds the user's original request verbatim",
+		"rewrites only the affected `S#`, and reopens only its linked task",
+	]);
+	assert.doesNotMatch(delegation, /Translate the user's request into concise English/);
+	containsAll(delegation, [
+		"never translate, condense, or paraphrase the user's requirements",
+		"Reproduce a user-reported failure",
+	]);
+	containsAll(read("assets/agents/gentle-ai-worker.md"), ["until `## Log`", "which `S#` the change covers"]);
+	containsAll(read("assets/agents/gentle-ai-verify.md"), [
+		"verbatim user entries in `## Log`",
+		"verdict per `S#`",
+		"compare the exact output and error text",
+		"isolated state",
+	]);
+	containsAll(read("assets/agents/gentle-ai-explore.md"), ["until `## Log`"]);
 });
 
 test("ODD defaults to applicable test-first without chat or TUI activation", () => {

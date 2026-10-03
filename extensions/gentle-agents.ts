@@ -42,7 +42,7 @@ import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
 import { resolveGentlePiAgentHome, gentlePiConfigHome } from "../lib/agent-home.ts";
 import { resolveProfilePin, resolveUnversionedProjectProfile } from "../lib/agent-profile-pin.ts";
-import { allowedEditSurfaces, isDevelopmentSurface, isGenericBoundedWriter, prepareBoundSessionRepository, rejectUnscopedBoundedWriterDispatch, safeBootstrapDirectory, sessionRepositoryAuthority } from "../lib/bounded-writer-admission.ts";
+import { allowedEditSurfaces, inheritAllowedEditSurfaces, isDevelopmentSurface, isGenericBoundedWriter, prepareBoundSessionRepository, rejectUnscopedBoundedWriterDispatch, safeBootstrapDirectory, sessionRepositoryAuthority } from "../lib/bounded-writer-admission.ts";
 import { CHILD_METRICS_EVENT, CHILD_METRICS_REVOKED, childEvent, launchSelection, type LaunchSelection } from "../lib/runtime-metrics-children.ts";
 import { runtimeMetricsEnvAllows, type RuntimeMetricsPolicyDeps } from "../lib/runtime-metrics-policy.ts";
 
@@ -1117,6 +1117,14 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		return stored?.task;
 	};
 
+	// A guessed id ("1") leads back to real ids instead of a dead end, so the
+	// parent retries the same call rather than re-summarizing it (gentle-shell#1713).
+	const unknownTask = (id: unknown, ctx: ExtensionContext | undefined) => {
+		const recent = [...store.list(ctx?.sessionManager?.getSessionId() ?? "")].sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
+		const hint = recent.length ? ` Recent task ids: ${recent.map((task) => `${task.id} (${task.agent})`).join(", ")}.` : "";
+		return text(`Error: no task ${String(id)}.${hint}`, { error: "unknown task" });
+	};
+
 	// Restores this exact session's own finished subagents as visible history
 	// on an explicit resume, or on startup into a session that already has
 	// entries -- never on new, fork, or reload (see the session_start handler's
@@ -1636,14 +1644,14 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		},
 	);
 
-	tool("status", "Report the status of one subagent task.", { required: ["task_id"], properties: { task_id: { type: "string" } } }, async (params) => {
+	tool("status", "Report the status of one subagent task.", { required: ["task_id"], properties: { task_id: { type: "string" } } }, async (params, ctx) => {
 		const task = await resolveTask(String(params.task_id));
-		return task ? text(describeTask(task), taskDetails(task)) : text(`Error: no task ${String(params.task_id)}`, { error: "unknown task" });
+		return task ? text(describeTask(task), taskDetails(task)) : unknownTask(params.task_id, ctx);
 	});
 
-	tool("result", "Return the final answer of a finished subagent task, or its current state if it is still running.", { required: ["task_id"], properties: { task_id: { type: "string" } } }, async (params) => {
+	tool("result", "Return the final answer of a finished subagent task, or its current state if it is still running.", { required: ["task_id"], properties: { task_id: { type: "string" } } }, async (params, ctx) => {
 		const task = await resolveTask(String(params.task_id));
-		if (!task) return text(`Error: no task ${String(params.task_id)}`, { error: "unknown task" });
+		if (!task) return unknownTask(params.task_id, ctx);
 		// The parent just pulled a finished result; its pending completion must
 		// never be replayed on top of it.
 		if (isFinished(task.status)) {
@@ -1683,7 +1691,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		async (params, ctx, signal) => {
 			if (Object.hasOwn(params, "sdd_change") || Object.hasOwn(params, "remediation") || Object.hasOwn(params, "research_selection")) return text("Error: retired SDD delegation is not supported.", { error: "retired SDD delegation" });
 			const previous = await resolveTask(String(params.task_id));
-			if (!previous) return text(`Error: no task ${String(params.task_id)}`, { error: "unknown task" });
+			if (!previous) return unknownTask(params.task_id, ctx);
 			if (retiredSddAgent(previous.agent)) return text("Error: retired SDD agents cannot be continued.", { error: "retired SDD delegation" });
 			if (!isFinished(previous.status) || !previous.sessionPath) return text(`Error: task ${previous.id} cannot be continued yet (${previous.status}).`, { error: "not continuable" });
 			// Continuing acts on the previous result, so any pending completion for
@@ -1694,7 +1702,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			if (!agent) return text(`Error: subagent "${previous.agent}" is no longer defined.`, { error: "unknown agent" });
 			const mode = (params.mode as AgentMode | undefined) ?? (previous.mode as AgentMode);
 			const foreignContinuation = foreignTasks.has(previous.id);
-			return launch(ctx, await buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, previous.sessionPath, foreignContinuation ? undefined : previous.cwd, signal, foreignContinuation ? previous.cwd : undefined), signal);
+			const prompt = inheritAllowedEditSurfaces(previous.agent, String(params.prompt ?? ""), params.context, previous.prompt);
+			return launch(ctx, await buildRequest(ctx, agent, prompt, typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, previous.sessionPath, foreignContinuation ? undefined : previous.cwd, signal, foreignContinuation ? previous.cwd : undefined), signal);
 		},
 	);
 
