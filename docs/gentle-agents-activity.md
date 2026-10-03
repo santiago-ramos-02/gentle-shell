@@ -34,6 +34,9 @@ Pi's `setWidget` is the only fire-and-forget RPC push structured enough to carry
       "summary": {
         "id": "t_abc123",
         "agent": "explore",
+        "mode": "task",
+        "model": "claude-bridge/claude-sonnet-5-5",
+        "thinking": "medium",
         "label": "Map the auth module",
         "prompt": "Explore how authentication works…",
         "status": "running",
@@ -49,6 +52,7 @@ Pi's `setWidget` is the only fire-and-forget RPC push structured enough to carry
       "thread": {
         "version": 7,
         "dropped": 0,
+        "total": 2,
         "items": [
           { "kind": "text", "text": "Looking at the auth flow first." },
           { "kind": "tool", "name": "read", "args": "{\"path\":\"lib/auth.ts\"}", "running": false, "isError": false, "output": "…file contents…" }
@@ -61,7 +65,7 @@ Pi's `setWidget` is the only fire-and-forget RPC push structured enough to carry
 
 `summary` is `TaskSummary` from `lib/agents-protocol.ts`, unchanged. Each task's `summary` is a field whitelist of its `TaskRecord`: `id`, `agent`, `mode`, `model`, `thinking` (`null` when unset), `label`, `prompt`, `status`, `createdAt`, `startedAt`, `endedAt`, `lastStep`, `lastActivityAt`, `turns`, `toolCalls`, `error`. Every other `TaskRecord` field — `cwd`, `parentSessionId`, `sessionPath`, `result`, `tokens`, `cost` — is deliberately left out, the same discipline `lib/orchestrator-presence.ts`'s `projectActivity` already applies to same-profile peer discovery.
 
-`thread.items` is a `ThreadItem[]` whitelist too: text/thinking/note items keep `{ kind, text }` (`text` bounded, see below); tool items carry `{ kind: "tool", name, args, running, isError, output }`, where `args` is the tool's argument object `JSON.stringify`'d (never the raw object). `thread.dropped` is the store's own ring-buffer drop counter (unrelated to the per-push item cap below); `thread.version` increments on every thread mutation.
+`thread.items` is a `ThreadItem[]` whitelist too: text/thinking/note items keep `{ kind, text }` (`text` bounded, see below); tool items carry `{ kind: "tool", name, args, running, isError, output }`, where `args` is the tool's argument object `JSON.stringify`'d (never the raw object). `thread.dropped` is the store's own ring-buffer drop counter (unrelated to the per-push item cap below); `thread.version` increments on every thread mutation. `thread.total` counts every item the task ever had; since every bound below keeps the newest items, `items[i]` is item number `total - items.length + i`, which lets a host place items that stream in place.
 
 Tasks are ordered `running`, `waiting`, `queued`, then finished tasks by `endedAt` descending (most recently finished first).
 

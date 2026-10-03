@@ -68,6 +68,7 @@ function rpcTask(id: string, status: TaskStatus, endedAt: number | null, opts: {
 		thread: {
 			version: 1,
 			dropped: 0,
+			total: items,
 			items: Array.from({ length: items }, (_v, index) => ({ kind: "note" as const, text: `${"n".repeat(itemTextLen)}${index}` })),
 		},
 	};
@@ -106,6 +107,18 @@ test("projectRpcActivity whitelists task fields and orders running, waiting, que
 	assert.equal(runningSummary.prompt, "short prompt");
 	assert.equal(activity.tasks[4]!.summary.error, null);
 	assert.equal(activity.tasks[3]!.summary.error, "boom");
+});
+
+test("projectRpcActivity numbers the kept thread items so a host can place each one", () => {
+	const store = new TaskStore();
+	store.add(task("t1", "s1"));
+	for (const text of ["one", "two", "three"]) store.apply("t1", { type: TASK_EVENT.NOTE, text }, 1);
+
+	const thread = projectRpcActivity(store, { maxThreadItems: 2 }).tasks[0]!.thread;
+	// `total` counts every item the task ever had, so the kept window's first item is
+	// number `total - items.length`, however many were cut before or after projection.
+	assert.equal(thread.total, 3);
+	assert.deepEqual(thread.items.map((item) => ("text" in item ? item.text : "")), ["two", "three"]);
 });
 
 test("projectRpcActivity truncates the prompt, tool args, and tool output to their bounds", () => {

@@ -72,6 +72,8 @@ export type RpcThreadItem = RpcThreadTextItem | RpcThreadToolItem;
 export interface RpcThread {
 	version: number;
 	dropped: number;
+	/** Items the task ever had. Every bound keeps the newest items, so `items[i]` is item number `total - items.length + i`. */
+	total: number;
 	items: RpcThreadItem[];
 }
 
@@ -169,7 +171,7 @@ export function projectRpcActivity(store: TaskStore, opts: ProjectRpcActivityOpt
 		tasks: tasks.map((task) => {
 			const thread = store.thread(task.id);
 			const kept = maxThreadItems >= thread.items.length ? thread.items : thread.items.slice(thread.items.length - maxThreadItems);
-			return { summary: projectTaskSummary(task), thread: { version: thread.version, dropped: thread.dropped, items: kept.map(projectThreadItem) } };
+			return { summary: projectTaskSummary(task), thread: { version: thread.version, dropped: thread.dropped, total: thread.dropped + thread.items.length, items: kept.map(projectThreadItem) } };
 		}),
 	};
 }
