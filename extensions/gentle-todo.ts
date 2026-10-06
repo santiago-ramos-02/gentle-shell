@@ -29,6 +29,7 @@ import {
 // the human and the model.
 
 const WIDGET_KEY = "gentle-todo";
+const STATUS_ENUM = ["pending", "in_progress", "blocked", "done", "dropped"];
 const COLLAPSE_KEY_DEFAULT = "ctrl+shift+t";
 const TOOL_PARAMETERS = {
 	type: "object",
@@ -46,15 +47,15 @@ const TOOL_PARAMETERS = {
 				properties: {
 					id: { type: "integer", description: "Existing task id to keep." },
 					title: { type: "string", description: "Short imperative title, e.g. 'Write the parser'." },
-					status: { type: "string", enum: ["pending", "in_progress", "done"], description: "Defaults to pending." },
-					note: { type: "string", description: "What is happening right now, shown while in_progress, e.g. 'writing tests'." },
+					status: { type: "string", enum: STATUS_ENUM, description: "Defaults to pending. blocked: open but waiting on something outside the list; dropped: will not be done, on purpose." },
+					note: { type: "string", description: "What is happening right now, shown while in_progress, e.g. 'writing tests'; required for blocked, naming what it waits for, e.g. 'waiting for an admin'." },
 				},
 			},
 		},
 		id: { type: "integer", description: "Task id for update." },
 		title: { type: "string", description: "Title for add, or a new title for update." },
-		status: { type: "string", enum: ["pending", "in_progress", "done"], description: "Status for add or update." },
-		note: { type: "string", description: "Note for add or update." },
+		status: { type: "string", enum: STATUS_ENUM, description: "Status for add or update." },
+		note: { type: "string", description: "Note for add or update; required for blocked." },
 	},
 } as const;
 
@@ -183,6 +184,8 @@ export default function gentleTodo(pi: ExtensionAPI, env: NodeJS.ProcessEnv = pr
 			"Mark a task in_progress before starting it and done right after finishing it; keep exactly one task in_progress.",
 			"Prefer write with the complete list whenever the plan changes; keep ids of tasks that already exist.",
 			"Never mark a task done while tests fail or the work is partial; add a task for the blocker instead.",
+			"Mark a task blocked with a note naming what it waits for only when that is outside the list (a person, another team, an authorization); a prerequisite in the list is ordering, so keep the task pending. Return it to pending once the condition holds.",
+			"When the plan changes, mark tasks it made obsolete dropped, never done; dropped tasks no longer count as open.",
 		],
 		parameters: TOOL_PARAMETERS,
 		executionMode: "sequential",

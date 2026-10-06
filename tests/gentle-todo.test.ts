@@ -309,3 +309,39 @@ test("session_start drops a list that was already finished, so a reload never sh
 	const prompt = (await fire("before_agent_start", ctx, { systemPrompt: "base" })) as { systemPrompt: string } | undefined;
 	assert.equal(prompt, undefined, "and nothing is injected into the prompt");
 });
+
+test("the todo tool offers blocked and dropped in its schema and guidelines", () => {
+	const { pi, tools } = fakePi();
+	gentleTodo(pi, {});
+	const tool = tools.get("todo") as unknown as { parameters: { properties: Record<string, { enum?: string[]; items?: { properties: Record<string, { enum?: string[]; description?: string }> } }> }; promptGuidelines: string[] };
+	const statuses = ["pending", "in_progress", "blocked", "done", "dropped"];
+	assert.deepEqual(tool.parameters.properties.status.enum, statuses);
+	assert.deepEqual(tool.parameters.properties.tasks.items!.properties.status.enum, statuses);
+	assert.match(tool.parameters.properties.tasks.items!.properties.note.description!, /required for blocked/);
+	assert.ok(tool.promptGuidelines.some((line) => /blocked with a note naming what it waits for/.test(line)));
+	assert.ok(tool.promptGuidelines.some((line) => /dropped/.test(line) && /obsolete/.test(line)));
+});
+
+test("a list left with only dropped tasks open finishes and clears; a blocked-only list stays in the prompt without going stale", async () => {
+	const { pi, tools, fire } = fakePi();
+	gentleTodo(pi, {});
+	const { ctx, widget } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("todo")!.execute("c1", { action: "write", tasks: [{ title: "A", status: "done" }, { title: "Old plan", status: "dropped" }] }, undefined, undefined, ctx);
+	await fire("tool_execution_end", ctx, { toolName: "todo" });
+	await fire("agent_end", ctx);
+	assert.match(widget()![0], /Todos ▾ Collapse · 1 of 1/);
+	await fire("before_agent_start", ctx, promptEvent());
+	assert.equal(widget(), undefined, "a done-and-dropped list clears at the next turn");
+
+	await tools.get("todo")!.execute("c2", { action: "write", tasks: [{ title: "A", status: "done" }, { title: "Deploy", status: "blocked", note: "waiting for an admin" }] }, undefined, undefined, ctx);
+	await fire("tool_execution_end", ctx, { toolName: "todo" });
+	for (let turn = 0; turn < 4; turn++) {
+		await fire("agent_end", ctx);
+		const event = promptEvent();
+		await fire("before_agent_start", ctx, event);
+		assert.match(event.systemPromptOptions.appendSystemPrompt, /2\. \[blocked\] Deploy — waiting for an admin/);
+		assert.doesNotMatch(event.systemPromptOptions.appendSystemPrompt, /stale/);
+	}
+	assert.match(widget()![2], /⊘ Deploy · waiting for an admin/);
+});

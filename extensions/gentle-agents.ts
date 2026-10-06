@@ -69,6 +69,7 @@ export const AGENTS_RESULT_TYPE = "gentle-agents.result";
 export const AGENTS_MESSAGE_TYPE = "gentle-agents.message";
 export const AGENTS_ORCHESTRATOR_MESSAGE_TYPE = "gentle-agents.orchestrator-message";
 export const AGENTS_STALE_RESULT_TYPE = "gentle-agents.stale-result";
+export const AGENTS_STALE_NOTICE_TYPE = "gentle-agents.stale-notice";
 const RENDER_COALESCE_MS = 400;
 const CLOCK_TICK_MS = 1000;
 // How often a foreground subagent wait checks for a message the user sent meanwhile.
@@ -89,6 +90,10 @@ const NATIVE_PARENT_WAKE_TEXT = "Review the delivered subagent output and contin
 // How long a dispatched wake may take to start a parent run before a later
 // delivery may send another one.
 export const PARENT_WAKE_GRACE_MS = 30_000;
+// A delivery or wake the host rejected while the parent was idle is retried
+// after the grace at most this many times in a row, so a permanently broken
+// runtime never retries forever.
+const PARENT_DELIVERY_RETRY_LIMIT = 3;
 
 const retiredSddAgent = (name: string): boolean => /^sdd(?:-|$)/.test(name);
 
@@ -780,6 +785,22 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	let promptStarting = false;
 	let cancelPromptGrace: (() => void) | undefined;
 	let cancelBoundaryFlush: (() => void) | undefined;
+	// An idle parent has no turn boundary coming, so a failed idle delivery or
+	// wake is retried by one bounded timer that runs a full flush.
+	let cancelDeliveryRetry: (() => void) | undefined;
+	let deliveryRetries = 0;
+	const endDeliveryRetry = () => {
+		cancelDeliveryRetry?.();
+		cancelDeliveryRetry = undefined;
+	};
+	const armDeliveryRetry = () => {
+		if (cancelDeliveryRetry || deliveryRetries >= PARENT_DELIVERY_RETRY_LIMIT) return;
+		deliveryRetries += 1;
+		cancelDeliveryRetry = deps.schedule(() => {
+			cancelDeliveryRetry = undefined;
+			flushAll();
+		}, PARENT_WAKE_GRACE_MS);
+	};
 
 	const isTaskLive = (id: string): boolean => {
 		const task = store.get(id);
@@ -847,6 +868,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		// without a run keeps the wake owed until a later boundary flush.
 		if (route !== "idle") return;
 		wakeOwed = false;
+		endDeliveryRetry();
 		beginPromptStart();
 		try {
 			// "steer" matters only when a run started in between: the wake is then
@@ -863,9 +885,14 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 					display: false,
 				}, { deliverAs: "steer", triggerTurn: true });
 			}
+			deliveryRetries = 0;
 		} catch {
 			// A stale runtime fails closed instead of throwing from a microtask.
+			// The stored content still needs a turn, so the wake stays owed and is
+			// retried once per grace, a bounded number of times in a row.
 			endPromptStart();
+			wakeOwed = true;
+			armDeliveryRetry();
 		}
 	};
 
@@ -886,12 +913,21 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		sendToParent({ customType: AGENTS_RESULT_TYPE, content: completionText(task), display: true, details: taskDetails(task) }, route);
 	};
 
-	// A stale completion must not re-enter the LLM conversation, so it is
-	// delivered as durable TUI-only content and the human still sees it.
-	const deliverStale = (task: TaskRecord, settledAt: number) => {
+	// A stale report must not re-enter the LLM conversation, but the parent is
+	// told never to poll: it gets a compact model-facing notice naming the task,
+	// and the human gets durable TUI-only content.
+	const deliverStale = (task: TaskRecord, settledAt: number, route: Exclude<ParentRoute, "hold">) => {
 		if (activeSessionId() !== task.parentSessionId) return;
 		const ageSeconds = Math.max(0, Math.round((deps.now() - settledAt) / 1000));
-		pi.appendEntry(AGENTS_STALE_RESULT_TYPE, { taskId: task.id, agent: task.agent, label: task.label, status: task.status, ageSeconds });
+		const status = task.status.replace("_", " ");
+		sendToParent({
+			customType: AGENTS_STALE_NOTICE_TYPE,
+			content: `Subagent ${task.agent} (task ${task.id}, "${task.label}") ${status} about ${ageSeconds}s ago while you were busy. Its report was not replayed here; call subagent_result with task_id ${task.id} to read it.`,
+			display: false,
+			details: taskDetails(task),
+		}, route);
+		// The notice already reached the parent; a failed card must not resend it.
+		try { pi.appendEntry(AGENTS_STALE_RESULT_TYPE, { taskId: task.id, agent: task.agent, label: task.label, status: task.status, ageSeconds }); } catch { /* TUI-only content. */ }
 	};
 
 	const deliverMessage = (msg: PendingAgentMessage, route: Exclude<ParentRoute, "hold">) => {
@@ -928,11 +964,17 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const flushCompletions = () => {
 		const route = deliveryRoute(false);
 		if (!route) return;
-		for (const { task, settledAt, stale } of completions.takeDeliverable(deps.now())) {
+		for (const entry of completions.takeDeliverable(deps.now())) {
 			try {
-				if (stale) deliverStale(task, settledAt);
-				else deliver(task, route);
-			} catch { /* Best-effort delivery: at most once, even if forwarding fails. */ }
+				if (entry.stale) deliverStale(entry.task, entry.settledAt, route);
+				else deliver(entry.task, route);
+			} catch {
+				// The parent is told never to poll, so a failed forward must not
+				// lose the completion: it waits for the next boundary instead, and
+				// an idle parent, which has none coming, gets a bounded retry.
+				completions.requeue(entry);
+				if (route === "idle") armDeliveryRetry();
+			}
 		}
 	};
 
@@ -966,6 +1008,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		endPromptStart();
 		cancelBoundaryFlush?.();
 		cancelBoundaryFlush = undefined;
+		endDeliveryRetry();
+		deliveryRetries = 0;
 	};
 
 	// A completion settles into our queue. An idle parent flushes right away so
@@ -998,6 +1042,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		parentRunActive = true;
 		// The run carries everything stored while the parent was idle.
 		wakeOwed = false;
+		endDeliveryRetry();
+		deliveryRetries = 0;
 		endPromptStart();
 	});
 	pi.on("agent_end", () => {

@@ -5200,7 +5200,7 @@ test("a stale parent context fails closed: child completions and notifications a
 	await fire("session_shutdown", ctx);
 });
 
-test("a completion held past the stale window becomes transcript-only content and never re-enters the conversation", async () => {
+test("a completion held past the stale window keeps its report out of the conversation and shows the human a stale card", async () => {
 	const { pi, tools, fire, sent, entries, entryRenderers } = fakePi();
 	const harness = deps();
 	let clock = 1000;
@@ -5226,6 +5226,171 @@ test("a completion held past the stale window becomes transcript-only content an
 	assert.match(rendered, new RegExp(id));
 	assert.match(rendered, /explore/);
 	assert.match(rendered, /ago/);
+	await fire("session_shutdown", ctx);
+});
+
+// Issue #1821/#1092: the parent is told never to poll, so an unread stale
+// completion must still tell the model a result is waiting, without replaying
+// the report itself.
+test("an unread completion held past the stale window steers a compact notice into the running parent", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	let clock = 1000;
+	harness.deps.now = () => clock;
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const started = await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Long tool call", mode: "background" }, undefined, undefined, ctx);
+	const id = (started.details.gentleAgents as { taskId: string }).taskId;
+	await tick();
+	await fire("agent_start", ctx);
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Late answer." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	clock += STALE_COMPLETION_MS + 1_000;
+	await fire("turn_end", ctx);
+	const notices = sent.filter((entry) => entry.message.customType === "gentle-agents.stale-notice");
+	assert.equal(notices.length, 1, "the model is told once that an unread result is waiting");
+	assert.deepEqual(notices[0]!.options, { deliverAs: "steer", triggerTurn: true });
+	const content = String(notices[0]!.message.content);
+	assert.match(content, new RegExp(id));
+	assert.match(content, /subagent_result/);
+	assert.doesNotMatch(content, /Late answer\./, "the stale report itself is never replayed");
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0);
+	await fire("turn_end", ctx);
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.stale-notice").length, 1, "the notice is sent at most once");
+	await fire("session_shutdown", ctx);
+});
+
+test("an unread stale completion flushed at an idle boundary stores its notice and wakes the parent", async () => {
+	const { pi, tools, fire, sent, userMessages, setIdle } = fakePi();
+	const harness = deps();
+	let clock = 1000;
+	harness.deps.now = () => clock;
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Ends idle", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	await fire("agent_start", ctx);
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Late answer." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	clock += STALE_COMPLETION_MS + 1_000;
+	setIdle(true);
+	await fire("agent_end", ctx);
+	await tick();
+	const notices = sent.filter((entry) => entry.message.customType === "gentle-agents.stale-notice");
+	assert.equal(notices.length, 1);
+	assert.deepEqual(notices[0]!.options, { triggerTurn: false });
+	assert.equal(userMessages.length, 1, "an idle parent is woken instead of waiting forever");
+	await fire("session_shutdown", ctx);
+});
+
+test("a completion whose forwarding throws stays queued and is delivered at the next boundary", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Flaky host", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	await fire("agent_start", ctx);
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Retried answer." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	const sendMessage = pi.sendMessage;
+	Object.assign(pi, { sendMessage: () => { throw new Error("host busy"); } });
+	await fire("turn_end", ctx);
+	assert.equal(sent.length, 0);
+	Object.assign(pi, { sendMessage });
+	await fire("turn_end", ctx);
+	const results = sent.filter((entry) => entry.message.customType === "gentle-agents.result");
+	assert.equal(results.length, 1, "a failed forward is retried, not lost");
+	assert.match(String(results[0]!.message.content), /Retried answer\./);
+	await fire("turn_end", ctx);
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 1, "a delivered completion is never sent twice");
+	await fire("session_shutdown", ctx);
+});
+
+test("a completion whose forwarding throws while the parent is idle is retried after the bounded grace", async () => {
+	const { pi, tools, fire, sent, userMessages } = fakePi();
+	const harness = deps();
+	const timers = recordTimers(harness.deps);
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Idle flaky host", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const sendMessage = pi.sendMessage;
+	Object.assign(pi, { sendMessage: () => { throw new Error("host busy"); } });
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Idle retried answer." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(sent.length, 0);
+	assert.equal(userMessages.length, 0);
+	Object.assign(pi, { sendMessage });
+	// No turn boundary is coming for an idle parent, so the retry is a timer.
+	assert.equal(timers.run(PARENT_WAKE_GRACE_MS), 1, "one bounded retry flush is armed");
+	await tick();
+	const results = sent.filter((entry) => entry.message.customType === "gentle-agents.result");
+	assert.equal(results.length, 1, "the requeued completion reaches the idle parent");
+	assert.match(String(results[0]!.message.content), /Idle retried answer\./);
+	assert.equal(userMessages.length, 1, "and the idle parent is woken for it");
+	// Only the dispatched wake's own grace remains; expiring it resends nothing.
+	assert.equal(timers.run(PARENT_WAKE_GRACE_MS), 1);
+	await tick();
+	assert.equal(sent.length, 1, "a successful retry never delivers the completion twice");
+	assert.equal(userMessages.length, 1);
+	await fire("session_shutdown", ctx);
+});
+
+test("retries for a failing idle delivery stop after the bounded limit", async () => {
+	const { pi, tools, fire, sent, userMessages } = fakePi();
+	const harness = deps();
+	const timers = recordTimers(harness.deps);
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Broken host", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	Object.assign(pi, { sendUserMessage: () => { throw new Error("host rejected prompt"); } });
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	let retries = 0;
+	while (timers.run(PARENT_WAKE_GRACE_MS) > 0) {
+		retries += 1;
+		await tick();
+		assert.ok(retries <= 3, "a permanently failing wake never retries forever");
+	}
+	assert.equal(retries, 3);
+	assert.equal(sent.length, 1, "retries never store the completion twice");
+	assert.equal(userMessages.length, 0);
+	await fire("session_shutdown", ctx);
+});
+
+test("a wake that throws stays owed and is retried after the bounded grace", async () => {
+	const { pi, tools, fire, sent, userMessages } = fakePi();
+	const harness = deps();
+	const timers = recordTimers(harness.deps);
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Lost wake", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const sendUserMessage = pi.sendUserMessage;
+	Object.assign(pi, { sendUserMessage: () => { throw new Error("host rejected prompt"); } });
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(sent.length, 1, "the completion is stored before the wake fails");
+	assert.equal(userMessages.length, 0);
+	Object.assign(pi, { sendUserMessage });
+	assert.equal(timers.run(PARENT_WAKE_GRACE_MS), 1, "one bounded retry is armed");
+	await tick();
+	assert.equal(userMessages.length, 1, "the idle parent is finally woken");
+	assert.equal(sent.length, 1, "the retry wakes without storing the completion again");
 	await fire("session_shutdown", ctx);
 });
 
