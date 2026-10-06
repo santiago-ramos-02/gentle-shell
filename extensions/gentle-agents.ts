@@ -71,6 +71,8 @@ export const AGENTS_ORCHESTRATOR_MESSAGE_TYPE = "gentle-agents.orchestrator-mess
 export const AGENTS_STALE_RESULT_TYPE = "gentle-agents.stale-result";
 const RENDER_COALESCE_MS = 400;
 const CLOCK_TICK_MS = 1000;
+// How often a foreground subagent wait checks for a message the user sent meanwhile.
+const FOREGROUND_MESSAGE_POLL_MS = 250;
 const TOOL_PREFIX = "subagent_";
 // Wakes an idle parent after child content was stored as a custom message.
 // It names itself as automated so the model never attributes it to the human.
@@ -1584,9 +1586,29 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		};
 		if (signal?.aborted) onAbort();
 		else signal?.addEventListener("abort", onAbort, { once: true });
+		// Pi hands the parent a message the user sends meanwhile only once this tool call returns,
+		// so it would wait behind the whole run. The wait yields to it instead: the task keeps
+		// running and its result arrives on its own, as a yielded task's does.
+		let cancelMessagePoll: () => void = () => {};
+		const userMessage = new Promise<"user-message">((resolve) => {
+			const check = () => {
+				if (ctx.hasPendingMessages?.()) resolve("user-message");
+				else cancelMessagePoll = deps.schedule(check, FOREGROUND_MESSAGE_POLL_MS);
+			};
+			cancelMessagePoll = deps.schedule(check, FOREGROUND_MESSAGE_POLL_MS);
+		});
 		try {
-			const query = await runner.waitForQuery(task.id);
-			if (query) {
+			const query = await Promise.race([runner.waitForQuery(task.id), userMessage]);
+			if (query === "user-message") {
+				const live = store.get(task.id) ?? task;
+				if (!isFinished(live.status)) {
+					yieldedTaskIds.add(live.id);
+					return text(
+						`The user sent a message while ${live.agent} (task ${live.id}) was still running. It keeps running in the background, and its result is delivered automatically when it finishes. Read the user's message now.`,
+						taskDetails(live),
+					);
+				}
+			} else if (query) {
 				const live = store.get(task.id) ?? task;
 				messages.consumeQuery(task.id, query.requestId);
 				const questionSuffix = query.message ? `\n\nQuestion:\n${query.message}` : "";
@@ -1603,6 +1625,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			// otherwise guesses ordinal ids for subagent_continue (#1731 T19).
 			return text(completionText(finished), taskDetails(finished));
 		} finally {
+			cancelMessagePoll();
 			signal?.removeEventListener("abort", onAbort);
 		}
 	};

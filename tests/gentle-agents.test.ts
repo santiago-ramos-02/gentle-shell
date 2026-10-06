@@ -686,6 +686,39 @@ test("first foreground query yields while its child runs and delivers one comple
 	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 1);
 });
 
+test("a foreground wait yields to a message the user sends and still delivers the completion", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	const timers = recordTimers(harness.deps);
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	let userMessagePending = false;
+	(ctx as unknown as { hasPendingMessages(): boolean }).hasPendingMessages = () => userMessagePending;
+	await fire("session_start", ctx);
+	await fire("agent_start", ctx);
+	const pending = tools.get("subagent_run")!.execute("foreground", { agent: "explore", task: "Long mapping" }, undefined, undefined, ctx);
+	await tick();
+
+	// Nothing waiting yet: the wait keeps going.
+	timers.takeLast(250)();
+	await tick();
+	userMessagePending = true;
+	timers.takeLast(250)();
+	const yielded = await pending;
+
+	assert.notEqual((yielded as { terminate?: boolean }).terminate, true, "the parent keeps its run to read the message");
+	assert.match(yielded.content[0].text, /The user sent a message while explore \(task .+\) was still running/);
+	assert.deepEqual(harness.children[0].killed, [], "the subagent keeps running");
+
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "mapped" }], stopReason: "stop" }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await fire("turn_end", ctx);
+	await fire("agent_end", ctx);
+	await tick();
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 1);
+	await fire("session_shutdown", ctx);
+});
+
 test("cancelling a yielded foreground task prevents completion follow-up", async () => {
 	const { pi, tools, fire, sent } = fakePi();
 	const harness = deps();
