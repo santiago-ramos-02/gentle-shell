@@ -16,6 +16,8 @@ on:
 
 permissions:
   contents: read
+  # Opens an issue when a sync fails, so a stuck fork is noticed, and closes it once one succeeds.
+  issues: write
 
 concurrency:
   group: t3-sync
@@ -67,3 +69,27 @@ jobs:
           node scripts/check-types.mjs
           node --experimental-strip-types --test tests/gentle-pi-api.test.ts tests/model-routing-authority.test.ts tests/profile-pin.test.ts tests/profiles-orchestrator.test.ts tests/agent-profiles.test.ts
           git push origin HEAD:main
+
+      - if: failure()
+        name: Report the failed sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="T3 fork sync is failing"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "Failed again: $run_url"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "The scheduled merge of upstream main failed, so main and its releases are no longer following upstream. Usually a merge conflict or a failing check: see $run_url. This closes itself after the next successful sync."
+          fi
+
+      - if: success()
+        name: Close the failed-sync issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="T3 fork sync is failing"
+          for issue in $(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[].number'); do
+            gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --comment "Synced again: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          done
