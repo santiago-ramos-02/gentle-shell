@@ -24,6 +24,7 @@ import {
 	access,
 	mkdir,
 	readFile,
+	readdir,
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -39,48 +40,6 @@ import type {
 import { Key, Text, isKeyRelease, matchesKey, truncateToWidth, type KeybindingsManager, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { resolveGentlePiAgentHome, gentlePiConfigHome } from "../lib/agent-home.ts";
 import {
-	type PersonaMode,
-	isRecord,
-	gentleAiConfigHome,
-	modelConfigPath,
-	modelExportPath,
-	MODEL_EXPORT_KIND,
-	MODEL_EXPORT_VERSION,
-	legacyProjectModelConfigPath,
-	projectPersonaConfigPath,
-	personaConfigPath,
-	readPersonaMode,
-	writePersonaMode,
-	readSavedModelConfig,
-	readSavedModelConfigAsync,
-	readModelConfig,
-	writeModelConfig,
-	writeModelConfigAsync,
-	parseModelExport,
-	cloneModelConfig,
-	updateFrontmatterRouting,
-	readEffectiveModelConfig,
-	readGlobalEffectiveModelConfig,
-	pinnedEffectiveModelConfig,
-	readEffectiveModelConfigAsync,
-	readGlobalEffectiveModelConfigFromAsync,
-	listAgentsFromDir,
-	listAgentsFromDirAsync,
-	discoverableNonBuiltinAgentRoots,
-	builtinAgentDirs,
-	listDiscoverableAgents,
-	orderDiscoverableAgents,
-	orchestratorSettingsPath,
-	isProviderReviewRole,
-	modelAssignmentNames,
-	routingDefaultLabel,
-	migrateLegacyProjectModelOverrides,
-	applyModelConfigAsync,
-} from "../lib/model-routing.ts";
-import { applyProfile } from "../lib/profile-operations.ts";
-// Hosts and tests import these from the extension, where they used to live.
-export { applyModelConfig, applyModelConfigAsync, readModelConfig, readModelConfigAsync } from "../lib/model-routing.ts";
-import {
 	BACKGROUND_SUBAGENTS_FILE,
 	BACKGROUND_SUBAGENTS_SCHEMA,
 	loadBackgroundSubagentsPolicy,
@@ -89,13 +48,18 @@ import {
 	type BackgroundSubagentsPolicy,
 	type BackgroundSubagentsResolution,
 } from "../lib/background-subagents-policy.ts";
-import { installPackageAssets, getPackageAssetOwner, hasPackageAssetOwnerInstallation, type PackageAssetOwner, isPackageManagedSddAsset } from "../lib/agent-assets.ts";
+import { installPackageAssets, getPackageAssetOwner, hasPackageAssetOwnerInstallation, type PackageAssetOwner, isPackageManagedSddAsset, updatePackageManagedSddAgentOwnership } from "../lib/agent-assets.ts";
 import {
 	THINKING_LEVELS,
+	normalizeModelConfig,
+	isThinkingLevel,
 	normalizeModelId,
+	normalizeRoutingEntry,
+	readSavedModelConfig as readModelRoutingAuthority,
 	readSavedModelConfigAsync as readModelRoutingAuthorityAsync,
 	type AgentModelConfig,
 	type AgentRoutingEntry,
+	type ModelConfigFileResult,
 	type ThinkingLevel,
 } from "../lib/model-routing-authority.ts";
 import {
@@ -117,6 +81,7 @@ import {
 	renameProfile,
 	routingColumnWidths,
 	serializeProfileExport,
+	setActiveProfile,
 	updateProfile,
 	writeProfilesFileSync,
 	type AgentProfilesFile,
@@ -136,8 +101,11 @@ import {
 	type ProfilePinSource,
 	type ProfilePinStatus,
 } from "../lib/agent-profile-pin.ts";
+import { bindSessionProfile, readSessionProfileBinding } from "../lib/session-profile-binding.ts";
 import {
+	applyOrchestratorSettings,
 	readOrchestratorSettings,
+	restoreOrchestratorSettings,
 	type OrchestratorSettingsReadResult,
 	parseOrchestratorModelRef,
 } from "../lib/profiles-orchestrator.ts";
@@ -249,6 +217,9 @@ import {
 	verificationPlan,
 	isSmallWriterProfile,
 	resolveWriterProfile,
+	decodeAgentRiskEscalation,
+	escalatedRisk,
+	HIGH_RISK_ITEMS,
 	RDD_LINE,
 	WRITER_PROFILE,
 	VERIFICATION_TIER,
@@ -261,6 +232,7 @@ import {
 	type ReviewDueReason,
 	type NativeReviewOutcome,
 	type WriterProfile,
+	type AgentRiskEscalation,
 } from "../lib/review-risk-assessment.ts";
 import {
 	assertReviewApprovedAcknowledgementExecuteV1,
@@ -400,6 +372,7 @@ type BackgroundSubagentsCapability = "ready" | "absent";
 interface BackgroundSubagentsRendering {
 	policy: BackgroundSubagentsPolicy;
 	capability: BackgroundSubagentsCapability;
+	singleShot?: boolean;
 }
 
 const DEFAULT_BACKGROUND_SUBAGENTS_RENDERING: BackgroundSubagentsRendering = {
@@ -743,7 +716,15 @@ function resolveBackgroundSubagentsCapability(
 function renderBackgroundSubagentsStatusLine(
 	background: BackgroundSubagentsRendering,
 ): string {
+	if (background.singleShot) return `Background subagent policy: off (single-shot mode)`;
 	return `Background subagent policy: ${background.policy} (capability: ${background.capability})`;
+}
+
+// gentle-shell#1731 T27: `pi -p` and `pi --mode json` run one prompt and then
+// dispose the runtime, so background results can never arrive. Mirrors
+// isSingleShotMode in extensions/gentle-agents.ts, which rejects the launch.
+function isSingleShotHostMode(mode: string | undefined): boolean {
+	return mode === "print" || mode === "json";
 }
 
 /**
@@ -884,6 +865,11 @@ async function readRddModeStatusOnce(
 interface ReviewAssessmentPlanDetails {
 	schema: "gentle-pi.review-assessment-plan/v1";
 	risk: VerificationTier;
+	// gentle-shell#1494: the native tier before any agent escalation. `risk`
+	// differs from it only when the agent raised the candidate to high.
+	nativeRisk: VerificationTier;
+	// `applied` is false when the native tier was already high or unassessable.
+	agentEscalation?: { item: number; label: string; reason: string; applied: boolean };
 	reasons: readonly ReviewAssessmentReason[];
 	changedPaths: number;
 	changedLines: number;
@@ -1038,7 +1024,10 @@ async function resolveReviewAssessmentPlan(
 		}
 	}
 
-	const risk: VerificationTier = assessment?.risk ?? VERIFICATION_TIER.UNASSESSABLE;
+	const nativeRisk: VerificationTier = assessment?.risk ?? VERIFICATION_TIER.UNASSESSABLE;
+	// gentle-shell#1494: an agent escalation raises passive/medium to high and
+	// never lowers; the native tier stays visible as `nativeRisk`.
+	const risk = escalatedRisk(nativeRisk, input.escalate);
 	// gentle-pi#668: the memo is read only for THIS candidate's own target
 	// identity, never repository-only. It is still needed when the caller
 	// claims `closed`, because a recorded decline beats closure (gentle-pi#1175).
@@ -1050,6 +1039,10 @@ async function resolveReviewAssessmentPlan(
 	return {
 		schema: "gentle-pi.review-assessment-plan/v1",
 		risk,
+		nativeRisk,
+		...(input.escalate === undefined
+			? {}
+			: { agentEscalation: { item: input.escalate.item, label: HIGH_RISK_ITEMS[input.escalate.item], reason: input.escalate.reason, applied: risk !== nativeRisk } }),
 		// No path is known for an unassessable candidate: omit it rather than
 		// emitting an empty string the native reason shape forbids.
 		reasons: assessment?.reasons ?? (unassessableDetail === undefined ? [] : [{ code: unassessableCode, detail: unassessableDetail }]),
@@ -1111,6 +1104,11 @@ async function resolveRddModeStatus(
 	return status;
 }
 
+/** True only for a validated `off` line; `unknown` and `on` are never off. */
+function isRddStatusLineOff(line: string | undefined): boolean {
+	return line !== undefined && line.startsWith("Receipt-driven development: off ");
+}
+
 /** Resolves and renders the RDD status line for a production call site in one call. */
 async function resolveRddStatusLine(
 	nativeReviewCli: Pick<NativeReviewCli, "reviewMode"> | null | undefined,
@@ -1135,12 +1133,14 @@ function getOrchestratorPrompt(
 	cwd: string = process.cwd(),
 	activeTools?: readonly string[],
 	rddStatusLine: string = renderRddStatusLine(undefined),
+	hostMode?: string,
 ): string {
 	const background: BackgroundSubagentsRendering = {
 		policy: loadBackgroundSubagentsPolicy(cwd),
 		capability: resolveBackgroundSubagentsCapability(cwd, activeTools),
+		singleShot: isSingleShotHostMode(hostMode),
 	};
-	const cacheKey = `${background.policy}:${background.capability}:${rddStatusLine}`;
+	const cacheKey = `${background.policy}:${background.capability}:${background.singleShot}:${rddStatusLine}`;
 	let prompt = orchestratorPromptCache.get(cacheKey);
 	if (prompt === undefined) {
 		prompt = renderOrchestratorPrompt(ASSETS_DIR, background, rddStatusLine);
@@ -1222,6 +1222,17 @@ function loadReviewContractPromptFragment(
 	return reviewContractPromptFragmentCache;
 }
 
+async function pathExists(path: string): Promise<boolean> {
+	try {
+		await access(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+type PersonaMode = "gentleman" | "neutral";
+
 const PERSONA_OPTIONS = ["gentleman", "neutral"] as const;
 
 const GENTLEMAN_PERSONA_PROMPT = `Persona:
@@ -1248,6 +1259,7 @@ function buildGentlePrompt(
 	cwd: string = process.cwd(),
 	activeTools?: readonly string[],
 	rddStatusLine: string = renderRddStatusLine(undefined),
+	hostMode?: string,
 ): string {
 	const personaPrompt =
 		persona === "neutral" ? NEUTRAL_PERSONA_PROMPT : GENTLEMAN_PERSONA_PROMPT;
@@ -1274,27 +1286,27 @@ ${languageBoundary}
 
 Default workflow: Organic Driven Development (MANDATORY)
 Organic Driven Development (ODD) is the predefined workflow of this orchestrator. Every request enters it, without the user asking for a workflow, a plan, or task tracking. Never describe this workflow only when asked about it: run it. Run these steps in this order on every request:
-1. **Authorize.** Investigation, explanation, review, comparison, and proposal-only requests stay read-only: no writer, apply, or implementation artifacts. Ambiguous or conditional change intent gets one clarification; stop and wait.
-2. **Explore.** Explore existing code and requirements first, proportionately to the request, before proposing or writing anything.
+1. **Authorize.** Investigation, explanation, review, comparison, and proposal-only requests stay read-only: no writer, apply, or implementation artifacts. Ambiguous or conditional change intent (unclear whether a change is authorized at all) gets one clarification; stop and wait. A user saying they may stop you or resume later asks for notes and separate commits, not a stop.
+2. **Explore.** Explore existing code and requirements first, proportionately to the request, before proposing or writing anything. Do not delegate exploration of files you will read anyway to work inline; explore only for a map you need to decide or route.
 3. **Resolve uncertainty.** Recommend optional research only for a named uncertainty; ask one focused user question only for a real unresolved product decision, then stop and wait; use at most one scoped read-only assumption challenge for a high-consequence unproven premise.
-4. **Classify.** The work is substantial when exploration yields two or more meaningful implementation steps, or progress worth recovering after an interruption. Small, understood work stays small and creates no durable task artifacts.
-5. **Track before the first write.** For substantial authorized implementation, create \`odd/tasks/<feature-name>.md\` and its Engram mirror \`odd/<feature-name>/tasks\` automatically, then create or rebuild the visible \`todo\` list from the reconciled feature tasks, all before the first source write and without asking permission for tasks or storage. Tell the user in one line which feature document was created and how many tasks it holds. The document is the specification subagents read, in this order: a two- or three-line header; \`## Specs\` with numbered \`S#\` that quote the user's exact strings, error messages, and examples verbatim, never summarized and never adding unrequested requirements; \`## Tasks\` with one line per task (ID, linked \`S#\`, route, commit); \`## Log\` last, where \`L1\` is the user's original request verbatim and later user corrections, evidence, and decisions are appended. A requirement change appends its verbatim Log entry, rewrites only the affected \`S#\`, and reopens only its task.
-6. **Implement task by task.** Hand off by reference, never by paraphrase: \`Spec: odd/tasks/<feature>.md (read until \`## Log\`). Do T#; S#.\` and ask which \`S#\` were covered. Without a feature document, include the user's request verbatim. Verify reads the whole document, runs the spec's examples, and returns a verdict per \`S#\`. When the user reports a failure, reproduce it before deciding it already works. Route each task through the orchestrator's Work Routing Ladder, honoring its mandatory delegation triggers, with applicable test-first development and checks. These triggers are mandatory, not advisory: executing past a fired trigger inline is a routing defect even if the work succeeds. Check an item off only after its outcome and checks were observed; update the file, mirror, and visible \`todo\` projection after every task transition and material plan change. Every task closes with at least one work-unit commit on the feature branch, branch first when on the default branch, with tests and docs alongside the behavior, using a Conventional Commit message; record the commit identity in the feature document as evidence. Work-unit commits on the feature branch are part of authorized substantial ODD implementation; push, pull request creation, and merge remain the user's decisions.
-7. **Close.** Report the verified outcome, every failed, skipped, or pending check, and the next step. The native review candidate is a work-unit commit or a PR slice, never a TODO checkbox and never the accumulated feature branch; native review runs only under the user-owned RDD switch.
+4. **Classify.** Size the task by the orchestrator's Task Size section: small when understood, risk is contained, and the work could be resumed from the original request and \`git diff\` alone; large only when that resume test fails. Never classify by counting files, commands, tests, fixes, or a requested todo list. Small work stays inline and creates no durable task artifacts.
+5. **Track before the first write.** For large authorized implementation, create \`odd/tasks/<feature-name>.md\` and its Engram mirror \`odd/<feature-name>/tasks\` automatically, then create or rebuild the visible \`todo\` list from the reconciled feature tasks, all before the first source write and without asking permission for tasks or storage. Tell the user in one line which feature document was created and how many tasks it holds. The document is the specification subagents read, in this order: a two- or three-line header; \`## Specs\` with numbered \`S#\` that quote the user's exact strings, error messages, and examples verbatim, never summarized and never adding unrequested requirements; \`## Tasks\` with one line per task (ID, linked \`S#\`, route, commit); \`## Log\` last, where \`L1\` is the user's original request verbatim and later user corrections, evidence, and decisions are appended. A requirement change appends its verbatim Log entry, rewrites only the affected \`S#\`, and reopens only its task.
+6. **Implement task by task.** Hand off by reference, never by paraphrase: name the document, task, and specs (for example \`Spec: odd/tasks/<feature>.md, T2, S3-S4\`), tell workers to read until \`## Log\`, and ask which \`S#\` were covered. Without a feature document, include the user's request verbatim. Verify reads the whole document, runs the spec's examples the parent authorized, against isolated state when they mutate data, and returns a verdict per \`S#\`. When the user reports a failure, reproduce it before deciding it already works. Each test asserts every observable effect of the rule it covers (exit code, exact stdout and stderr, and that rejected input leaves stored data and counters unchanged), covers the cases the rule itself names (its examples, boundaries, and errors), and checks through the public interface, never internal storage. When you add or change a command, option, or message, update the help text and docs that describe it. Route each task through the orchestrator's Mechanisms, honoring its mandatory delegation triggers, with applicable test-first development and checks. These triggers are mandatory, not advisory: executing past a fired trigger inline is a routing defect even if the work succeeds. Check an item off only after its outcome and checks were observed; update the file, mirror, and visible \`todo\` projection after every task transition and material plan change. Every tracked task closes with at least one work-unit commit on the feature branch, branch first when on the default branch, with tests and docs alongside the behavior, using a Conventional Commit message; record the commit identity in the feature document as evidence. Work-unit commits on the feature branch are part of authorized large ODD implementation; push, pull request creation, and merge remain the user's decisions.
+7. **Close.** Report the verified outcome, every failed, skipped, or pending check, and the next step. Before writing \`Risk: none\`, check whether your diff changes code that existing behavior the request did not mention also uses (shared options, parsers, helpers); if it does, that is item 3. Never end with a tracked task pending unless you quote the user's explicit stop. An applicable quick check runs once; an unavailable verifier or subagent is reported as unavailable, never retried or escalated into extra ceremony. Partial, blocked, unavailable, or exhausted proof becomes one **Needs your decision** result naming the open blockers or missing proof, never more verification; that result is a valid stop, hedged wording is not. The native review candidate is a work-unit commit or a PR slice, never a TODO checkbox and never the accumulated feature branch; native review runs only under the user-owned RDD switch.
 Phase reporting: the Gentle Shell prompt label is inferred automatically from the primary session's tool activity (reads show \`exploring\`, edits \`implementing\`, test runs \`checking\`, user questions \`deciding\`). When the \`gentle_odd_phase\` tool is available, use it to refine that label with phases tools cannot show (\`authorizing\`, \`researching\`, \`deciding\`, \`closing\`): call \`gentle_odd_phase\` only when the primary session's ODD phase actually changes, never per tool call or on a fixed cadence, and never from a subagent. It drives the Gentle Shell prompt label only.
 Resume an interrupted feature with \`mem_context\`, then project- and feature-scoped \`mem_search\`, then \`mem_get_observation\` for the full document, then the task file itself; reconcile before continuing the next unfinished task. Detail for steps 3–7: \`orchestrator-delegation.md\` and \`orchestrator-memory.md\`.
 
 Harness principles:
 - el Gentleman is not prompt engineering. It is runtime discipline around powerful agents.
-- Organic Driven Development (ODD) is the predefined workflow for every request: authorize, explore, resolve uncertainty, classify, track substantial work before the first write, implement task by task with proportionate checks, close each task with a work-unit commit, and close.
+- Organic Driven Development (ODD) is the predefined workflow for every request: authorize, explore, resolve uncertainty, classify, track large work before the first write, implement task by task with proportionate checks, close each tracked task with a work-unit commit, and close.
 - Clarify scope, constraints, acceptance criteria, and non-goals before implementation.
 - Use subagents when available for exploration, planning, implementation, and review, while keeping one parent session responsible for orchestration.
-- Keep writes single-threaded unless the user explicitly approves parallel write isolation.
-- For behavior changes with applicable runnable deterministic tests and a clear expected outcome, use test-first by default: observe RED, GREEN, then refactor with focused checks. Test presence alone does not establish applicability; no chat or TUI toggle activates it. For passive documentation, non-testable changes, an unavailable runner, or no meaningful RED, explain why and run proportionate ordinary functional or structural verification. Never invent lifecycle evidence or skip checks. Follow orchestrator-delegation.md for ODD forwarding and evidence.
+- Parallel writers only with disjoint Allowed edit surfaces (runtime-enforced) or isolated worktrees.
+- For behavior changes with applicable runnable deterministic tests and a clear expected outcome, use test-first by default: observe RED, GREEN, then refactor with focused checks. Write one RED test per requested rule. For every existing command or option the change touches, add one test proving its previous behavior still holds; add no other cases. An existing behavior counts as touched when it shares the code you changed (options, parsers, helpers, validation). Test presence alone does not establish applicability; no chat or TUI toggle activates it. For passive documentation, non-testable changes, an unavailable runner, or no meaningful RED, explain why and run proportionate ordinary functional or structural verification. Never invent lifecycle evidence or skip checks. Follow orchestrator-delegation.md for ODD forwarding and evidence.
 - Protect the human reviewer: avoid oversized changes, surface review workload risk, and ask before turning one task into a large multi-area change.
 - Never claim persistent memory is available because of this package. Memory is provided by separate packages or MCP tools when installed and callable.
 
-${getOrchestratorPrompt(cwd, activeTools, rddStatusLine)}`;
+${getOrchestratorPrompt(cwd, activeTools, rddStatusLine, hostMode)}`;
 }
 
 // Matches `git [global-flags] push` — tolerates flags like -C /repo or --work-tree=/tmp
@@ -1595,6 +1607,23 @@ const SENSITIVE_PATH_PATTERNS: RegExp[] = [
 	/\.(?:pem|key|p12|pfx)$/,
 ];
 
+const JUDGMENT_DAY_AGENT_NAMES = [
+	"jd-judge-a",
+	"jd-judge-b",
+	"jd-fix-agent",
+] as const;
+
+const CORE_MODEL_AGENT_NAMES = JUDGMENT_DAY_AGENT_NAMES;
+const CORE_MODEL_AGENT_NAME_SET = new Set<string>(CORE_MODEL_AGENT_NAMES);
+
+type AgentSource = "project" | "user" | "builtin";
+
+interface AgentEntry {
+	name: string;
+	source: AgentSource;
+	filePath?: string;
+}
+
 const KEEP_CURRENT = "Keep current";
 const INHERIT_MODEL = "Inherit active/default model";
 const CUSTOM_MODEL = "Custom model id";
@@ -1874,6 +1903,117 @@ async function confirmCommand(
 	};
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function gentleAiConfigHome(): string {
+	return gentlePiConfigHome();
+}
+
+function modelConfigPath(_cwd: string): string {
+	return join(gentleAiConfigHome(), "models.json");
+}
+
+function modelExportPath(_cwd: string): string {
+	return join(gentleAiConfigHome(), "models.export.json");
+}
+
+const MODEL_EXPORT_KIND = "gentle-pi.agent_model_routing";
+const MODEL_EXPORT_VERSION = 1;
+
+function legacyProjectModelConfigPath(cwd: string): string {
+	return join(cwd, ".pi", "gentle-ai", "models.json");
+}
+
+function projectPersonaConfigPath(cwd: string): string {
+	return join(cwd, ".pi", "gentle-ai", "persona.json");
+}
+
+function personaConfigPath(_cwd: string): string {
+	return join(gentleAiConfigHome(), "persona.json");
+}
+
+function readPersonaFile(path: string): PersonaMode | undefined {
+	if (!existsSync(path)) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (!isRecord(parsed)) return undefined;
+		return parsed.mode === "neutral" ? "neutral" : "gentleman";
+	} catch {
+		return undefined;
+	}
+}
+
+function readPersonaMode(cwd: string): PersonaMode {
+	return (
+		readPersonaFile(projectPersonaConfigPath(cwd)) ??
+		readPersonaFile(personaConfigPath(cwd)) ??
+		"gentleman"
+	);
+}
+
+function writePersonaMode(cwd: string, mode: PersonaMode): string[] {
+	const paths = [personaConfigPath(cwd)];
+	const projectPath = projectPersonaConfigPath(cwd);
+	if (existsSync(projectPath)) paths.push(projectPath);
+	for (const path of paths) {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, `${JSON.stringify({ mode }, null, 2)}\n`);
+	}
+	return paths;
+}
+
+function readSavedModelConfig(cwd: string): ModelConfigFileResult {
+	const projectPath = legacyProjectModelConfigPath(cwd);
+	const result = readModelRoutingAuthority(modelConfigPath(cwd), projectPath);
+	return result.status === "invalid" && result.path === projectPath
+		? { status: "valid", config: {} }
+		: result;
+}
+
+async function readSavedModelConfigAsync(
+	cwd: string,
+): Promise<ModelConfigFileResult> {
+	const projectPath = legacyProjectModelConfigPath(cwd);
+	const result = await readModelRoutingAuthorityAsync(modelConfigPath(cwd), projectPath);
+	return result.status === "invalid" && result.path === projectPath
+		? { status: "valid", config: {} }
+		: result;
+}
+
+export function readModelConfig(cwd: string): AgentModelConfig {
+	const result = readSavedModelConfig(cwd);
+	return result.status === "valid" ? result.config : {};
+}
+
+export async function readModelConfigAsync(
+	cwd: string,
+): Promise<AgentModelConfig> {
+	const result = await readSavedModelConfigAsync(cwd);
+	return result.status === "valid" ? result.config : {};
+}
+
+function writeModelConfig(cwd: string, config: AgentModelConfig): void {
+	const path = modelConfigPath(cwd);
+	mkdirSync(dirname(path), { recursive: true });
+	const cleaned = normalizeModelConfig(config) ?? {};
+	writeFileSync(path, `${JSON.stringify(cleaned, null, 2)}\n`);
+}
+
+async function writeModelConfigAsync(cwd: string, config: AgentModelConfig): Promise<void> {
+	const path = modelConfigPath(cwd);
+	await mkdir(dirname(path), { recursive: true });
+	const cleaned = normalizeModelConfig(config) ?? {};
+	await writeFile(path, `${JSON.stringify(cleaned, null, 2)}\n`);
+}
+
+function parseModelExport(value: unknown): AgentModelConfig | undefined {
+	if (!isRecord(value)) return undefined;
+	if (value.kind !== MODEL_EXPORT_KIND || value.version !== MODEL_EXPORT_VERSION) return undefined;
+	return normalizeModelConfig(value.agents);
+}
+
 async function exportSavedModelConfig(ctx: ExtensionContext): Promise<number> {
 	const saved = await readModelRoutingAuthorityAsync(
 		modelConfigPath(ctx.cwd),
@@ -1898,6 +2038,726 @@ async function readModelExport(ctx: ExtensionContext): Promise<AgentModelConfig 
 	}
 }
 
+function cloneModelConfig(config: AgentModelConfig): AgentModelConfig {
+	return Object.fromEntries(
+		Object.entries(config).map(([name, entry]) => [name, { ...entry }]),
+	);
+}
+
+function updateFrontmatterRouting(
+	content: string,
+	entry: AgentRoutingEntry | undefined,
+): string {
+	if (!content.startsWith("---\n")) return content;
+	const endIndex = content.indexOf("\n---", 4);
+	if (endIndex === -1) return content;
+	const frontmatter = content.slice(4, endIndex);
+	const body = content.slice(endIndex);
+	const lines = frontmatter
+		.split("\n")
+		.filter(
+			(line) => !line.startsWith("model:") && !line.startsWith("thinking:"),
+		);
+	const toInsert: string[] = [];
+	if (entry?.model) toInsert.push(`model: ${entry.model}`);
+	if (entry?.thinking) toInsert.push(`thinking: ${entry.thinking}`);
+	if (toInsert.length > 0) {
+		const descriptionIndex = lines.findIndex((line) =>
+			line.startsWith("description:"),
+		);
+		const insertIndex =
+			descriptionIndex >= 0 ? descriptionIndex + 1 : Math.min(1, lines.length);
+		lines.splice(insertIndex, 0, ...toInsert);
+	}
+	return `---\n${lines.join("\n")}${body}`;
+}
+
+/**
+ * The routing an agent file currently carries, read the same way
+ * `updateFrontmatterRouting` writes it: top-level `model:` and `thinking:`
+ * frontmatter lines. Anything else is "no routing", not an error.
+ */
+function readFrontmatterRouting(content: string): AgentRoutingEntry | undefined {
+	if (!content.startsWith("---\n")) return undefined;
+	const endIndex = content.indexOf("\n---", 4);
+	if (endIndex === -1) return undefined;
+	const raw: Record<string, string> = {};
+	for (const line of content.slice(4, endIndex).split("\n")) {
+		if (line.startsWith("model:")) raw.model = line.slice("model:".length).trim();
+		else if (line.startsWith("thinking:")) raw.thinking = line.slice("thinking:".length).trim();
+	}
+	if (raw.model === undefined && raw.thinking === undefined) return undefined;
+	const entry = normalizeRoutingEntry(raw);
+	return entry && !isClearRoutingEntry(entry) ? entry : undefined;
+}
+
+function routingEntryFromModelProfile(value: unknown): AgentRoutingEntry | undefined {
+	if (!isRecord(value)) return undefined;
+	const entry = normalizeRoutingEntry({ model: value.model, thinking: value.effort });
+	return entry && !isClearRoutingEntry(entry) ? entry : undefined;
+}
+
+function mergeMaterializedRouting(
+	profile: AgentRoutingEntry | undefined,
+	frontmatter: AgentRoutingEntry | undefined,
+): AgentRoutingEntry | undefined {
+	if (!profile) return frontmatter;
+	if (!frontmatter) return profile;
+	return normalizeRoutingEntry({
+		model: profile.model ?? frontmatter.model,
+		thinking: profile.thinking ?? frontmatter.thinking,
+	});
+}
+
+function readSubagentModelProfiles(path: string): Record<string, unknown> {
+	if (!existsSync(path)) return {};
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		return isRecord(parsed) && isRecord(parsed.model_profiles) ? parsed.model_profiles : {};
+	} catch {
+		return {};
+	}
+}
+
+async function readSubagentModelProfilesAsync(path: string): Promise<Record<string, unknown>> {
+	if (!(await pathExists(path))) return {};
+	try {
+		const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+		return isRecord(parsed) && isRecord(parsed.model_profiles) ? parsed.model_profiles : {};
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * The routing an agent is materialized with — what subagent launches actually
+ * resolve — regardless of what `models.json` records: the runtime reads
+ * `subagents.json` model profiles first and the agent frontmatter otherwise,
+ * independently for each routing field.
+ */
+function readMaterializedRoutingEntry(
+	cwd: string,
+	agent: AgentEntry,
+	profilesByPath: Map<string, Record<string, unknown>>,
+): AgentRoutingEntry | undefined {
+	const profilesPath = agentModelProfileConfigPath(cwd, agent.source);
+	let profiles = profilesByPath.get(profilesPath);
+	if (!profiles) {
+		profiles = readSubagentModelProfiles(profilesPath);
+		profilesByPath.set(profilesPath, profiles);
+	}
+	const fromProfile = routingEntryFromModelProfile(profiles[agent.name]);
+	if (!agent.filePath || !existsSync(agent.filePath)) return fromProfile;
+	try {
+		return mergeMaterializedRouting(fromProfile, readFrontmatterRouting(readFileSync(agent.filePath, "utf8")));
+	} catch {
+		return fromProfile;
+	}
+}
+
+async function readMaterializedRoutingEntryAsync(
+	cwd: string,
+	agent: AgentEntry,
+	profilesByPath: Map<string, Record<string, unknown>>,
+): Promise<AgentRoutingEntry | undefined> {
+	const profilesPath = agentModelProfileConfigPath(cwd, agent.source);
+	let profiles = profilesByPath.get(profilesPath);
+	if (!profiles) {
+		profiles = await readSubagentModelProfilesAsync(profilesPath);
+		profilesByPath.set(profilesPath, profiles);
+	}
+	const fromProfile = routingEntryFromModelProfile(profiles[agent.name]);
+	if (!agent.filePath || !(await pathExists(agent.filePath))) return fromProfile;
+	try {
+		return mergeMaterializedRouting(fromProfile, readFrontmatterRouting(await readFile(agent.filePath, "utf8")));
+	} catch {
+		return fromProfile;
+	}
+}
+
+/**
+ * The routing a launch would resolve: a winning per-repository pin replaces subagent
+ * routing wholesale, so when one wins it is the effective routing. The launch
+ * resolver decides, so the profile shown as effective is exactly the profile a launch
+ * would use -- there is no second precedence rule here.
+ */
+function pinnedEffectiveModelConfig(cwd: string): AgentModelConfig | undefined {
+	const resolution = resolveProfilePin({ cwd, configHome: gentleAiConfigHome() });
+	return resolution === undefined ? undefined : cloneModelConfig(resolution.modelProfiles);
+}
+
+/**
+ * The routing in effect: `models.json` where it speaks, and the materialized
+ * stores the runtime resolves from for every discoverable agent it is silent
+ * about. A sparse `models.json` therefore never hides routing that is still
+ * live (#1012). A winning pin outranks both. Reading never writes.
+ */
+function readEffectiveModelConfig(cwd: string): AgentModelConfig {
+	return pinnedEffectiveModelConfig(cwd) ?? readGlobalEffectiveModelConfig(cwd);
+}
+
+/** The routing in effect once the pin is set aside: what a global save materializes. */
+function readGlobalEffectiveModelConfig(cwd: string): AgentModelConfig {
+	const effective = cloneModelConfig(readModelConfig(cwd));
+	const profilesByPath = new Map<string, Record<string, unknown>>();
+	for (const agent of listDiscoverableAgents(cwd)) {
+		if (isProviderReviewRole(agent.name) || agent.name in effective) continue;
+		const entry = readMaterializedRoutingEntry(cwd, agent, profilesByPath);
+		if (entry) effective[agent.name] = entry;
+	}
+	return effective;
+}
+
+async function readEffectiveModelConfigAsync(cwd: string): Promise<AgentModelConfig> {
+	const pinned = pinnedEffectiveModelConfig(cwd);
+	if (pinned) return pinned;
+	return readGlobalEffectiveModelConfigFromAsync(cwd, await readModelConfigAsync(cwd));
+}
+
+/**
+ * The saved global routing merged with the materialized stores of every
+ * discoverable agent it is silent about — the same effective view
+ * `readEffectiveModelConfigAsync` builds, but starting from an already-read
+ * saved routing so callers that must distinguish an unreadable authority can
+ * keep that distinction while still seeing materialized routes.
+ */
+async function readGlobalEffectiveModelConfigFromAsync(
+	cwd: string,
+	base: AgentModelConfig,
+): Promise<AgentModelConfig> {
+	const effective = cloneModelConfig(base);
+	const profilesByPath = new Map<string, Record<string, unknown>>();
+	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
+		if (isProviderReviewRole(agent.name) || agent.name in effective) continue;
+		const entry = await readMaterializedRoutingEntryAsync(cwd, agent, profilesByPath);
+		if (entry) effective[agent.name] = entry;
+	}
+	return effective;
+}
+
+/**
+ * A profile is a complete routing snapshot: applying it must leave every
+ * discoverable agent it omits on inherit, not on whatever was materialized
+ * before. Padding the omitted agents with clear entries makes
+ * `applyModelConfig` remove their model profiles and frontmatter routing, the
+ * same way `/gentle:models` clears an agent set to inherit.
+ */
+async function withOmittedAgentsClearedAsync(
+	cwd: string,
+	config: AgentModelConfig,
+): Promise<AgentModelConfig> {
+	const completed = cloneModelConfig(config);
+	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
+		if (isProviderReviewRole(agent.name) || agent.name in completed) continue;
+		completed[agent.name] = {};
+	}
+	return completed;
+}
+
+function parseAgentName(filePath: string): string | undefined {
+	let content: string;
+	try {
+		content = readFileSync(filePath, "utf8");
+	} catch {
+		return undefined;
+	}
+	const name = content.match(/^name:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]?.trim();
+	if (!name) return undefined;
+	const packageName = content
+		.match(/^package:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]
+		?.trim();
+	return packageName ? `${packageName}.${name}` : name;
+}
+
+async function parseAgentNameAsync(
+	filePath: string,
+): Promise<string | undefined> {
+	let content: string;
+	try {
+		content = await readFile(filePath, "utf8");
+	} catch {
+		return undefined;
+	}
+	const name = content.match(/^name:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]?.trim();
+	if (!name) return undefined;
+	const packageName = content
+		.match(/^package:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]
+		?.trim();
+	return packageName ? `${packageName}.${name}` : name;
+}
+
+function listAgentFilesRecursive(dir: string): string[] {
+	if (!existsSync(dir)) return [];
+	const files: string[] = [];
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (entry.name === "skills") continue;
+			files.push(...listAgentFilesRecursive(path));
+		} else if (
+			entry.isFile() &&
+			entry.name.endsWith(".md") &&
+			!entry.name.endsWith(".chain.md")
+		)
+			files.push(path);
+	}
+	return files;
+}
+
+async function listAgentFilesRecursiveAsync(dir: string): Promise<string[]> {
+	if (!(await pathExists(dir))) return [];
+	const files: string[] = [];
+	let entries;
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		return files;
+	}
+	for (const entry of entries) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (entry.name === "skills") continue;
+			files.push(...(await listAgentFilesRecursiveAsync(path)));
+		} else if (
+			entry.isFile() &&
+			entry.name.endsWith(".md") &&
+			!entry.name.endsWith(".chain.md")
+		) {
+			files.push(path);
+		}
+	}
+	return files;
+}
+
+function listAgentsFromDir(dir: string, source: AgentSource): AgentEntry[] {
+	return listAgentFilesRecursive(dir)
+		.map((filePath): AgentEntry | undefined => {
+			const name = parseAgentName(filePath);
+			return name ? { name, source, filePath } : undefined;
+		})
+		.filter((entry): entry is AgentEntry => entry !== undefined);
+}
+
+async function listAgentsFromDirAsync(
+	dir: string,
+	source: AgentSource,
+): Promise<AgentEntry[]> {
+	const filePaths = await listAgentFilesRecursiveAsync(dir);
+	const entries: AgentEntry[] = [];
+	for (const filePath of filePaths) {
+		const name = await parseAgentNameAsync(filePath);
+		if (name) entries.push({ name, source, filePath });
+	}
+	return entries;
+}
+
+interface DiscoverableNonBuiltinAgentRoot {
+	dir: string;
+	source: AgentSource;
+	/** The package installer owns this directory, so packageAssetAudit reports it. */
+	packageManaged: boolean;
+}
+
+function discoverableNonBuiltinAgentRoots(cwd: string): DiscoverableNonBuiltinAgentRoot[] {
+	const globalAgentHome = gentlePiAgentHome();
+	const roots: DiscoverableNonBuiltinAgentRoot[] = [
+		{ dir: join(globalAgentHome, "agents"), source: "user", packageManaged: true },
+		{ dir: join(globalAgentHome, "subagents"), source: "user", packageManaged: false },
+		{ dir: join(homedir(), ".agents"), source: "user", packageManaged: false },
+		{ dir: join(cwd, ".agents"), source: "project", packageManaged: false },
+		{ dir: join(cwd, ".pi", "agents"), source: "project", packageManaged: false },
+		{ dir: join(cwd, ".pi", "subagents"), source: "project", packageManaged: false },
+	];
+	const unique = new Map<string, DiscoverableNonBuiltinAgentRoot>();
+	for (const root of roots) {
+		let canonical: string;
+		try {
+			canonical = realpathSync(root.dir);
+		} catch {
+			canonical = resolve(root.dir);
+		}
+		const existing = unique.get(canonical);
+		if (existing) {
+			// Reinsert so a later alias keeps true later-root precedence even when
+			// another physical root appears between the duplicate entries. A merged
+			// package-managed root must keep its installer-owned path: ownership
+			// updates validate that lexical path against the managed manifest root.
+			const managedRoot = existing.packageManaged ? existing : root.packageManaged ? root : undefined;
+			unique.delete(canonical);
+			unique.set(canonical, {
+				dir: managedRoot?.dir ?? root.dir,
+				source: root.source,
+				packageManaged: managedRoot !== undefined,
+			});
+		} else unique.set(canonical, root);
+	}
+	return [...unique.values()];
+}
+
+function builtinAgentDirs(cwd: string): string[] {
+	return [
+		join(PACKAGE_ROOT, "..", "pi-subagents-j0k3r", "agents"),
+		join(cwd, ".pi", "npm", "node_modules", "pi-subagents-j0k3r", "agents"),
+		join(homedir(), ".local", "lib", "node_modules", "pi-subagents-j0k3r", "agents"),
+		join(PACKAGE_ROOT, "..", "pi-subagents", "agents"),
+		join(cwd, ".pi", "npm", "node_modules", "pi-subagents", "agents"),
+		join(homedir(), ".local", "lib", "node_modules", "pi-subagents", "agents"),
+	];
+}
+
+function listDiscoverableAgents(cwd: string): AgentEntry[] {
+	const builtinDirs = builtinAgentDirs(cwd);
+	const agents = [
+		...builtinDirs.flatMap((dir) => listAgentsFromDir(dir, "builtin")),
+		...discoverableNonBuiltinAgentRoots(cwd).flatMap(({ dir, source }) =>
+			listAgentsFromDir(dir, source),
+		),
+	];
+	const byName = new Map<string, AgentEntry>();
+	for (const agent of agents) byName.set(agent.name, agent);
+	return orderDiscoverableAgents(Array.from(byName.values()));
+}
+
+async function listDiscoverableAgentsAsync(cwd: string): Promise<AgentEntry[]> {
+	const builtinDirs = builtinAgentDirs(cwd);
+	const agents: AgentEntry[] = [];
+	for (const dir of builtinDirs) {
+		agents.push(...(await listAgentsFromDirAsync(dir, "builtin")));
+	}
+	for (const { dir, source } of discoverableNonBuiltinAgentRoots(cwd)) {
+		agents.push(...(await listAgentsFromDirAsync(dir, source)));
+	}
+	const byName = new Map<string, AgentEntry>();
+	for (const agent of agents) byName.set(agent.name, agent);
+	return orderDiscoverableAgents(Array.from(byName.values()));
+}
+
+function orderDiscoverableAgents(agents: AgentEntry[]): AgentEntry[] {
+	const coreFirst = CORE_MODEL_AGENT_NAMES.map((name) =>
+		agents.find((agent) => agent.name === name),
+	).filter((agent): agent is AgentEntry => agent !== undefined);
+	const rest = agents
+		.filter((agent) => !CORE_MODEL_AGENT_NAME_SET.has(agent.name))
+		.sort((left, right) => left.name.localeCompare(right.name));
+	return [...coreFirst, ...rest];
+}
+
+function isClearRoutingEntry(entry: AgentRoutingEntry): boolean {
+	return entry.model === undefined && entry.thinking === undefined;
+}
+
+function agentModelProfileConfigPath(cwd: string, source: AgentSource): string {
+	return source === "project"
+		? join(cwd, ".pi", "subagents.json")
+		: join(gentlePiAgentHome(), "subagents.json");
+}
+
+function modelProfileForRoutingEntry(
+	entry: AgentRoutingEntry | undefined,
+): Record<string, string> | undefined {
+	if (!entry || isClearRoutingEntry(entry)) return undefined;
+	const profile: Record<string, string> = {};
+	if (entry.model) profile.model = entry.model;
+	if (entry.thinking) profile.effort = entry.thinking;
+	return Object.keys(profile).length > 0 ? profile : undefined;
+}
+
+function updateSubagentModelProfileAtPath(
+	path: string,
+	name: string,
+	entry: AgentRoutingEntry | undefined,
+	options: { preserveExisting?: boolean } = {},
+): boolean {
+	let config: Record<string, unknown> = {};
+	if (existsSync(path)) {
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+			if (isRecord(parsed)) config = { ...parsed };
+		} catch {
+			config = {};
+		}
+	}
+	const modelProfiles = isRecord(config.model_profiles)
+		? { ...config.model_profiles }
+		: {};
+	const profile = modelProfileForRoutingEntry(entry);
+	// A write that would leave the profile as it is (including removing a
+	// profile that was never there) is not an update and touches no file.
+	if (JSON.stringify(modelProfiles[name]) === JSON.stringify(profile)) return false;
+	if (profile) {
+		if (options.preserveExisting && isRecord(modelProfiles[name])) return false;
+		modelProfiles[name] = profile;
+	} else delete modelProfiles[name];
+	if (Object.keys(modelProfiles).length > 0) config.model_profiles = modelProfiles;
+	else delete config.model_profiles;
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+	return true;
+}
+
+async function updateSubagentModelProfileAtPathAsync(
+	path: string,
+	name: string,
+	entry: AgentRoutingEntry | undefined,
+	options: { preserveExisting?: boolean } = {},
+): Promise<boolean> {
+	let config: Record<string, unknown> = {};
+	if (await pathExists(path)) {
+		try {
+			const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+			if (isRecord(parsed)) config = { ...parsed };
+		} catch {
+			config = {};
+		}
+	}
+	const modelProfiles = isRecord(config.model_profiles)
+		? { ...config.model_profiles }
+		: {};
+	const profile = modelProfileForRoutingEntry(entry);
+	// A write that would leave the profile as it is (including removing a
+	// profile that was never there) is not an update and touches no file.
+	if (JSON.stringify(modelProfiles[name]) === JSON.stringify(profile)) return false;
+	if (profile) {
+		if (options.preserveExisting && isRecord(modelProfiles[name])) return false;
+		modelProfiles[name] = profile;
+	} else delete modelProfiles[name];
+	if (Object.keys(modelProfiles).length > 0) config.model_profiles = modelProfiles;
+	else delete config.model_profiles;
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(path, `${JSON.stringify(config, null, 2)}\n`);
+	return true;
+}
+
+function updateSubagentModelProfile(
+	cwd: string,
+	source: AgentSource,
+	name: string,
+	entry: AgentRoutingEntry | undefined,
+	options: { preserveExisting?: boolean } = {},
+): boolean {
+	return updateSubagentModelProfileAtPath(
+		agentModelProfileConfigPath(cwd, source),
+		name,
+		entry,
+		options,
+	);
+}
+
+function projectSettingsPath(cwd: string): string {
+	return join(cwd, ".pi", "settings.json");
+}
+
+/**
+ * Pi's own global settings file, which is where the orchestrator model lives.
+ * Profiles own the three `default*` keys there; nothing else in this extension
+ * reads or writes that file.
+ */
+function orchestratorSettingsPath(): string {
+	return join(gentlePiAgentHome(), "settings.json");
+}
+
+function removeLegacyAgentOverridesFromSettings(
+	settingsPath: string,
+	settings: Record<string, unknown>,
+): void {
+	const subagents = isRecord(settings.subagents)
+		? { ...settings.subagents }
+		: undefined;
+	if (!subagents) return;
+	delete subagents.agentOverrides;
+	if (Object.keys(subagents).length > 0) settings.subagents = subagents;
+	else delete settings.subagents;
+	mkdirSync(dirname(settingsPath), { recursive: true });
+	writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+}
+
+function isValidJsonObjectFileOrMissing(path: string): boolean {
+	if (!existsSync(path)) return true;
+	try {
+		return isRecord(JSON.parse(readFileSync(path, "utf8")));
+	} catch {
+		return false;
+	}
+}
+
+const PROVIDER_REVIEW_ROLES = ["review-refuter", "review-validator"] as const;
+
+function isProviderReviewRole(name: string): boolean {
+	return PROVIDER_REVIEW_ROLES.some((role) => role === name);
+}
+
+function modelAssignmentNames(cwd: string): string[] {
+	return [...new Set([
+		...PROVIDER_REVIEW_ROLES,
+		...listDiscoverableAgents(cwd).map((agent) => agent.name),
+	])];
+}
+
+const PROVIDER_ROUTING_DEFAULT_LABELS = {
+	model: "Pi persisted default model",
+	effort: "Pi persisted default effort",
+} as const;
+
+type RoutingDefaultField = keyof typeof PROVIDER_ROUTING_DEFAULT_LABELS;
+
+function routingDefaultLabel(name: string, field: RoutingDefaultField): string {
+	return isProviderReviewRole(name) ? PROVIDER_ROUTING_DEFAULT_LABELS[field] : "inherit";
+}
+
+function migrateLegacyProjectModelOverrides(cwd: string): number {
+	const settingsPath = projectSettingsPath(cwd);
+	if (!existsSync(settingsPath)) return 0;
+	let settings: Record<string, unknown>;
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(settingsPath, "utf8"));
+		if (!isRecord(parsed)) return 0;
+		settings = { ...parsed };
+	} catch {
+		return 0;
+	}
+	const subagents = isRecord(settings.subagents) ? settings.subagents : undefined;
+	const agentOverrides = isRecord(subagents?.agentOverrides)
+		? subagents.agentOverrides
+		: undefined;
+	if (!agentOverrides) return 0;
+	const agentsByName = new Map(listDiscoverableAgents(cwd).map((agent) => [agent.name, agent]));
+	const migratableEntries = Object.entries(agentOverrides)
+		.filter(([name]) => !isProviderReviewRole(name))
+		.map(([name, value]) => ({ name, entry: normalizeRoutingEntry(value) }))
+		.filter((item): item is { name: string; entry: AgentRoutingEntry } =>
+			item.entry !== undefined && !isClearRoutingEntry(item.entry),
+		);
+	const targetPaths = new Set(
+		migratableEntries.map(({ name }) =>
+			agentModelProfileConfigPath(cwd, agentsByName.get(name)?.source ?? "project"),
+		),
+	);
+	if (![...targetPaths].every(isValidJsonObjectFileOrMissing)) return 0;
+	let migrated = 0;
+	for (const { name, entry } of migratableEntries) {
+		const source = agentsByName.get(name)?.source ?? "project";
+		if (updateSubagentModelProfile(cwd, source, name, entry, { preserveExisting: true })) migrated += 1;
+	}
+	removeLegacyAgentOverridesFromSettings(settingsPath, settings);
+	return migrated;
+}
+
+async function updateSubagentModelProfileAsync(
+	cwd: string,
+	source: AgentSource,
+	name: string,
+	entry: AgentRoutingEntry | undefined,
+	options: { preserveExisting?: boolean } = {},
+): Promise<boolean> {
+	return updateSubagentModelProfileAtPathAsync(
+		agentModelProfileConfigPath(cwd, source),
+		name,
+		entry,
+		options,
+	);
+}
+
+export function applyModelConfig(
+	cwd: string,
+	config: AgentModelConfig,
+): { updated: number; skipped: number } {
+	let updated = 0;
+	let skipped = 0;
+	const seenAgents = new Set<string>();
+	for (const agent of listDiscoverableAgents(cwd)) {
+		if (isProviderReviewRole(agent.name)) continue;
+		seenAgents.add(agent.name);
+		const entry = config[agent.name];
+		if (entry === undefined) {
+			skipped += 1;
+			continue;
+		}
+		if (agent.source === "builtin") {
+			if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
+			else skipped += 1;
+			continue;
+		}
+		if (!agent.filePath || !existsSync(agent.filePath)) {
+			skipped += 1;
+		} else {
+			const original = readFileSync(agent.filePath, "utf8");
+			const next = updateFrontmatterRouting(original, entry);
+			if (next === original) {
+				skipped += 1;
+			} else {
+				if (!updatePackageManagedSddAgentOwnership(agent.filePath, original, next)) {
+					writeFileSync(agent.filePath, next);
+				}
+				updated += 1;
+			}
+		}
+		if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
+		else skipped += 1;
+	}
+	for (const [name, entry] of Object.entries(config)) {
+		if (isProviderReviewRole(name)) continue;
+		// The orchestrator is routing, not an agent: its model lives in Pi's global
+		// settings.json and must never reach subagents.json.
+		if (isProfileOrchestratorKey(name)) continue;
+		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
+			if (updateSubagentModelProfile(cwd, "user", name, entry)) updated += 1;
+			else skipped += 1;
+		}
+	}
+	return { updated, skipped };
+}
+
+export async function applyModelConfigAsync(
+	cwd: string,
+	config: AgentModelConfig,
+): Promise<{ updated: number; skipped: number }> {
+	let updated = 0;
+	let skipped = 0;
+	const seenAgents = new Set<string>();
+	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
+		if (isProviderReviewRole(agent.name)) continue;
+		seenAgents.add(agent.name);
+		const entry = config[agent.name];
+		if (entry === undefined) {
+			skipped += 1;
+			continue;
+		}
+		if (agent.source === "builtin") {
+			if (await updateSubagentModelProfileAsync(cwd, agent.source, agent.name, entry))
+				updated += 1;
+			else skipped += 1;
+			continue;
+		}
+		if (!agent.filePath || !(await pathExists(agent.filePath))) {
+			skipped += 1;
+		} else {
+			const original = await readFile(agent.filePath, "utf8");
+			const next = updateFrontmatterRouting(original, entry);
+			if (next === original) {
+				skipped += 1;
+			} else {
+				if (!updatePackageManagedSddAgentOwnership(agent.filePath, original, next)) {
+					await writeFile(agent.filePath, next);
+				}
+				updated += 1;
+			}
+		}
+		if (await updateSubagentModelProfileAsync(cwd, agent.source, agent.name, entry))
+			updated += 1;
+		else skipped += 1;
+	}
+	for (const [name, entry] of Object.entries(config)) {
+		if (isProviderReviewRole(name)) continue;
+		if (isProfileOrchestratorKey(name)) continue;
+		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
+			if (await updateSubagentModelProfileAsync(cwd, "user", name, entry))
+				updated += 1;
+			else skipped += 1;
+		}
+	}
+	return { updated, skipped };
+}
+
 export async function applySavedModelConfig(
 	ctx: ExtensionContext,
 	applyConfig: typeof applyModelConfigAsync = applyModelConfigAsync,
@@ -1914,6 +2774,7 @@ export async function applySavedModelConfig(
 		result.status === "valid" ? result.config : {},
 	);
 }
+
 function describeModelConfig(cwd: string, config: AgentModelConfig): string[] {
 	return modelAssignmentNames(cwd).map((name) => {
 		const entry = config[name];
@@ -2738,6 +3599,7 @@ function updateCurrentProfileFromSavedRouting(ctx: ExtensionContext, pi: Extensi
 
 type ProfilesPanelResult =
 	| { type: "apply"; name: string }
+	| { type: "apply-global"; name: string }
 	| { type: "create" }
 	| { type: "update"; name: string }
 	| { type: "duplicate"; name: string }
@@ -2925,6 +3787,7 @@ class ProfilesPanel implements OverlayComponent {
 	private readonly orchestratorSettings: OrchestratorSettingsReadResult;
 	// Actions reopen the panel, refreshing this snapshot without disk reads during rendering.
 	private readonly pinStatus: ProfilePinStatus | undefined;
+	private readonly sessionBoundName: string | undefined;
 
 	constructor(
 		file: AgentProfilesFile,
@@ -2938,6 +3801,7 @@ class ProfilesPanel implements OverlayComponent {
 		saveSnapshot: ProfilesSnapshotHandler,
 		requestRender: () => void,
 		pinStatus: () => ProfilePinStatus | undefined,
+		sessionBound: () => string | undefined,
 		feedback?: string,
 	) {
 		this.file = file;
@@ -2950,7 +3814,8 @@ class ProfilesPanel implements OverlayComponent {
 		this.rows = rows;
 		this.orchestratorSettings = orchestratorSettings;
 		this.pinStatus = pinStatus();
-		const items = buildProfileListItems(file, evaluateProfilePin(this.pinStatus, file.profiles).winner?.profile);
+		this.sessionBoundName = sessionBound();
+		const items = buildProfileListItems(file, evaluateProfilePin(this.pinStatus, file.profiles).winner?.profile, this.sessionBoundName);
 		this.listItems = items;
 		this.list = new NativeChoiceList<ProfileListItem>(
 			items,
@@ -3013,6 +3878,7 @@ class ProfilesPanel implements OverlayComponent {
 			this.requestRender();
 			return;
 		}
+		if (data === "a") return this.finish({ type: "apply-global", name });
 		if (data === "d") return this.finish({ type: "duplicate", name });
 		if (data === "r") return this.finish({ type: "rename", name });
 		if (data === "x") return this.finish({ type: "delete", name });
@@ -3091,7 +3957,7 @@ class ProfilesPanel implements OverlayComponent {
 	private refreshListItems(): void {
 		// Keep the list instance (and its pointer observer) alive while refreshing the
 		// mutable item records that NativeChoiceList already holds by reference.
-		for (const item of buildProfileListItems(this.file, evaluateProfilePin(this.pinStatus, this.file.profiles).winner?.profile)) {
+		for (const item of buildProfileListItems(this.file, evaluateProfilePin(this.pinStatus, this.file.profiles).winner?.profile, this.sessionBoundName)) {
 			const current = this.listItems.find((candidate) => candidate.id === item.id);
 			if (current) Object.assign(current, item);
 		}
@@ -3138,7 +4004,7 @@ class ProfilesPanel implements OverlayComponent {
 
 	private renderFooterRow(width: number): string {
 		const hints =
-			"enter apply · c create · s snapshot · d duplicate · r rename · x delete · e export · i import · p pin · P share · j/k line · ctrl+j/k page · esc close";
+			"enter use in this session · a set as global default · c create · s snapshot · d duplicate · r rename · x delete · e export · i import · p pin · P share · j/k line · ctrl+j/k page · esc close";
 		const text = this.feedback ?? hints;
 		return [
 			this.renderText("│", "border"),
@@ -3174,6 +4040,14 @@ class ProfilesPanel implements OverlayComponent {
 			// any invalid or stale layer, and the scope sentence all come from the shared
 			// precedence rule the launch resolver uses.
 			...profilePinDetailLines(this.pinStatus, this.file.profiles).map((line) => this.renderLine(line, width, "muted")),
+			// gentle-shell#1064 slice 1: the binding is stored for this session and
+			// outranks the pin in the panel list, so it is named right after the pin
+			// layers. Launch resolution ships with slice 2 (gentle-shell#1558); this
+			// slice stores the binding only, launch routing is unchanged, and nothing
+			// was written.
+			...(this.sessionBoundName === undefined
+				? []
+				: [this.renderLine(`session        ${sanitizeTerminalText(this.sessionBoundName)} (session) — stored for this session; launch routing is unchanged; nothing was written`, width, "muted")]),
 			"",
 			this.renderLine("Profile routing", width, "accent"),
 			...this.indentLines(this.routingLines(profileRows, widths), width),
@@ -3230,6 +4104,7 @@ class ProfilesPanel implements OverlayComponent {
 	}
 }
 
+/** The full-screen profile picker: one visit per action, so every reopen reads fresh store, pin, orchestrator, and session-binding state. */
 async function showProfilesPanel(
 	ctx: ExtensionContext,
 	file: AgentProfilesFile,
@@ -3237,6 +4112,7 @@ async function showProfilesPanel(
 	selectedName: string | undefined,
 	saveSnapshot: ProfilesSnapshotHandler,
 	status?: string,
+	sessionBoundName?: string,
 ): Promise<ProfilesPanelResult> {
 	// Both orchestrator and pin state are snapshots for this panel visit.
 	// Actions (including p/P) reopen the panel and read fresh state.
@@ -3255,6 +4131,7 @@ async function showProfilesPanel(
 				saveSnapshot,
 				() => tui.requestRender(),
 				() => readProfilePinStatus(ctx.cwd),
+				() => sessionBoundName,
 				status,
 			);
 			const container = createNativeFullscreenInteraction({
@@ -3302,7 +4179,7 @@ function reportProfilesDrops(ctx: ExtensionContext, path: string, drops: Profile
 }
 
 /** Pi's own live-session controls: the ExtensionAPI's setModel/setThinkingLevel. */
-type LiveSession = Pick<ExtensionAPI, "setModel" | "setThinkingLevel">;
+type LiveSession = Pick<ExtensionAPI, "setModel" | "setThinkingLevel" | "getThinkingLevel">;
 
 /**
  * Switch the running session to the profile's orchestrator. `settings.json`
@@ -3352,102 +4229,7 @@ function profileSnapshotFrom(
 	return snapshot;
 }
 
-/**
- * Upstream's confirmation for a global profile apply, run by applyProfile after its pin check
- * and before anything is written. Only this terminal panel asks; headless hosts apply directly.
- */
-async function confirmGlobalProfileApply(
-	ctx: ExtensionContext,
-	name: string,
-	normalized: AgentModelConfig,
-	orchestratorEntry: ReturnType<typeof readProfileOrchestrator>,
-): Promise<boolean> {
-	const hasAgentRoutes = Object.keys(normalized).some((name) => !isProfileOrchestratorKey(name));
-	// Every global apply confirms before anything is written: applying replaces
-	// the whole routing map in models.json and clears materialized routes the
-	// profile omits, so the dialog must name the concrete diff. The current
-	// routing is read from the same authority every other consumer uses; an
-	// unreadable config is tolerated as empty, exactly like readModelConfigAsync.
-	const savedRouting = await readModelRoutingAuthorityAsync(
-		modelConfigPath(ctx.cwd),
-		legacyProjectModelConfigPath(ctx.cwd),
-	);
-	// The apply pads omitted discoverable agents with clear entries, so the
-	// diff must run against the effective current routing: the saved global
-	// routing plus the materialized routes (frontmatter, subagents.json) of
-	// agents the saved routing is silent about. models.json alone would hide
-	// materialized-only routes the approval actually clears.
-	const currentRouting = savedRouting.status === "valid"
-		? await readGlobalEffectiveModelConfigFromAsync(ctx.cwd, savedRouting.config)
-		: {};
-	const agentNames = [
-		...new Set([
-			...Object.keys(currentRouting).filter((name) => !isProfileOrchestratorKey(name)),
-			...Object.keys(normalized).filter((name) => !isProfileOrchestratorKey(name)),
-		]),
-	].sort();
-	const replacedRoutes: string[] = [];
-	const clearedRoutes: string[] = [];
-	const addedRoutes: string[] = [];
-	for (const name of agentNames) {
-		const from = currentRouting[name];
-		const to = normalized[name];
-		if (to === undefined) {
-			clearedRoutes.push(`${name}: ${formatOrchestratorSelection(from)} → inherit (cleared)`);
-		} else if (from === undefined) {
-			addedRoutes.push(`${name}: ${formatOrchestratorSelection(to)} (added)`);
-		} else if (from.model !== to.model || from.thinking !== to.thinking) {
-			replacedRoutes.push(`${name}: ${formatOrchestratorSelection(from)} → ${formatOrchestratorSelection(to)}`);
-		}
-	}
-	if (!hasAgentRoutes) {
-		// A genuinely empty profile and an orchestrator-only profile both wipe
-		// every materialized agent route, but they read very differently to the
-		// user: the orchestrator entry survives the apply and reconfigures the
-		// orchestrator, so the dialog must not promise an entirely empty config.
-		const [confirmTitle, confirmMessage] = orchestratorEntry !== undefined
-			? [
-				"Apply orchestrator-only profile?",
-				`Profile "${name}" has an orchestrator entry but no agent routing entries. Applying it will replace global routing in ${sanitizeTerminalText(modelConfigPath(ctx.cwd))} with the orchestrator entry alone, clear every materialized agent route so every agent returns to inherit its default model, set the configured orchestrator entry in settings.json, and attempt to switch this session to that orchestrator model. Continue?`,
-			]
-			: [
-				"Apply empty profile?",
-				`Profile "${name}" has no routing entries. Applying it will replace global routing in ${sanitizeTerminalText(modelConfigPath(ctx.cwd))} with an empty configuration and return every agent to inherit its default model. Continue?`,
-			];
-		const approved = await ctx.ui.confirm(confirmTitle, confirmMessage);
-		if (!approved) return false;
-	} else {
-		// A populated profile keeps the same abort semantics as the empty and
-		// orchestrator-only dialogs: declining leaves every surface untouched.
-		// When the routing authority is unreadable the diff above was computed
-		// against an empty map, so the dialog must disclose the unreadable
-		// routing and the replace/clear-to-inherit effect instead of presenting
-		// existing routes as merely "(added)" (the #1349 wipe-bug class).
-		// When the profile carries an orchestrator entry, approval also writes
-		// settings.json and tries to move the live session, so both variants
-		// must disclose those effects in the same words the orchestrator-only
-		// dialog uses. An unconditional "will switch" is never claimed: the
-		// registry/auth can refuse the live move.
-		const orchestratorEffects = orchestratorEntry !== undefined
-			? ", set the configured orchestrator entry in settings.json, and attempt to switch this session to that orchestrator model"
-			: "";
-		let confirmMessage: string;
-		if (savedRouting.status !== "valid") {
-			const modelsPath = sanitizeTerminalText(modelConfigPath(ctx.cwd));
-			confirmMessage = `Profile "${name}" has agent routing entries, but the current global routing in ${modelsPath} could not be read, so existing routes are not listed. Applying it will replace global routing in ${modelsPath} with this profile's routes, so every existing agent route may be replaced or cleared back to inherit${orchestratorEffects}. Continue?`;
-		} else {
-			const changes = [...replacedRoutes, ...clearedRoutes, ...addedRoutes];
-			const changeSummary = changes.length > 0
-				? changes.join("; ")
-				: "its agent routes already match the current global routing";
-			confirmMessage = `Profile "${name}" has agent routing entries. Applying it will replace global routing in ${sanitizeTerminalText(modelConfigPath(ctx.cwd))} with this profile's routes: ${changeSummary}${orchestratorEffects}. Continue?`;
-		}
-		const approved = await ctx.ui.confirm(`Apply profile "${name}"?`, confirmMessage);
-		if (!approved) return false;
-	}
-	return true;
-}
-
+/** Runs one finished panel action against the store and the live session, returning the file the reopened panel should show. */
 async function runProfilesPanelAction(
 	ctx: ExtensionContext,
 	live: LiveSession,
@@ -3458,87 +4240,308 @@ async function runProfilesPanelAction(
 ): Promise<AgentProfilesFile> {
 	switch (result.type) {
 		case "apply": {
-			const applied = await applyProfile({
-				cwd: ctx.cwd,
-				profilesPath: path,
-				file,
-				name: result.name,
-				confirmGlobalApply: (profile) =>
-					confirmGlobalProfileApply(ctx, result.name, profile.normalized, profile.orchestratorEntry),
-			});
-			if (applied === undefined) return file;
-			switch (applied.status) {
-				case "pin-failed":
+			if (!hasOwnProfile(file.profiles, result.name)) return file;
+			// gentle-shell#1064 slice 1: Enter binds the selected profile to this
+			// parent session. The binding is in-process state keyed by the session
+			// id: it writes no store marker, no global routing, no materialized
+			// stores, no agent frontmatter, no Pi settings, and no pin or declaration
+			// layer, pin or not. This slice stores the binding only: launch routing
+			// is unchanged until slice 2 (gentle-shell#1558) resolves the binding
+			// at launch. Refreshing the binding means selecting again.
+			const sessionId = ctx.sessionManager?.getSessionId?.();
+			if (typeof sessionId !== "string" || sessionId.length === 0) {
+				ctx.ui.notify(
+					`el Gentleman cannot bind profile "${result.name}" to this session: no parent session id is available here. Set it as the global default with a instead.`,
+					"warning",
+				);
+				return file;
+			}
+			bindSessionProfile(sessionId, result.name, normalizeModelConfig(file.profiles[result.name]) ?? {});
+			ctx.ui.notify(
+				`el Gentleman bound profile "${result.name}" to this session — shown as "${result.name} (session)". The binding is stored for this session; launch routing is unchanged. Nothing was written: the global routing, pins, and materialized stores are untouched. Set as global default with a.`,
+				"info",
+			);
+			return file;
+		}
+		case "apply-global": {
+			if (!hasOwnProfile(file.profiles, result.name)) return file;
+			// A pinned repository resolves its subagent routing from the profile at launch,
+			// so a global apply would move global state this repository never reads. When a
+			// pin wins, applying is repo-scoped: re-pin this clone and write no global
+			// routing, no materialized stores, and no orchestrator. The committed
+			// declaration is never rewritten behind a commit.
+			const pinResolution = resolveProfilePin({ cwd: ctx.cwd, configHome: gentleAiConfigHome() });
+			if (pinResolution) {
+				const localPath = pinResolution.status.localPath;
+				let pinNote: string;
+				try {
+					writeProfilePinSync(localPath, result.name);
+					pinNote = `el Gentleman applied profile "${result.name}" repo-scoped: this clone now pins it in ${sanitizeTerminalText(localPath)}.\nSubagent launches here keep resolving the pin; no global routing or orchestrator was written.`;
+				} catch (error) {
 					ctx.ui.notify(
-						`el Gentleman could not pin profile "${result.name}" in ${sanitizeTerminalText(applied.localPath)}: ${profilesErrorMessage(applied.error)}`,
+						`el Gentleman could not pin profile "${result.name}" in ${sanitizeTerminalText(localPath)}: ${profilesErrorMessage(error)}`,
 						"warning",
 					);
-					return file;
-				case "pinned": {
-					let pinNote = `el Gentleman applied profile "${result.name}" repo-scoped: this clone now pins it in ${sanitizeTerminalText(applied.localPath)}.\nSubagent launches here keep resolving the pin; no global routing or orchestrator was written.`;
-					if (applied.shadowedDeclaration) {
-						pinNote += `\nThis worktree's committed declaration ${sanitizeTerminalText(applied.shadowedDeclaration.path)} still declares "${applied.shadowedDeclaration.profile}"; the clone-local pin now takes precedence.`;
-					}
-					ctx.ui.notify(pinNote, "info");
 					return file;
 				}
-				case "claim-failed":
-					ctx.ui.notify(
-						`el Gentleman could not update ${sanitizeTerminalText(path)}: ${profilesErrorMessage(applied.error)}`,
-						"warning",
-					);
-					return file;
-				case "failed": {
-					if (applied.stage === "models") {
-						ctx.ui.notify(
-							`el Gentleman could not write ${sanitizeTerminalText(modelConfigPath(ctx.cwd))}: ${profilesErrorMessage(applied.error)}`,
-							"warning",
-						);
-					} else if (applied.stage === "materialize") {
-						ctx.ui.notify(
-							`el Gentleman could not materialize profile "${result.name}": ${profilesErrorMessage(applied.error)}`,
-							"warning",
-						);
-					} else {
-						const settingsPath = orchestratorSettingsPath();
-						ctx.ui.notify(
-							`el Gentleman could not set the orchestrator from profile "${result.name}": ${sanitizeTerminalText(String(applied.error))}. ${sanitizeTerminalText(settingsPath)} was left unchanged.`,
-							"warning",
-						);
-					}
-					const unresolved = applied.unrestoredModelsPath
-						? ` ${sanitizeTerminalText(applied.unrestoredModelsPath)} still holds this profile's routing because no previously active profile was recorded to restore.`
-						: "";
-					ctx.ui.notify(
-						`el Gentleman could not apply profile "${result.name}". Restored: ${applied.restored}.${unresolved}`,
-						"warning",
-					);
-					return file;
+				if (pinResolution.source === "repo" && pinResolution.path !== localPath) {
+					pinNote += `\nThis worktree's committed declaration ${sanitizeTerminalText(pinResolution.path)} still declares "${pinResolution.profile}"; the clone-local pin now takes precedence.`;
+				}
+				ctx.ui.notify(pinNote, "info");
+				return file;
+			}
+			const normalized = normalizeModelConfig(file.profiles[result.name]) ?? {};
+			const orchestratorEntry = readProfileOrchestrator(normalized);
+			const hasAgentRoutes = Object.keys(normalized).some((name) => !isProfileOrchestratorKey(name));
+			// Every global apply confirms before anything is written: applying replaces
+			// the whole routing map in models.json and clears materialized routes the
+			// profile omits, so the dialog must name the concrete diff. The current
+			// routing is read from the same authority every other consumer uses; an
+			// unreadable config is tolerated as empty, exactly like readModelConfigAsync.
+			const savedRouting = await readModelRoutingAuthorityAsync(
+				modelConfigPath(ctx.cwd),
+				legacyProjectModelConfigPath(ctx.cwd),
+			);
+			// The apply pads omitted discoverable agents with clear entries, so the
+			// diff must run against the effective current routing: the saved global
+			// routing plus the materialized routes (frontmatter, subagents.json) of
+			// agents the saved routing is silent about. models.json alone would hide
+			// materialized-only routes the approval actually clears.
+			const currentRouting = savedRouting.status === "valid"
+				? await readGlobalEffectiveModelConfigFromAsync(ctx.cwd, savedRouting.config)
+				: {};
+			const agentNames = [
+				...new Set([
+					...Object.keys(currentRouting).filter((name) => !isProfileOrchestratorKey(name)),
+					...Object.keys(normalized).filter((name) => !isProfileOrchestratorKey(name)),
+				]),
+			].sort();
+			const replacedRoutes: string[] = [];
+			const clearedRoutes: string[] = [];
+			const addedRoutes: string[] = [];
+			for (const name of agentNames) {
+				const from = currentRouting[name];
+				const to = normalized[name];
+				if (to === undefined) {
+					clearedRoutes.push(`${name}: ${formatOrchestratorSelection(from)} → inherit (cleared)`);
+				} else if (from === undefined) {
+					addedRoutes.push(`${name}: ${formatOrchestratorSelection(to)} (added)`);
+				} else if (from.model !== to.model || from.thinking !== to.thinking) {
+					replacedRoutes.push(`${name}: ${formatOrchestratorSelection(from)} → ${formatOrchestratorSelection(to)}`);
 				}
 			}
+			if (!hasAgentRoutes) {
+				// A genuinely empty profile and an orchestrator-only profile both wipe
+				// every materialized agent route, but they read very differently to the
+				// user: the orchestrator entry survives the apply and reconfigures the
+				// orchestrator, so the dialog must not promise an entirely empty config.
+				const [confirmTitle, confirmMessage] = orchestratorEntry !== undefined
+					? [
+						"Apply orchestrator-only profile?",
+						`Profile "${result.name}" has an orchestrator entry but no agent routing entries. Applying it will replace global routing in ${sanitizeTerminalText(modelConfigPath(ctx.cwd))} with the orchestrator entry alone, clear every materialized agent route so every agent returns to inherit its default model, set the configured orchestrator entry in settings.json, and attempt to switch this session to that orchestrator model. Continue?`,
+					]
+					: [
+						"Apply empty profile?",
+						`Profile "${result.name}" has no routing entries. Applying it will replace global routing in ${sanitizeTerminalText(modelConfigPath(ctx.cwd))} with an empty configuration and return every agent to inherit its default model. Continue?`,
+					];
+				const approved = await ctx.ui.confirm(confirmTitle, confirmMessage);
+				if (!approved) return file;
+			} else {
+				// A populated profile keeps the same abort semantics as the empty and
+				// orchestrator-only dialogs: declining leaves every surface untouched.
+				// When the routing authority is unreadable the diff above was computed
+				// against an empty map, so the dialog must disclose the unreadable
+				// routing and the replace/clear-to-inherit effect instead of presenting
+				// existing routes as merely "(added)" (the #1349 wipe-bug class).
+				// When the profile carries an orchestrator entry, approval also writes
+				// settings.json and tries to move the live session, so both variants
+				// must disclose those effects in the same words the orchestrator-only
+				// dialog uses. An unconditional "will switch" is never claimed: the
+				// registry/auth can refuse the live move.
+				const orchestratorEffects = orchestratorEntry !== undefined
+					? ", set the configured orchestrator entry in settings.json, and attempt to switch this session to that orchestrator model"
+					: "";
+				// A profile whose agent routes already match the effective current routing
+				// and that moves no orchestrator changes nothing: re-selecting the active
+				// profile or verifying state would otherwise train users to approve a
+				// dialog without reading it, weakening the guard on the destructive cases
+				// (issue #1683). Any routing change, any orchestrator change, or an
+				// unreadable routing authority (the diff above cannot prove a no-op)
+				// keeps the confirmation exactly as #1349/#1384 defined it.
+				// `applyOrchestratorSettings` treats an entry without a model as "leave
+				// settings.json alone", so such an entry is a no-op too, not a change.
+				// The live session is a fourth surface: applying re-asserts the profile's
+				// orchestrator on it, so a session already moved to another model or
+				// thinking level mid-session is a real change the user must approve,
+				// even when settings.json and the profile agree.
+				const liveOrchestrator = (() => {
+					if (ctx.model === undefined || typeof ctx.model.provider !== "string" || typeof ctx.model.id !== "string") return undefined;
+					let thinking: unknown;
+					try { thinking = live.getThinkingLevel(); } catch { return undefined; }
+					return { model: `${ctx.model.provider}/${ctx.model.id}`, thinking: isThinkingLevel(thinking) ? thinking : undefined };
+				})();
+				const orchestratorUnchanged = (orchestratorEntry === undefined || orchestratorEntry.model === undefined) || (() => {
+					const current = readOrchestratorSettings(orchestratorSettingsPath());
+					// An invalid stored defaultThinkingLevel is dropped from the entry but
+					// applyOrchestratorSettings would delete the key, so the file would
+					// change: a no-op cannot be proven and the dialog must stay.
+					if (current.status === "valid" && "defaultThinkingLevel" in current.value && current.entry?.thinking === undefined) return false;
+					return current.status === "valid" && current.entry !== undefined
+						&& current.entry.model === orchestratorEntry.model
+						&& current.entry.thinking === orchestratorEntry.thinking
+						&& liveOrchestrator !== undefined
+						&& liveOrchestrator.model === orchestratorEntry.model
+						&& liveOrchestrator.thinking === orchestratorEntry.thinking;
+				})();
+				if (savedRouting.status === "valid" && replacedRoutes.length === 0 && clearedRoutes.length === 0 && addedRoutes.length === 0 && orchestratorUnchanged) {
+					ctx.ui.notify(
+						`Profile "${result.name}" already matches the current global routing${orchestratorEntry !== undefined ? " and orchestrator" : ""}; applying it changed nothing.`,
+						"info",
+					);
+				} else {
+					let confirmMessage: string;
+					if (savedRouting.status !== "valid") {
+						const modelsPath = sanitizeTerminalText(modelConfigPath(ctx.cwd));
+						confirmMessage = `Profile "${result.name}" has agent routing entries, but the current global routing in ${modelsPath} could not be read, so existing routes are not listed. Applying it will replace global routing in ${modelsPath} with this profile's routes, so every existing agent route may be replaced or cleared back to inherit${orchestratorEffects}. Continue?`;
+					} else {
+						const changes = [...replacedRoutes, ...clearedRoutes, ...addedRoutes];
+						const changeSummary = changes.length > 0
+							? changes.join("; ")
+							: "its agent routes already match the current global routing";
+						confirmMessage = `Profile "${result.name}" has agent routing entries. Applying it will replace global routing in ${sanitizeTerminalText(modelConfigPath(ctx.cwd))} with this profile's routes: ${changeSummary}${orchestratorEffects}. Continue?`;
+					}
+					const approved = await ctx.ui.confirm(`Apply profile "${result.name}"?`, confirmMessage);
+					if (!approved) return file;
+				}
+			}
+			// Applying spans three files — the store, models.json, and Pi's global
+			// settings.json — and there is no cross-file rename, so order the writes to
+			// keep the store truthful and compensate on failure: claim the profile in
+			// the store first, then materialise routing, then the orchestrator. A claim
+			// that fails leaves routing untouched; anything that fails after the claim
+			// restores the previous claim and, when the previously active profile is
+			// known, the routing that profile implies.
+			const claimed = setActiveProfile(file, result.name);
+			try {
+				writeProfilesFileSync(path, claimed);
+			} catch (error) {
+				ctx.ui.notify(
+					`el Gentleman could not update ${sanitizeTerminalText(path)}: ${profilesErrorMessage(error)}`,
+					"warning",
+				);
+				return file;
+			}
+			const previousActiveConfig =
+				file.active !== undefined && hasOwnProfile(file.profiles, file.active)
+					? normalizeModelConfig(file.profiles[file.active]) ?? {}
+					: undefined;
+			// Set only when the orchestrator write succeeded, so the revert knows it has
+			// something to undo. A rollback closure (not a previous-bytes value) is used
+			// because "the file did not exist before" is a real state that must restore
+			// by removing the file, and `undefined` bytes cannot carry that distinction.
+			let orchestratorRollback: (() => void) | undefined;
+			const revertClaim = async (routingWritten: boolean): Promise<AgentProfilesFile> => {
+				let restored = previousActiveConfig === undefined ? "" : "routing";
+				if (routingWritten && previousActiveConfig !== undefined) {
+					try {
+						await writeModelConfigAsync(ctx.cwd, previousActiveConfig);
+						// Materialize the previous profile again with the same
+						// replacement semantics, so the failed profile's routes do not
+						// linger in subagents.json or the agent frontmatter.
+						await applyModelConfigAsync(
+							ctx.cwd,
+							await withOmittedAgentsClearedAsync(ctx.cwd, previousActiveConfig),
+						);
+					} catch {
+						restored = "";
+					}
+				}
+				if (orchestratorRollback) {
+					try {
+						orchestratorRollback();
+						restored = restored === "" ? "settings" : `${restored} and settings`;
+					} catch {
+						restored = restored === "" ? "" : restored;
+					}
+				}
+				try {
+					writeProfilesFileSync(path, file);
+					restored = restored === "" ? "active marker" : `${restored} and active marker`;
+				} catch {
+					restored = restored === "" ? "nothing" : restored;
+				}
+				const unresolved =
+					routingWritten && previousActiveConfig === undefined
+						? ` ${sanitizeTerminalText(modelConfigPath(ctx.cwd))} still holds this profile's routing because no previously active profile was recorded to restore.`
+						: "";
+				ctx.ui.notify(
+					`el Gentleman could not apply profile "${result.name}". Restored: ${restored}.${unresolved}`,
+					"warning",
+				);
+				return file;
+			};
+			try {
+				await writeModelConfigAsync(ctx.cwd, normalized);
+			} catch (error) {
+				ctx.ui.notify(
+					`el Gentleman could not write ${sanitizeTerminalText(modelConfigPath(ctx.cwd))}: ${profilesErrorMessage(error)}`,
+					"warning",
+				);
+				return revertClaim(false);
+			}
+			// models.json holds the profile as written; the padding with clear
+			// entries only drives materialization, so agents the profile omits
+			// return to inherit instead of keeping a previously materialized route.
+			let applyResult: { updated: number; skipped: number };
+			try {
+				applyResult = await applyModelConfigAsync(
+					ctx.cwd,
+					await withOmittedAgentsClearedAsync(ctx.cwd, normalized),
+				);
+			} catch (error) {
+				ctx.ui.notify(
+					`el Gentleman could not materialize profile "${result.name}": ${profilesErrorMessage(error)}`,
+					"warning",
+				);
+				return revertClaim(true);
+			}
 			let orchestratorNote = "";
-			if (applied.orchestrator) {
-				if (applied.orchestrator.writtenTo) {
-					orchestratorNote = `\nOrchestrator set to ${formatOrchestratorSelection(applied.orchestrator.entry)} in ${sanitizeTerminalText(applied.orchestrator.writtenTo)}.`;
+			if (orchestratorEntry !== undefined) {
+				const settingsPath = orchestratorSettingsPath();
+				const written = applyOrchestratorSettings(settingsPath, orchestratorEntry);
+				if (written.status === "invalid") {
+					ctx.ui.notify(
+						`el Gentleman could not set the orchestrator from profile "${result.name}": ${sanitizeTerminalText(written.reason)}. ${sanitizeTerminalText(settingsPath)} was left unchanged.`,
+						"warning",
+					);
+					return revertClaim(true);
+				}
+				if (written.status === "written") {
+					const previous = written.previous;
+					orchestratorRollback = () => restoreOrchestratorSettings(settingsPath, previous);
+					orchestratorNote = `\nOrchestrator set to ${formatOrchestratorSelection(orchestratorEntry)} in ${sanitizeTerminalText(settingsPath)}.`;
 				}
 				// settings.json only governs future sessions. The session the user is
 				// sitting in keeps its model until told otherwise, which made a profile
 				// look applied while the orchestrator kept answering with the old one.
-				orchestratorNote += await switchLiveOrchestrator(ctx, live, applied.orchestrator.entry);
+				orchestratorNote += await switchLiveOrchestrator(ctx, live, orchestratorEntry);
 			}
-			// Saying so keeps a broken pin from looking like the reason a launch ignored
-			// the profile just applied.
-			const pinNote = applied.unresolvedPin
-				? "\nThis repository also has a pin layer that does not resolve; the global routing above governs its subagents until the pin is fixed."
-				: "";
+			// A pin that does not resolve changes nothing at launch, so the global apply
+			// above is what governs this repository. Saying so keeps a broken pin from
+			// looking like the reason a launch ignored the profile just applied.
+			const pinEvaluation = evaluateProfilePin(readProfilePinStatus(ctx.cwd), file.profiles);
+			let pinNote = "";
+			if (pinEvaluation.stale.length > 0 || pinEvaluation.invalid.length > 0) {
+				pinNote = "\nThis repository also has a pin layer that does not resolve; the global routing above governs its subagents until the pin is fixed.";
+			}
 			ctx.ui.notify(
 				[
-					`el Gentleman applied profile "${result.name}" — ${applied.updated} agent${applied.updated === 1 ? "" : "s"} updated.`,
+					`el Gentleman applied profile "${result.name}" — ${applyResult.updated} agent${applyResult.updated === 1 ? "" : "s"} updated.`,
 					"New routing takes effect on the next subagent launch.",
 				].join("\n") + orchestratorNote + pinNote,
 				"info",
 			);
-			return applied.file;
+			return claimed;
 		}
 		case "create": {
 			const answer = await ctx.ui.input("New profile name", "e.g. deep-work");
@@ -3800,6 +4803,7 @@ async function runProfilesPanelAction(
 	}
 }
 
+/** `/gentle:profiles`: seed or open the store, then loop the panel over one action at a time until it closes. */
 async function handleProfilesCommand(ctx: ExtensionContext, live: LiveSession): Promise<void> {
 	const path = profilesFilePath(gentleAiConfigHome());
 	const read = readProfilesFileResult(path);
@@ -3832,7 +4836,10 @@ async function handleProfilesCommand(ctx: ExtensionContext, live: LiveSession): 
 			file,
 			name,
 			profileSnapshotFrom(
-				readEffectiveModelConfig(ctx.cwd),
+				// The snapshot captures the same routing the panel shows as current,
+				// so a session binding outranks the shared layers here too.
+				readSessionProfileBinding(ctx.sessionManager?.getSessionId?.())?.modelProfiles
+					?? readEffectiveModelConfig(ctx.cwd),
 				readOrchestratorSettings(orchestratorSettingsPath()),
 			),
 		);
@@ -3841,12 +4848,22 @@ async function handleProfilesCommand(ctx: ExtensionContext, live: LiveSession): 
 		return next;
 	};
 	let selectedName: string | undefined;
+	const sessionBoundName = () => readSessionProfileBinding(ctx.sessionManager?.getSessionId?.())?.name;
+	// The panel's "Current routing (effective)" table shows what this session's
+	// launches resolve right now, and a session binding outranks every shared
+	// layer, so a bound session reads its snapshot as the current routing while an
+	// unbound session keeps reading the effective config exactly as before.
+	const currentRoutingForPanel = async () =>
+		readSessionProfileBinding(ctx.sessionManager?.getSessionId?.())?.modelProfiles
+		?? await readEffectiveModelConfigAsync(ctx.cwd);
 	let result = await showProfilesPanel(
 		ctx,
 		file,
-		await readEffectiveModelConfigAsync(ctx.cwd),
+		await currentRoutingForPanel(),
 		selectedName,
 		saveSnapshot,
+		undefined,
+		sessionBoundName(),
 	);
 	while (result.type !== "close") {
 		const report: ProfilesPanelReport = {};
@@ -3855,10 +4872,11 @@ async function handleProfilesCommand(ctx: ExtensionContext, live: LiveSession): 
 		result = await showProfilesPanel(
 			ctx,
 			file,
-			await readEffectiveModelConfigAsync(ctx.cwd),
+			await currentRoutingForPanel(),
 			selectedName,
 			saveSnapshot,
 			report.status,
+			sessionBoundName(),
 		);
 	}
 }
@@ -3974,10 +4992,11 @@ const REVIEW_CONTROLLER_PARAMETER_FIELDS = {
 	},
 } as const;
 
-// Providers such as non-strict Anthropic emit only root properties/required.
-// Keep the full declaration here and operation constraints in runtime branches.
-// The nullable root shell prevents Pi from deleting an optional supplied null;
-// both the branches below and the facade reject it, so it never becomes omitted.
+// Root-level union combinators (anyOf/oneOf/allOf) are forbidden by the Anthropic
+// tool definition spec and cause Claude Code/Agent SDK to drop the tool (#1698).
+// The root schema is a plain object; the nullable root shell prevents Pi from
+// deleting an optional supplied null, while runtime branches in the facade
+// enforce that null and non-START/ASSESS objects are rejected fail-closed.
 const REVIEW_CONTROLLER_PARAMETERS = {
 	...REVIEW_CONTROLLER_PARAMETER_FIELDS,
 	properties: {
@@ -3987,24 +5006,6 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 			description: `${REVIEW_CONTROLLER_PARAMETER_FIELDS.properties.input.description} Null is invalid; omit input when optional.`,
 		},
 	},
-	anyOf: [
-		{
-			...REVIEW_CONTROLLER_PARAMETER_FIELDS,
-			properties: {
-				...REVIEW_CONTROLLER_PARAMETER_FIELDS.properties,
-				operation: { ...REVIEW_CONTROLLER_PARAMETER_FIELDS.properties.operation, enum: ["start", "assess"] },
-				input: { ...REVIEW_JSON_ARGUMENT, description: REVIEW_CONTROLLER_PARAMETER_FIELDS.properties.input.description },
-			},
-		},
-		{
-			...REVIEW_CONTROLLER_PARAMETER_FIELDS,
-			properties: {
-				...REVIEW_CONTROLLER_PARAMETER_FIELDS.properties,
-				operation: { ...REVIEW_CONTROLLER_PARAMETER_FIELDS.properties.operation, enum: Object.values(REVIEW_CONTROLLER_OPERATION).filter((operation) => operation !== "start" && operation !== "assess") },
-				input: { ...REVIEW_JSON_STRING, description: "Serialized JSON object string only; objects are accepted only by START/ASSESS." },
-			},
-		},
-	],
 } as const;
 
 const REVIEW_CAPTURE_PARAMETERS = {
@@ -4097,6 +5098,9 @@ interface ReviewAssessInput extends Pick<NativeReviewAssessRequest, "untrackedSc
 	// candidate's own target identity (never a different one); `closed` is
 	// never auto-derived -- pass it explicitly.
 	nativeReviewOutcome?: NativeReviewOutcome;
+	// gentle-shell#1494: the agent raises this candidate to high by citing a
+	// high-risk item; it can never lower the native tier.
+	escalate?: AgentRiskEscalation;
 }
 
 function isNativeReviewOutcome(value: unknown): value is NativeReviewOutcome {
@@ -4106,10 +5110,10 @@ function isNativeReviewOutcome(value: unknown): value is NativeReviewOutcome {
 function parseReviewAssessInput(operation: ReviewControllerOperation, raw: string | undefined): ReviewAssessInput {
 	if (raw === undefined) return {};
 	const value = parseControllerJson(raw, operation);
-	const allowed = new Set(["baseRef", "committedOnly", "writerModelId", "writerEffort", "nativeReviewOutcome", "untrackedScope", "expectedUntrackedInventory", "intendedUntracked"]);
+	const allowed = new Set(["baseRef", "committedOnly", "writerModelId", "writerEffort", "nativeReviewOutcome", "escalate", "untrackedScope", "expectedUntrackedInventory", "intendedUntracked"]);
 	const unexpected = Object.keys(value).find((key) => !allowed.has(key));
 	if (unexpected !== undefined) throw new Error(`Review controller ${operation} input does not accept ${unexpected}`);
-	const { baseRef, committedOnly, writerModelId, writerEffort, nativeReviewOutcome } = value;
+	const { baseRef, committedOnly, writerModelId, writerEffort, nativeReviewOutcome, escalate } = value;
 	if (baseRef !== undefined && typeof baseRef !== "string") throw new Error(`Review controller ${operation} input baseRef must be a string`);
 	if (committedOnly !== undefined && typeof committedOnly !== "boolean") throw new Error(`Review controller ${operation} input committedOnly must be a boolean`);
 	if (writerModelId !== undefined && typeof writerModelId !== "string") throw new Error(`Review controller ${operation} input writerModelId must be a string`);
@@ -4124,6 +5128,7 @@ function parseReviewAssessInput(operation: ReviewControllerOperation, raw: strin
 		...(writerModelId === undefined ? {} : { writerModelId: writerModelId as string }),
 		...(writerEffort === undefined ? {} : { writerEffort: writerEffort as string }),
 		...(nativeReviewOutcome === undefined ? {} : { nativeReviewOutcome: nativeReviewOutcome as NativeReviewOutcome }),
+		...(escalate === undefined ? {} : { escalate: decodeAgentRiskEscalation(escalate) }),
 	};
 }
 
@@ -5421,6 +6426,11 @@ const processRetainedNativeStatusSelections = new Map<PendingReviewConsentSessio
 // and a fresh primary-loop start resets it to 0.
 const processAgentEndSubagentDepth = new Map<PendingReviewConsentSessionKey, number>();
 
+// gentle-shell#1064 slice 1: the parent-session profile binding store lives in
+// lib/session-profile-binding.ts (in-process, keyed by parent session id). The
+// panel binds on Enter; the launch resolver, the shell status reader, and the
+// usage provider scope read the same store through the lib.
+
 // gentle-pi#677: gentle-ai#4309 owns anonymous usage telemetry end to end;
 // Pi only nudges it once per process. This is a plain process-lifetime
 // guard, not a session-keyed map, because the nudge is meant to fire at most
@@ -6176,6 +7186,12 @@ function mapLastEventClosure(
 			...(closure.requestHash === undefined ? {} : { request_hash: closure.requestHash }),
 			...(closure.correctionLines === undefined ? {} : { correction_lines: closure.correctionLines }),
 			...(closure.advisoryFindings === undefined ? {} : { advisory_findings: closure.advisoryFindings }),
+			...(closure.escalation === undefined ? {} : { escalation: {
+				cause: closure.escalation.cause,
+				finding_ids: closure.escalation.findingIds,
+				...(closure.escalation.refuterOutcomes === undefined ? {} : { refuter_outcomes: closure.escalation.refuterOutcomes.map(({ findingId, ...outcome }) => ({ finding_id: findingId, ...outcome })) }),
+			} }),
+			...(closure.targetedValidatorEvidence === undefined ? {} : { targeted_validator_evidence: closure.targetedValidatorEvidence.raw }),
 			...(closure.statusContinuation === undefined ? {} : { status_continuation: closure.statusContinuation.raw }),
 			// The host has to see the acknowledgement to run it: approval now
 			// waits for that exact invocation instead of burning on its own, so
@@ -8261,6 +9277,7 @@ export const __testing = {
 	parseReviewControllerParameters,
 	parseReviewCaptureParameters,
 	parseReviewCaptureGroupParameters,
+	runProfilesPanelAction,
 	resolveReviewModeGate,
 	readEffectiveModelConfig,
 	readEffectiveModelConfigAsync,
@@ -8650,7 +9667,7 @@ function createGentleAiExtensionForTesting(
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization, then call RESET or RECOVER only after authorization. RESET and RECOVER_LOCK route to audited native `gentle-ai review reclaim`; only RESET carries the legacy repositoryId, commonDirHash, inventoryHash, and confirmation challenge. RECOVER routes to native `gentle-ai review recover` with exactly six inputs: predecessorLineage, expectedPredecessorRevision, successorLineage, disposition, actor, and reason. Never send RECOVER the reset challenge and never send it a maintainerAuthorization: Pi reads fresh native target status, pins the predecessor lineage, revision, provider-selected disposition, and target identity, derives the exact six-line native authorization binding, displays it for fresh UI approval, and re-reads status before mutating. Negotiated target status supplies the sole accepted recovery disposition, and a caller-supplied substitute is rejected. Treat a native-input-required envelope as a request for exact values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
 			"A consent-required START may be resolved inside the eligible interactive Pi host. Its third UI action is host-owned: it runs this envelope's exact provider grant once and allows later fresh validated envelopes only for the same live SessionManager, nonempty session ID, and canonical Git common-directory identity, including sibling worktrees; an unrelated repository requires a new explicit human grant. Revoke removes the current repository grant, while nonreload replacement, quit, and process exit remove all session grants; reload preserves them. It grants no provider mode, verdict, acknowledgement, maintenance, delivery, or cross-repository authority. A package-owned child may ask its parent only with the canonical digest of its exact pending target; the parent binds that digest to the task repository and fails closed otherwise. If the tool returns an unresolved envelope, present the original two provider choices without changing machine tokens, commands, target IDs, or invocations; never add the host action to the decoded provider envelope. After one explicit relayed human answer, call answer-consent exactly once with only consentBinding and answer (`granted` or `declined`). Never create host permission from tool arguments, model prose, child/headless responses, or an uncertain native result. A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START output, the controller calls target-scoped native status once and returns only its declared action. An ambiguous gentle_review_capture outcome independently reconciles once and never replays the capture.",
 			"Use gentle_review only for native review authority operations; delivery commands follow ordinary repository policy.",
-			'ASSESS (gentle-pi#662/#668) is read-only and needs no lineageId: after a delegated writer returns, call {"operation":"assess"} over its diff and follow the returned plan (writerSelfVerification, structuralReadbackOnly, independentVerifier, reason) instead of judging non-triviality from the task description. Pass input as JSON only to assess a committed range ({"baseRef":"<ref>","committedOnly":true}), to supply a fallback writer profile ({"writerModelId":"...", "writerEffort":"..."}), or to state that the native review was declined or unavailable for this candidate ({"nativeReviewOutcome":"declined|unavailable|unknown"}). The writer profile comes from the runtime-recorded model and effort of the pending mutations for this root (writerProfileSource runtime); caller writerModelId/writerEffort are only a fallback when no runtime evidence exists (caller), otherwise the profile is small (fallback). A missing model, a mini model token (gemini is not mini), or low effort keeps the conservative small-model bias. The on-path (writer self-verification is the record, no separate verifier) holds only when RDD reads on and nativeReviewOutcome resolves to "closed" for this candidate. ASSESS derives closed only from the native candidate.consumed fact for this exact candidate, written natively when the approved review for that candidate is acknowledged; a caller-supplied closed is not authority and, without that fact, resolves to unknown. A declined, unavailable, or unknown outcome falls back to the exact risk-gated plan RDD off would return, re-enabling the separate verifier; unknown is never treated as closed, and a decline is candidate-scoped and never lowers the bar below RDD off. A decline or unavailable review recorded by this process is bound to that exact candidate\'s own target identity, never to a different candidate or to bare repository state, and wins over closure. The result\'s outcome_source (explicit|derived|unknown) and writerProfileSource (runtime|caller|fallback) state which evidence produced each value. When native reports them, ASSESS projects reviewDue, reviewDueReason, candidate.consumed, and the native continuation verbatim; older binaries omit them and nothing is invented. Relay that continuation unchanged; never rebuild it. A native code review is not a substitute for applicable functional checks: tests, builds, and functional verification such as browser checks for UI changes still run when applicable. A failed or unavailable native assessment reports risk "unassessable", verified exactly like "high". This never mutates review authority state.',
+			'ASSESS (gentle-pi#662/#668) is read-only and needs no lineageId: after a delegated writer returns, call {"operation":"assess"} over its diff and follow the returned plan (writerSelfVerification, structuralReadbackOnly, independentVerifier, reason) instead of judging non-triviality from the task description. Pass input as JSON only to assess a committed range ({"baseRef":"<ref>","committedOnly":true}), to supply a fallback writer profile ({"writerModelId":"...", "writerEffort":"..."}), or to state that the native review was declined or unavailable for this candidate ({"nativeReviewOutcome":"declined|unavailable|unknown"}), or to raise a candidate you know is high risk ({"escalate":{"item":1-6,"reason":"<one line>"}}, item from the Task Size high-risk list; it raises passive or medium to high, keeps nativeRisk, returns agentEscalation, and can never lower a tier). The writer profile comes from the runtime-recorded model and effort of the pending mutations for this root (writerProfileSource runtime); caller writerModelId/writerEffort are only a fallback when no runtime evidence exists (caller), otherwise the profile is small (fallback). A missing model, a mini model token (gemini is not mini), or low effort keeps the conservative small-model bias. The on-path (writer self-verification is the record, no separate verifier) holds only when RDD reads on and nativeReviewOutcome resolves to "closed" for this candidate. ASSESS derives closed only from the native candidate.consumed fact for this exact candidate, written natively when the approved review for that candidate is acknowledged; a caller-supplied closed is not authority and, without that fact, resolves to unknown. A declined, unavailable, or unknown outcome falls back to the exact risk-gated plan RDD off would return, re-enabling the separate verifier; unknown is never treated as closed, and a decline is candidate-scoped and never lowers the bar below RDD off. A decline or unavailable review recorded by this process is bound to that exact candidate\'s own target identity, never to a different candidate or to bare repository state, and wins over closure. The result\'s outcome_source (explicit|derived|unknown) and writerProfileSource (runtime|caller|fallback) state which evidence produced each value. When native reports them, ASSESS projects reviewDue, reviewDueReason, candidate.consumed, and the native continuation verbatim; older binaries omit them and nothing is invented. Relay that continuation unchanged; never rebuild it. A native code review is not a substitute for applicable functional checks: tests, builds, and functional verification such as browser checks for UI changes still run when applicable. A failed or unavailable native assessment reports risk "unassessable", verified exactly like "high". This never mutates review authority state.',
 		],
 		parameters: REVIEW_CONTROLLER_PARAMETERS,
 		executionMode: "sequential",
@@ -8790,6 +9807,35 @@ function createGentleAiExtensionForTesting(
 		reminderEpoch += 1;
 		unbindPreparation?.();
 		reminderManager = ctx.sessionManager;
+		// gentle-shell#1690: a delegated child runs in the parent's resolved
+		// worktree. Repository preparation, review negotiation, asset install and
+		// model config belong to the parent session and write shared state. The
+		// standing review grant is host-only (a child never captures an identity),
+		// so revoke/refresh have nothing to act on; the child relay is load-time.
+		// Only that parent-owned work is skipped: the session-local resets above,
+		// the dev-binary notice, and any step added after this call, still run in
+		// children.
+		if (permissionEnvironment.GENTLE_PI_AGENTS_CHILD !== "1") await startParentSession(event, ctx);
+		else await surfaceDevBinaryOverride(ctx);
+	});
+
+	// Loud, every session: an active dev-binary override means this session
+	// runs an unpinned gentle-ai. One visible startup notice: the gentle-shell
+	// 🌹 card owns the announcement when it can render (shell enabled with UI);
+	// this toast is only the fallback for when the card is unavailable. The
+	// hasUI guard stays: headless contexts have no toast to show.
+	const surfaceDevBinaryOverride = async (ctx: ExtensionContext): Promise<void> => {
+		const devBinaryToastFallback = ctx.hasUI && !shellEnabled();
+		try {
+			const devBinary = await describeDevBinaryOverride();
+			if (devBinaryToastFallback && devBinary.state === "active") ctx.ui.notify(devBinary.line, "warning");
+			if (devBinaryToastFallback && devBinary.state === "invalid") ctx.ui.notify(devBinary.line, "error");
+		} catch (error) {
+			if (ctx.hasUI) ctx.ui.notify(`Gentle AI dev binary override check failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		}
+	};
+
+	const startParentSession = async (event: unknown, ctx: ExtensionContext): Promise<void> => {
 		const epoch = reminderEpoch;
 		const manager = ctx.sessionManager;
 		const originalCwd = manager?.getCwd?.() ?? ctx.cwd;
@@ -8810,19 +9856,7 @@ function createGentleAiExtensionForTesting(
 		const reason = (event as { reason?: unknown }).reason;
 		if (reason !== "reload") revokeCurrentReviewSessionPermission(ctx);
 		await refreshReviewSessionPermissionStatus(ctx);
-		// Loud, every session: an active dev-binary override means this session
-		// runs an unpinned gentle-ai. One visible startup notice: the gentle-shell
-		// 🌹 card owns the announcement when it can render (shell enabled with UI);
-		// this toast is only the fallback for when the card is unavailable. The
-		// hasUI guard stays: headless contexts have no toast to show.
-		const devBinaryToastFallback = ctx.hasUI && !shellEnabled();
-		try {
-			const devBinary = await describeDevBinaryOverride();
-			if (devBinaryToastFallback && devBinary.state === "active") ctx.ui.notify(devBinary.line, "warning");
-			if (devBinaryToastFallback && devBinary.state === "invalid") ctx.ui.notify(devBinary.line, "error");
-		} catch (error) {
-			if (ctx.hasUI) ctx.ui.notify(`Gentle AI dev binary override check failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
-		}
+		await surfaceDevBinaryOverride(ctx);
 		try {
 			const installResult = installPackageAssets(ctx.cwd, true, ["delegation", "review"]);
 			migrateLegacyProjectModelOverrides(ctx.cwd);
@@ -8858,7 +9892,7 @@ function createGentleAiExtensionForTesting(
 		} catch {
 			// Startup negotiation is best-effort only; never surface or throw.
 		}
-	});
+	};
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		const isNamedAgent = isNamedAgentStartEvent(event);
@@ -8897,19 +9931,25 @@ function createGentleAiExtensionForTesting(
 		// resolveRddStatusLine never throws and never hangs past
 		// RDD_STATUS_TIMEOUT_MS: an absent/timed-out/aborted/failing native
 		// binary renders the fail-closed "unknown" line instead.
-		const gentlePrompt = !isPrimarySession
+		const rddStatusLine = !isPrimarySession
+			? undefined
+			: await resolveRddStatusLine(nativeReviewCli, ctx.cwd, AbortSignal.timeout(RDD_STATUS_TIMEOUT_MS), undefined, ctx);
+		const gentlePrompt = rddStatusLine === undefined
 			? ""
 			: `\n\n${buildGentlePrompt(
 					readPersonaMode(ctx.cwd),
 					ctx.cwd,
 					readActiveToolNames(pi),
-					await resolveRddStatusLine(nativeReviewCli, ctx.cwd, AbortSignal.timeout(RDD_STATUS_TIMEOUT_MS), undefined, ctx),
+					rddStatusLine,
+					ctx.mode,
 				)}`;
 		// gentle-pi#560 / gentle-ai#4056, #4057: inject the mirrored provider
 		// contract bundle's review execution contract for the primary session
 		// only, and only when a native review CLI is actually present.
+		// gentle-shell#1494: skip it while RDD reads off, since no review can
+		// start; on and unknown keep it so the reviewed path never loses it.
 		const reviewContractPrompt =
-			isPrimarySession && nativeReviewCli !== null
+			isPrimarySession && nativeReviewCli !== null && !isRddStatusLineOff(rddStatusLine)
 				? (() => {
 					const fragment = loadReviewContractPromptFragment(ctx);
 					return fragment === null ? "" : `\n\n${fragment}`;
@@ -8973,7 +10013,7 @@ function createGentleAiExtensionForTesting(
 			// Persist the observed own write before any await. Preparation is not
 			// mutation evidence, and cannot invent a pre-write Changes baseline.
 			if (root) recordReviewMutation(pi, ctx.sessionManager, root, { source: "direct", toolName: event.toolName, toolCallId: event.toolCallId, ...directWriterProfile(pi, ctx) });
-			if (prospectiveRoot && !resolveSessionWorktree(ctx.cwd, ctx.cwd)) await prepareBoundSessionRepository(ctx.sessionManager, ctx.sessionManager.getCwd?.() ?? ctx.cwd, ctx.signal);
+			if (permissionEnvironment.GENTLE_PI_AGENTS_CHILD !== "1" && prospectiveRoot && !resolveSessionWorktree(ctx.cwd, ctx.cwd)) await prepareBoundSessionRepository(ctx.sessionManager, ctx.sessionManager.getCwd?.() ?? ctx.cwd, ctx.signal);
 		} catch { /* Preparation and receipt persistence cannot change a successful tool result. */ }
 	});
 

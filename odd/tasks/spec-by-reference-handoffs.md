@@ -21,7 +21,7 @@ S8. Handoff friction never shrinks content (#1713 cause 5): writer-surface rejec
 - [x] T2 (S8) inline · runtime friction in lib/bounded-writer-admission.ts and extensions/gentle-agents.ts + tests · RED→GREEN · b160c3b8
 - [x] T4 (S8) inline · review follow-ups R3-001/002/004/005: e2e continue test, always-backticked inherited surfaces, path-vs-prose rejection advice, exact rejection assertions · RED→GREEN · d9771820
 - [x] T5 (S8) inline · review follow-ups of lineage review-b5d3d60f29e54b69: ambiguous whitespace-entry advice, ctx-safe unknown-id error, one heading matcher (R3-003) · RED→GREEN · this work unit
-- [ ] T3 (S1-S6) pending user decision · port the doc format to the gentle-ai canon (`internal/components/agentguidance/routing.go`) and regenerate `fixtures/odd-routing-canonical.md`
+- [x] T3 (S1-S6) inline · canon parity: gentle-ai PR #5215 (665a181a) + regenerated `fixtures/odd-routing-canonical.md` + aligned step 6 and verify wording · RED→GREEN · this work unit (see L19-L21)
 
 ## Log
 L1 2026-10-03 user (verbatim): > quiero que hagamos esto, pero pimero lo analicemos super bien https://github.com/Gentleman-Programming/gentle-shell/issues/1713
@@ -59,3 +59,10 @@ L16 2026-10-03 RDD: lineage review-b5d3d60f29e54b69 (target 53d44815…, through
 L17 2026-10-03 user (verbatim): > pr y merge
 L18 2026-10-03 user (verbatim): > no seria mejor arreglar los hallazgos ?
    T5 evidence (risk: HIGH, writer admission; reviewers allowed per user): RED: ambiguous-entry test (writer-edit-surface-scope) and `TypeError ... reading 'sessionManager'` on a ctx-less subagent_status (gentle-agents). GREEN after fix. An unquoted whitespace entry that is valid when quoted now names both repairs (backticks or move prose); entries invalid even when quoted keep the prose advice. R3-003 is a pure refactor (one regex source), covered by existing inheritance tests.
+L19 2026-10-03 user (verbatim): > luego una vez que esto lo tengamos tenemos que hcer la paridad en gentle-ai
+L20 2026-10-03 user (verbatim): > ahh si dale haz la paridad
+   gentle-ai: issue #5214 (cross-repo refs are rejected there) and PR #5215 merged as 665a181a (commits 6c664915, 122e85b7, 5c460fce, cf8b93e0; feature doc odd/tasks/odd-spec-by-reference.md; its T5 identity is cf8b93e0). Three RDD reviews approved; 18 CI checks green.
+L21 2026-10-03 T3 evidence (risk: medium, prompt contract + mirror):
+   `node scripts/mirror-odd-routing.mjs --gentle-ai <clean worktree at 665a181a>` regenerated the fixture (previous source e7729359). Two ratchet anchors were stale from earlier canon changes, not from #1713: the 4-file mapping trigger (gentle-ai#5139 adopted the evidence budget) and the SDD trigger clause (canon is ODD-only); both now anchor the current canon text.
+   Parity fixes found by the gentle-ai review: step 6 example no longer nests backticks; verify runs only authorized examples, on isolated state when they mutate data; gentle-ai-verify command scope includes spec example commands (tests/package-manifest and tests/odd-integration assertions updated; exact + explicitly-authorized invariant kept).
+   RED: contract test (missing canon wording, nested backticks) and two new ratchet anchors failed first. GREEN: 610/610 prompt-contract tests.

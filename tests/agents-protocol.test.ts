@@ -3,6 +3,7 @@ import test from "node:test";
 import {
 	applyTaskEvent,
 	emptyThread,
+	MISSING_TOOLS_NOTE_PREFIX,
 	normalizeRpcEvent,
 	ToolArgumentProgress,
 	TASK_EVENT,
@@ -66,6 +67,17 @@ test("normalizeRpcEvent maps pi RPC events to task deltas and ignores the rest",
 	assert.deepEqual(normalizeRpcEvent({ type: "message_end", message: { role: "user" } }), []);
 	assert.deepEqual(normalizeRpcEvent({ type: "queue_update" }), []);
 	assert.deepEqual(normalizeRpcEvent("garbage"), []);
+});
+
+// #1690: Pi drops unknown --tools names silently, so the child reports them
+// with one marked notify; only that notify reaches the task thread.
+test("normalizeRpcEvent turns the marked missing-tools notify into a note and drops every other notify", () => {
+	const message = `${MISSING_TOOLS_NOTE_PREFIX} gentle_review_scope, codegraph`;
+	assert.deepEqual(normalizeRpcEvent({ type: "extension_ui_request", id: "u1", method: "notify", message, notifyType: "warning" }), [{ type: TASK_EVENT.NOTE, text: message }]);
+	assert.deepEqual(normalizeRpcEvent({ type: "extension_ui_request", id: "u2", method: "notify", message: "requested tools missing in child: x" }), [], "an unmarked notify stays dropped");
+	assert.deepEqual(normalizeRpcEvent({ type: "extension_ui_request", id: "u3", method: "notify", message: ` ${MISSING_TOOLS_NOTE_PREFIX} x` }), [], "the marker must be a prefix");
+	assert.deepEqual(normalizeRpcEvent({ type: "extension_ui_request", id: "u4", method: "setStatus", statusKey: "k", statusText: `${MISSING_TOOLS_NOTE_PREFIX} x` }), [], "only notify carries the marker");
+	assert.deepEqual(normalizeRpcEvent({ type: "extension_ui_request", id: "u5", method: "notify", message: `${MISSING_TOOLS_NOTE_PREFIX} \u001B[2Jx` }), [{ type: TASK_EVENT.NOTE, text: `${MISSING_TOOLS_NOTE_PREFIX} x` }], "child text is sanitized");
 });
 
 test("argument liveness accepts current and legacy Pi starts without display or usage deltas", () => {

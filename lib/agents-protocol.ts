@@ -152,6 +152,8 @@ export type SummaryListener = (summary: TaskSummary) => void;
 const DEFAULT_LIMITS: ThreadLimits = { maxItems: 400, maxOutputChars: 16_000 };
 /** Child UI requests that block on an answer; everything else (notify, setStatus, setWidget) is noise here. */
 export const DIALOG_METHODS: ReadonlySet<string> = new Set(["select", "confirm", "input", "editor"]);
+/** The one child notify that reaches the task thread: requested --tools the child does not have (#1690). */
+export const MISSING_TOOLS_NOTE_PREFIX = "gentle-agents: requested tools missing in child:";
 const LABEL_MAX = 72;
 const TEXT_CAP = 20_000;
 const ELLIPSIS = "…";
@@ -330,6 +332,7 @@ export function normalizeRpcEvent(raw: unknown, options: { observeResponses?: bo
 		case "agent_settled":
 			return [{ type: TASK_EVENT.AGENT_SETTLED }];
 		case "extension_ui_request":
+			if (event.method === "notify" && typeof event.message === "string" && event.message.startsWith(MISSING_TOOLS_NOTE_PREFIX)) return [{ type: TASK_EVENT.NOTE, text: clean(event.message) }];
 			return DIALOG_METHODS.has(String(event.method)) ? [{ type: TASK_EVENT.ASK, request: askRequest(event) }] : [];
 		case "auto_retry_start":
 			return [{ type: TASK_EVENT.NOTE, text: `retrying (${String(event.attempt ?? "?")}/${String(event.maxAttempts ?? "?")})` }];
