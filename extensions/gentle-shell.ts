@@ -120,6 +120,7 @@ import { JOBS_SIDEBAR_EVENT, JOBS_STATUS_KEY, isJobsSidebarSnapshot, type Runnin
 import { installSessionChangeCapture } from "../lib/session-change-capture.ts";
 import { SelectionEngine } from "../lib/selection-engine.ts";
 import { withOverlayRepaint } from "../lib/overlay-repaint.ts";
+import { buildNotificationRows } from "../lib/notification-customize.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
 // status bar, the petal prompt, the working-tree changes widget and overlay,
@@ -1036,6 +1037,8 @@ export class GentlePromptEditor extends CustomEditor {
 			} catch { /* Unknown layout: keep the original rendered prompt. */ }
 		}
 		if (this.vimPolicy !== "on") editorLines = this.selectionEngine.decorateRows(editorLines, inner, 0);
+		// SAFETY: this optional host hint is accepted only as an integer within the
+		// rendered row bounds below; absent/invalid hints fall back to all rows.
 		const visibleCount = (this as unknown as { renderedVisibleLineCount?: number }).renderedVisibleLineCount;
 		const borderEnd = Number.isInteger(visibleCount) && visibleCount! >= 1 && visibleCount! + 2 <= editorLines.length
 			? visibleCount! + 2 : editorLines.length;
@@ -1992,10 +1995,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		});
 	}
 	pi.registerCommand("gentle:customize", {
-		description: "Configure appearance, global Vim prompt editing, session-only YOLO permission and prompt history capture.",
+		description: "Configure appearance, audio notifications, global Vim prompt editing, session-only YOLO permission and prompt history capture.",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui" || !ctx.hasUI) {
-				if (ctx.hasUI) ctx.ui.notify("Visual customization requires an interactive terminal.", "warning");
+				if (ctx.hasUI) ctx.ui.notify("Customization requires an interactive terminal.", "warning");
 				return;
 			}
 			closeCustomize?.();
@@ -2003,9 +2006,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			let adapter: YoloUiAdapter | undefined;
 			let unobserve: (() => void) | undefined;
 			let finish: (() => void) | undefined;
+			let customizeView: VisualCustomizeView | undefined;
 			const close = () => {
 				if (closed) return;
 				closed = true;
+				customizeView?.dispose();
 				unobserve?.(); adapter?.dispose(); finish?.();
 				if (closeCustomize === close) closeCustomize = undefined;
 			};
@@ -2016,7 +2021,6 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			let banner = await readBannerConfig(bannerHome).catch(error => { close(); throw error; });
 			if (closed) return;
 			let activeTheme = ctx.ui.theme.name;
-			let customizeView: VisualCustomizeView | undefined;
 			let requestCustomizeRender: (() => void) | undefined;
 			let category: CustomizeCategory = "Animations";
 			const add = (label: CustomizeRow["label"], notice: string, action: () => void | false | Promise<void | false>, preview?: CustomizeRow["preview"]) => rows.push({ category, label, preview, action: async () => {
@@ -2175,6 +2179,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					else ctx.ui.notify(result.enabled ? "Prompt history capture: on. Applies from the next prompt; stored history is kept." : "Prompt history capture: off. New prompts are not recorded; stored history is kept.", "info");
 				},
 			});
+			rows.push(...buildNotificationRows(ctx));
 			category = "Layout";
 			for (const value of Object.values(STATUS_PLACEMENT)) add(() => `Status placement: ${value}${visual().statusPlacement === value ? " (current)" : ""}`, pending, () => updateVisual((settings) => ({ ...settings, statusPlacement: value })), () => layoutPreview({ ...visual(), statusPlacement: value }));
 			for (const value of Object.values(HEADER_PLACEMENT)) add(() => `Header placement: ${value}${visual().headerPlacement === value ? " (current)" : ""}`, pending, () => updateVisual((settings) => ({ ...settings, headerPlacement: value })), () => layoutPreview({ ...visual(), headerPlacement: value }));
@@ -2293,7 +2298,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					if (closed) done(null);
 					requestYoloRender = () => { if (!closed) tui.requestRender(); };
 					requestCustomizeRender = requestYoloRender;
-					customizeView = new VisualCustomizeView({ rows, profiles, theme, requestRender: requestYoloRender, rowsAvailable: () => Math.max(0, Math.floor(tui.terminal.rows * 0.85) - 2), onError: (error) => { if (!closed) ctx.ui.notify(`Visual customization: ${error.message}`, "error"); }, onClose: close });
+					customizeView = new VisualCustomizeView({ rows, profiles, theme, requestRender: requestYoloRender, rowsAvailable: () => Math.max(0, Math.floor(tui.terminal.rows * 0.85) - 2), onError: (error) => { if (!closed) ctx.ui.notify(`${customizeView?.title() ?? "Customization"}: ${error.message}`, "error"); }, onClose: close });
 					const view = customizeView;
 					// Own interaction lifetime here, leaving the shared view unchanged.
 					return {

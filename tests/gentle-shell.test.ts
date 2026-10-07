@@ -30,6 +30,8 @@ import { listVisualProfiles, saveVisualProfile } from "../lib/visual-profiles.ts
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
 import { resolveCardStyle, writeCardStyle } from "../lib/card-style-policy.ts";
+import { claimNotificationOwner } from "../lib/notification-service.ts";
+import { DEFAULT_NOTIFICATION_SETTINGS } from "../lib/notification-policy.ts";
 
 
 // Vim fixtures claim the installed pi-tui release, which the adapter gate
@@ -2886,7 +2888,7 @@ function scopedDoubleEscCancelConfigHome(t: { after(callback: () => void): void 
 function findCustomizeRow(ui: FakeUi, label: string, width = 90): boolean {
 	const view = ui.overlayView!;
 	view.handleInput("\x1b[D");
-	for (let category = 0; category < 10; category++) {
+	for (let category = 0; category < 11; category++) {
 		view.handleInput("\x1b[C");
 		for (let index = 0; index < 35; index++) {
 			if (view.render(width).some((line) => line.includes(`▸ ${label}`))) return true;
@@ -2905,6 +2907,61 @@ async function customizeAction(ui: FakeUi, label: string): Promise<void> {
 	for (let attempt = 0; attempt < 100 && ui.notices.length === notices; attempt++) await new Promise<void>((resolve) => setTimeout(resolve, 5));
 	assert.ok(ui.notices.length > notices, `action did not finish: ${label}`);
 }
+
+test("customize Notifications applies audio controls directly in the same overlay, without nested menus or visual writes", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const { pi, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home }); // Shell loads BEFORE owner.
+	const child = process.env.GENTLE_PI_AGENTS_CHILD;
+	process.env.GENTLE_PI_AGENTS_CHILD = "0";
+	t.after(() => { if (child === undefined) delete process.env.GENTLE_PI_AGENTS_CHILD; else process.env.GENTLE_PI_AGENTS_CHILD = child; });
+	let nested = 0; let writes = 0;
+	const { ctx, ui, overlayReady } = fakeContext({ select: async () => { nested++; return undefined; } });
+	const uiSpies = ctx.ui as unknown as Record<string, unknown>;
+	uiSpies.input = async () => { nested++; return undefined; };
+	uiSpies.confirm = async () => { nested++; return false; };
+	const owner = claimNotificationOwner(() => {}, { env: {},
+		read: () => ({ settings: structuredClone(DEFAULT_NOTIFICATION_SETTINGS), source: "default", globalFile: join(home, "notifications.json"), malformed: false, readError: false }),
+		write: () => { writes++; return join(home, "notifications.json"); } });
+	owner.attach(ctx); t.after(() => owner.retire());
+	let settled = false;
+	const pending = commands.get("gentle:customize")!.handler("", ctx).then(() => { settled = true; });
+	await overlayReady;
+	try {
+		assert.ok(findCustomizeRow(ui, "Audio notifications: off"), "global switch is a direct row");
+		assert.ok(findCustomizeRow(ui, "Audio: unmuted"), "mute is a direct row");
+		assert.equal(findCustomizeRow(ui, "Audio availability: check"), false, "availability row is removed from the card");
+		assert.equal(findCustomizeRow(ui, "Audio: restore preset"), false, "restore row is removed from the card");
+		assert.ok(findCustomizeRow(ui, "Success:"), "Success group is a direct row");
+		assert.ok(findCustomizeRow(ui, "Error:"), "Error group is a direct row");
+		assert.ok(findCustomizeRow(ui, "Attention:"), "Attention group is a direct row");
+		assert.match(ui.overlayView!.render(90).join("\n"), /Audio notifications/);
+		assert.equal(settled, false, "the overlay never closes to open a panel");
+		// Per-event exceptions stay folded until Advanced is expanded in the same overlay.
+		assert.ok(findCustomizeRow(ui, "Advanced:"), "Advanced toggle is a direct row");
+		assert.doesNotMatch(ui.overlayView!.render(90).join("\n"), /agent\.failed:/, "per-event rows stay folded by default");
+		ui.overlayView!.handleInput("\r");
+		// Let the toggle's busy microtask settle before activating a revealed row.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const notices = ui.notices.length;
+		assert.ok(findCustomizeRow(ui, "agent.failed:"));
+		ui.overlayView!.handleInput("\r");
+		for (let attempt = 0; attempt < 100 && ui.notices.length === notices; attempt++) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+		assert.ok(ui.notices.length > notices, "direct Enter action finished");
+		assert.equal(writes, 1);
+		assert.match(ui.overlayView!.render(90).join("\n"), /agent\.failed: builtin:attention/);
+		assert.equal(nested, 0, "no ctx.ui.select/input/confirm anywhere in the flow");
+		assert.equal(settled, false, "the notification action never closed the customize overlay");
+		assert.equal(existsSync(join(home, "visual.json")), false);
+		assert.equal(existsSync(join(home, "notifications.json")), false, "stubbed write left no file");
+	} finally { ui.closeOverlay?.(); await pending; }
+});
+
+test("production customize never wires the legacy notification panel", () => {
+	const source = readFileSync(new URL("../extensions/gentle-shell.ts", import.meta.url), "utf8");
+	assert.doesNotMatch(source, /openNotificationPanel|notification-ui\.ts/);
+	assert.match(source, /buildNotificationRows/);
+});
 
 test("customize Editor rows preview global preference without applying until Enter or Space", async (t) => {
 	const home = scopedDoubleEscCancelConfigHome(t);
@@ -3219,7 +3276,7 @@ test("customize Vim reports a persistence error without changing the live prompt
 	chmodSync(home, 0o500);
 	try {
 		await customizeAction(ui, "Vim: enable");
-		assert.match(ui.notices.at(-1)!, /Visual customization:/);
+		assert.match(ui.notices.at(-1)!, /Customization:/);
 		assert.equal(editor.effectiveVimPolicy, "off");
 		assert.equal(resolveVimPolicy({ gentlePiConfigHome: home }).policy, "off");
 	} finally {
@@ -4617,7 +4674,7 @@ test("registered canonical root governs real Git discovery, status and diff desp
 	h.pi.exec = ((command: string, args: string[], options: { timeout?: number } = {}) => new Promise((resolve) => {
 		execFile(command, args, { env: poisoned, encoding: "utf8", timeout: options.timeout, maxBuffer: Infinity }, (error, stdout, stderr) => resolve({ stdout, stderr, code: error ? typeof error.code === "number" ? error.code : 1 : 0, killed: Boolean(error?.killed) }));
 	})) as ExtensionAPI["exec"];
-	const { ctx, ui, overlayReady } = fakeContext();
+	const { ctx, ui } = fakeContext();
 	(ctx as unknown as { cwd: string }).cwd = selected;
 	(ctx.sessionManager as unknown as { getCwd(): string }).getCwd = () => selected;
 	const run = shellGitRunner(selected, poisoned);
