@@ -191,7 +191,7 @@ Gentle Shell ships its own interactive tools instead of depending on third-party
 - **`ask_user_question`** — one to four structured questions in a single questionnaire, each with two to four options, multi-select, per-option descriptions and previews — rendered as real TUI dialogs, usable in the live session.
 - **`ask_user_choice`** — one exactly representable single-select question, with an opt-in free-text response.
 - **`todo`** — plan tracking with the Gentle Todo card (see Gentle Todo below).
-- **`bash_background`**, **`job_stop`**, **`job_list`** — background shell jobs that notify the agent once when they exit (see Background jobs below).
+- **`bash_background`**, **`monitor`**, **`job_stop`**, **`job_list`** — background shell jobs that notify the agent when they exit, or on every output line (see Background jobs below).
 - **`gentle_review` / capture tools** — the native review surface for receipt-driven development.
 - **Optional companions** (separately installed, never bundled): `gentle-engram` for persistent memory, `pi-web-access` for web access when a task needs it and your policy allows it, `pi-lens` for additional inspection surfaces, `pi-intercom` for cross-session communication where your Pi setup supports it, and `@juicesharp/rpiv-ask-user-question` for interactive choice support where a separately installed extension fits your setup. These are companions, not hidden prerequisites or a claim that every Pi installation has every capability; persistent memory is **not** bundled with `gentle-pi`.
 
@@ -244,7 +244,7 @@ In the isolated Gentle Shell home, `settings.json` does not declare gentle-pi; t
 
 ### Background jobs
 
-Waiting on CI, a build, or a server should cost neither a `sleep` loop nor a subagent. `bash_background` runs a shell command in the background and returns a job id at once; the agent ends its turn or keeps working, and when the command exits the agent gets one message with the exit code, the last output lines, and the output file path. The wait condition lives inside the command, so its exit is the event:
+Waiting on CI, a build, or a server should cost neither a `sleep` loop nor a subagent, and neither should reacting to a log or a CI run while it progresses. `bash_background` runs a shell command in the background and returns a job id at once; the agent ends its turn or keeps working, and when the command exits the agent gets one message with the exit code, the last output lines, and the output file path. The wait condition lives inside the command, so its exit is the event:
 
 ```bash
 gh run watch 12345 --exit-status                           # CI finished
@@ -256,6 +256,7 @@ until curl -sf localhost:3000/health; do sleep 1; done     # server is up
 - stdout and stderr go to a temp file (`gentle-jobs-*/job-N.log`), never into the context; the agent reads it with `read` when it needs more than the tail. The tail keeps the last 20 lines, each capped at its newest 2,000 characters, and the log directory is removed when the session shuts down.
 - `bash_background` passes through the same command confirmation, YOLO waiver, and child safety guards as `bash`.
 - Jobs live in memory, belong to the session that started them, and are stopped when the session shuts down. At most 25 run at once.
+- `monitor` is a background job whose every output line is an event, delivered while the command keeps running — for example `tail -f app.log | grep --line-buffered ERROR`, or a loop that prints each CI check as it finishes. Lines within 200 ms share one notice of at most 20 lines (the rest are counted, and stay in the log); notices waiting for a busy agent coalesce. `timeout_seconds` is mandatory (1–1800): the monitor is stopped when it expires and reports its event count. One that prints more than 120 lines within 60 seconds is stopped as a flood, so filter its output. When the command exits, a final notice reports the exit code and event count. It goes through the same command guards as `bash`.
 - `/gentle:jobs` opens a full-terminal overlay with this session's jobs beside the selected job's command, status, output file, and live output tail; `↑`/`↓` or `j`/`k` move, `s` stops the selected running job, `q` closes (narrow terminals: `Tab` toggles details, `Escape` goes back). The footer shows `⧗ N jobs` while any run.
 
 ### Gentle Todo

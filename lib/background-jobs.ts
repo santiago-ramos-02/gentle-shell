@@ -17,12 +17,14 @@ import { join } from "node:path";
 
 /** The background sibling of Pi's native `bash` tool. */
 export const BASH_BACKGROUND_TOOL = "bash_background";
+/** A background job whose output lines are events. */
+export const MONITOR_TOOL = "monitor";
 /**
  * Tools whose `command` input runs in a shell. Command guards (confirmation,
  * YOLO, child safety) must cover every one of them, or the background tool
  * would bypass them.
  */
-export const SHELL_COMMAND_TOOLS: ReadonlySet<string> = new Set(["bash", BASH_BACKGROUND_TOOL]);
+export const SHELL_COMMAND_TOOLS: ReadonlySet<string> = new Set(["bash", BASH_BACKGROUND_TOOL, MONITOR_TOOL]);
 
 /** Lines kept for the exit notice and job listings. */
 export const TAIL_LINES = 20;
@@ -72,9 +74,12 @@ export interface JobExecOperations {
 }
 
 export type JobStatus = "running" | "exited" | "stopped" | "failed";
+/** A command reports its exit; a monitor also reports each output line. */
+export type JobKind = "command" | "monitor";
 
 export interface JobRecord {
 	readonly id: string;
+	readonly kind: JobKind;
 	readonly label: string;
 	readonly command: string;
 	readonly cwd: string;
@@ -87,6 +92,10 @@ export interface JobRecord {
 	endedAt?: number;
 	/** Last output lines; refreshed until the job ends. */
 	tail: string[];
+	/** Monitor only: output lines reported as events so far. */
+	events?: number;
+	/** Monitor only: the mandatory timeout it was started with. */
+	timeoutSeconds?: number;
 }
 
 export interface JobStartRequest {
@@ -94,6 +103,9 @@ export interface JobStartRequest {
 	cwd: string;
 	ownerSessionId: string;
 	label?: string;
+	kind?: JobKind;
+	/** Called with each complete output line, and the last partial one at exit. */
+	onLine?: (line: string) => void;
 }
 
 export interface JobRegistryDeps {
@@ -129,6 +141,7 @@ export function createJobRegistry(deps: JobRegistryDeps) {
 		const id = `job-${++counter}`;
 		const job: JobRecord = {
 			id,
+			kind: request.kind ?? "command",
 			label: request.label?.trim() || request.command,
 			command: request.command,
 			cwd: request.cwd,
@@ -147,17 +160,32 @@ export function createJobRegistry(deps: JobRegistryDeps) {
 		jobs.set(id, job);
 		aborts.set(id, abort);
 		const execCommand = commandPrefix ? `${commandPrefix}\n${request.command}` : request.command;
+		let linePartial = "";
+		const emitLines = (text: string, end: boolean) => {
+			if (!request.onLine) return;
+			const parts = (linePartial + text).split("\n");
+			linePartial = end ? "" : parts.pop() ?? "";
+			// Keep one extra character so a cut partial still reads as cut.
+			if (linePartial.length > MAX_TAIL_LINE_CHARS) linePartial = linePartial.slice(-(MAX_TAIL_LINE_CHARS + 1));
+			for (const part of parts) {
+				const line = part.endsWith("\r") ? part.slice(0, -1) : part;
+				request.onLine(line.length > MAX_TAIL_LINE_CHARS ? `…${line.slice(-MAX_TAIL_LINE_CHARS)}` : line);
+			}
+		};
 		const flushDecoder = () => {
 			const rest = decoder.decode();
 			if (rest) {
 				tail.push(rest);
 				job.tail = tail.lines();
 			}
+			emitLines(rest, true);
 		};
 		const onData = (data: Buffer) => {
 			output.write(data);
-			tail.push(decoder.decode(data, { stream: true }));
+			const text = decoder.decode(data, { stream: true });
+			tail.push(text);
 			job.tail = tail.lines();
+			emitLines(text, false);
 		};
 		const run = operations.exec(execCommand, request.cwd, { onData, signal: abort.signal }).then(
 			({ exitCode }) => finish(job, output, () => {

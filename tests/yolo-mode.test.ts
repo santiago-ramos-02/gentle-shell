@@ -268,3 +268,12 @@ test("bash_background goes through the same command confirmation and YOLO waiver
 	assert.equal(await call("git push origin main"), undefined);
 	assert.ok(await call("git push origin main && rm -rf ./data"), "YOLO never waives a destructive command");
 });
+
+test("monitor goes through the same command confirmation and YOLO waiver as bash", async () => {
+	const h = harness();
+	const call = (command: string) => h.emit("tool_call", { toolName: "monitor", input: { command, timeout_seconds: 60 } });
+	assert.deepEqual(await call("git push origin main"), { block: true, reason: "Gentle AI safety policy blocked the command because it was not confirmed." });
+	await h.command("enable");
+	assert.equal(await call("git push origin main"), undefined);
+	assert.ok(await call("git push origin main && rm -rf ./data"), "YOLO never waives a destructive command");
+});

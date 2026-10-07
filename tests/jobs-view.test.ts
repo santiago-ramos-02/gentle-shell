@@ -9,6 +9,7 @@ const theme = { fg: (_role: string, text: string) => text };
 
 function job(overrides: Partial<JobRecord> & Pick<JobRecord, "id">): JobRecord {
 	return {
+		kind: "command",
 		label: overrides.id,
 		command: `run ${overrides.id}`,
 		cwd: "/repo",
@@ -101,5 +102,14 @@ test("a narrow terminal shows the list, and tab toggles the selected job's detai
 		assert.doesNotMatch(h.screen(40).join("\n"), /gh run watch 7/);
 		h.view.handleInput("\u001b");
 		assert.equal(h.closed(), 1);
+	} finally { h.view.dispose(); }
+});
+
+test("a monitor shows its kind and event count in the list and details", () => {
+	const h = harness([job({ id: "job-1", kind: "monitor", label: "errors", command: "tail -f app.log | grep ERROR", events: 3, tail: ["ERROR x"] })]);
+	try {
+		const text = h.screen().join("\n");
+		assert.match(text, /◉ errors/);
+		assert.match(text, /Status +running · .* · 3 events/);
 	} finally { h.view.dispose(); }
 });

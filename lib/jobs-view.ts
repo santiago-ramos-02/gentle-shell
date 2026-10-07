@@ -24,7 +24,7 @@ const ROLE = { FRAME: "border", TITLE: "customMessageLabel", SELECTED: "accent",
 const REFRESH_MS = 1000;
 
 function glyph(job: JobRecord): [string, string] {
-	if (job.status === "running") return ["◐", "accent"];
+	if (job.status === "running") return [job.kind === "monitor" ? "◉" : "◐", "accent"];
 	if (job.status === "stopped") return ["–", "dim"];
 	if (job.status === "exited" && job.exitCode === 0) return ["✓", "success"];
 	return ["✗", "error"];
@@ -91,7 +91,7 @@ export class JobsView {
 		const title = truncateToWidth(`${JOB_GLYPH} Jobs · ${running} running · ${jobs.length - running} finished`, Math.max(0, inner - 4), "…");
 		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3)}╮`);
 		const list = this.listLines(jobs, selected, layout.listWidth, layout.bodyRows);
-		const detail = selected ? this.detailLines(selected, layout.bodyRows) : [theme.fg(ROLE.EMPTY, "No background jobs in this session."), theme.fg(ROLE.EMPTY, "The agent starts them with bash_background.")];
+		const detail = selected ? this.detailLines(selected, layout.bodyRows) : [theme.fg(ROLE.EMPTY, "No background jobs in this session."), theme.fg(ROLE.EMPTY, "The agent starts them with bash_background or monitor.")];
 		const bar = theme.fg(ROLE.FRAME, "│");
 		const body: string[] = [];
 		for (let row = 0; row < layout.bodyRows; row += 1) {
@@ -135,7 +135,7 @@ export class JobsView {
 		const head = [
 			theme.fg(ROLE.TITLE, `${clean(job.label)} · ${job.id}`),
 			`${theme.fg(ROLE.META, "Command")} ${clean(job.command)}`,
-			`${theme.fg(ROLE.META, "Status ")} ${clean(jobOutcome(job))} · ${this.elapsed(job)}`,
+			`${theme.fg(ROLE.META, "Status ")} ${clean(jobOutcome(job))} · ${this.elapsed(job)}${job.kind === "monitor" ? ` · ${job.events ?? 0} event${job.events === 1 ? "" : "s"}` : ""}`,
 			`${theme.fg(ROLE.META, "Output ")} ${clean(job.outputPath)}`,
 			"",
 		];
