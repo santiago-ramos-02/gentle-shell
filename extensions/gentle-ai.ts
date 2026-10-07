@@ -2197,6 +2197,11 @@ function readEffectiveModelConfig(cwd: string): AgentModelConfig {
 	return pinnedEffectiveModelConfig(cwd) ?? readGlobalEffectiveModelConfig(cwd);
 }
 
+/** Resolve one complete reviewer routing snapshot without per-role fallback. */
+function readReviewerModelConfig(cwd: string, sessionId: string | undefined): AgentModelConfig {
+	return readSessionProfileBinding(sessionId)?.modelProfiles ?? pinnedEffectiveModelConfig(cwd) ?? readModelConfig(cwd);
+}
+
 /** The routing in effect once the pin is set aside: what a global save materializes. */
 function readGlobalEffectiveModelConfig(cwd: string): AgentModelConfig {
 	const effective = cloneModelConfig(readModelConfig(cwd));
@@ -4041,14 +4046,10 @@ class ProfilesPanel implements OverlayComponent {
 			// any invalid or stale layer, and the scope sentence all come from the shared
 			// precedence rule the launch resolver uses.
 			...profilePinDetailLines(this.pinStatus, this.file.profiles).map((line) => this.renderLine(line, width, "muted")),
-			// gentle-shell#1064 slice 1: the binding is stored for this session and
-			// outranks the pin in the panel list, so it is named right after the pin
-			// layers. Launch resolution ships with slice 2 (gentle-shell#1558); this
-			// slice stores the binding only, launch routing is unchanged, and nothing
-			// was written.
+			// The session snapshot overrides subagent routing without changing pin layers.
 			...(this.sessionBoundName === undefined
 				? []
-				: [this.renderLine(`session        ${sanitizeTerminalText(this.sessionBoundName)} (session) — stored for this session; launch routing is unchanged; nothing was written`, width, "muted")]),
+				: [this.renderLine(`session        ${sanitizeTerminalText(this.sessionBoundName)} (session) — stored for this session; nothing was written`, width, "muted")]),
 			"",
 			this.renderLine("Profile routing", width, "accent"),
 			...this.indentLines(this.routingLines(profileRows, widths), width),
@@ -4185,10 +4186,10 @@ type LiveSession = Pick<ExtensionAPI, "setModel" | "setThinkingLevel" | "getThin
 /**
  * Switch the running session to the profile's orchestrator. `settings.json`
  * is the default for new sessions only; Pi's `setModel`/`setThinkingLevel`
- * are what move the live one. Failures never undo the persisted default: the
- * profile is applied for the next session either way, and the note says what
- * this session did. Nothing here may throw — settings.json is already written
- * and the apply must finish reporting.
+ * are what move the live one without persisting global defaults. This helper
+ * also serves explicit global apply, but never writes settings itself. Failures
+ * keep the current live model and report what happened; callers retain their
+ * routing snapshot or persisted default independently.
  */
 async function switchLiveOrchestrator(ctx: ExtensionContext, live: LiveSession, entry: AgentRoutingEntry): Promise<string> {
 	const reference = parseOrchestratorModelRef(entry.model);
@@ -4242,13 +4243,9 @@ async function runProfilesPanelAction(
 	switch (result.type) {
 		case "apply": {
 			if (!hasOwnProfile(file.profiles, result.name)) return file;
-			// gentle-shell#1064 slice 1: Enter binds the selected profile to this
-			// parent session. The binding is in-process state keyed by the session
-			// id: it writes no store marker, no global routing, no materialized
-			// stores, no agent frontmatter, no Pi settings, and no pin or declaration
-			// layer, pin or not. This slice stores the binding only: launch routing
-			// is unchanged until slice 2 (gentle-shell#1558) resolves the binding
-			// at launch. Refreshing the binding means selecting again.
+			// Enter applies a complete routing snapshot to this parent session and
+			// switches only its live orchestrator. No shared defaults, materialized
+			// stores, agent frontmatter, pins, or declarations are written.
 			const sessionId = ctx.sessionManager?.getSessionId?.();
 			if (typeof sessionId !== "string" || sessionId.length === 0) {
 				ctx.ui.notify(
@@ -4257,9 +4254,12 @@ async function runProfilesPanelAction(
 				);
 				return file;
 			}
-			bindSessionProfile(sessionId, result.name, normalizeModelConfig(file.profiles[result.name]) ?? {});
+			const snapshot = normalizeModelConfig(file.profiles[result.name]) ?? {};
+			bindSessionProfile(sessionId, result.name, snapshot);
+			const orchestrator = readProfileOrchestrator(snapshot);
+			const liveNote = orchestrator === undefined ? "" : await switchLiveOrchestrator(ctx, live, orchestrator);
 			ctx.ui.notify(
-				`el Gentleman bound profile "${result.name}" to this session — shown as "${result.name} (session)". The binding is stored for this session; launch routing is unchanged. Nothing was written: the global routing, pins, and materialized stores are untouched. Set as global default with a.`,
+				`el Gentleman bound profile "${result.name}" to this session — shown as "${result.name} (session)". Subagents and reviewers use this session's routing snapshot. Shared defaults were not written: the global routing, pins, and materialized stores are untouched. Set as global default with a.${liveNote}`,
 				"info",
 			);
 			return file;
@@ -4980,7 +4980,7 @@ const REVIEW_CONTROLLER_PARAMETER_FIELDS = {
 		},
 		input: {
 			type: "string",
-			description: "A JSON object or serialized object string for START/ASSESS only; every other operation requires a serialized object string. New native ordinary START uses {\"mode\":\"ordinary\"}, plus the agent lens selection {\"lenses\":[\"risk\",...],\"lensesReason\":\"<what you touched and how>\"} (both or neither, 1-4 of risk, resilience, readability, reliability; never with focus; providers that predate it keep the tier default); answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. Ordinary provider capture belongs only to gentle_review_capture. An explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. baseRef must be HEAD, a full 40- or 64-character commit id, or a ref name; abbreviated commit ids are rejected as base-ref-unresolvable. ASSESS accepts an optional object with baseRef, committedOnly, writerModelId, writerEffort, and nativeReviewOutcome (gentle-pi#662/#668/#1175). The writer profile comes from the runtime-recorded model and effort of the pending mutations for this root (writerProfileSource runtime); writerModelId and writerEffort are only a fallback when no runtime evidence exists (caller), and with neither the profile fails closed to small (fallback). A missing model, a mini model token (gemini is not mini), or low effort keeps the conservative small-model bias. ASSESS derives `closed` only from the native candidate.consumed fact for this exact candidate, which native records only when the approved review for that candidate is acknowledged; a caller-supplied closed is not authority and, without that fact, resolves to unknown. A declined, unavailable, or unknown outcome falls back to the exact risk-gated plan ASSESS returns when RDD is off, re-enabling the separate verifier; unknown is never treated as closed, and a decline is candidate-scoped and never lowers the bar below the RDD-off path. A declined or unavailable outcome, stated explicitly or recorded by this process for this exact candidate (never a different one, and never from repository state alone), wins over closure. The returned outcome_source (explicit|derived|unknown) says which of these produced the value. Legacy controller input remains separate.",
+			description: "A JSON object or serialized object string for START/ASSESS only; every other operation requires a serialized object string. New native ordinary START uses {\"mode\":\"ordinary\"}, plus the agent lens selection {\"lenses\":[\"risk\",...],\"lensesReason\":\"<what you touched and how>\"} (both or neither, 1-4 of risk, resilience, readability, reliability; never with focus; providers that predate it keep the tier default); answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. Ordinary provider capture belongs only to gentle_review_capture. An explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. baseRef must be HEAD, a full 40- or 64-character commit id, or a ref name; abbreviated commit ids are rejected as base-ref-unresolvable. ASSESS accepts an optional object with baseRef, committedOnly, writerModelId, writerEffort, and nativeReviewOutcome (gentle-pi#662/#668/#1175). The writer profile comes from the runtime-recorded model and effort of the pending mutations for this root (writerProfileSource runtime); writerModelId and writerEffort are only a fallback when no runtime evidence exists (caller), and with neither the profile fails closed to small (fallback). A missing model, a mini model token (gemini is not mini), or low effort keeps the conservative small-model bias. ASSESS derives `closed` only from the native candidate.consumed fact for this exact candidate, which native records only when the approved review for that candidate is acknowledged; a caller-supplied closed is not authority and, without that fact, resolves to unknown. Every outcome yields the exact risk-gated plan ASSESS returns when RDD is off: a closed review never removes the separate verifier the tier requires (verify-always-rdd-high S1), unknown is never treated as closed, and a decline is candidate-scoped and never lowers the bar below the RDD-off path. A declined or unavailable outcome, stated explicitly or recorded by this process for this exact candidate (never a different one, and never from repository state alone), wins over closure. The returned outcome_source (explicit|derived|unknown) says which of these produced the value. Legacy controller input remains separate.",
 		},
 		outputPath: { type: "string", description: "Retired with legacy bundle export; ignored. Export returns legacy-operation-retired." },
 		inputPath: { type: "string", description: "Repository-local JSON input file for the separate legacy controller flow (alternative to input). Legacy bundle import is retired." },
@@ -7325,7 +7325,7 @@ async function executeReviewHostRelayCapture(
 			// global routing. A pin that omits a required role stays omitted: the
 			// typed reviewer-config-invalid refusal below is fail-closed, never a
 			// silent per-role fallback to another account's routing.
-			const launch = reviewHostRelaySelection(slot.routingKey ?? slot.lens, pinnedEffectiveModelConfig(cwd) ?? readModelConfig(cwd));
+			const launch = reviewHostRelaySelection(slot.routingKey ?? slot.lens, readReviewerModelConfig(cwd, reviewerSessionId));
 			return {
 				captureArgumentTokens: slot.captureArgumentTokens,
 				targetCwd: cwd,
@@ -8156,10 +8156,9 @@ async function executeReviewCaptureGroupOperation(
 			mutation_outcome: "none",
 		};
 	}
-	// One routing snapshot for the whole group: the pin-over-global precedence
-	// is identical for every slot, so resolving it once before the map avoids
-	// re-running the pin resolver and config reads per slot.
-	const reviewerRouting = pinnedEffectiveModelConfig(cwd) ?? readModelConfig(cwd);
+	// Resolve session-over-pin-over-global once for the entire reviewer group,
+	// so every slot uses the same complete routing snapshot.
+	const reviewerRouting = readReviewerModelConfig(cwd, reviewerSessionId);
 	const requests: readonly ReviewHostRelayRequest[] = group.slots.map((slot) => ({
 		captureArgumentTokens: slot.captureArgumentTokens,
 		targetCwd: cwd,
@@ -9309,6 +9308,7 @@ export const __testing = {
 	runProfilesPanelAction,
 	resolveReviewModeGate,
 	readEffectiveModelConfig,
+	readReviewerModelConfig,
 	readEffectiveModelConfigAsync,
 	followRenamedPin,
 	profilePinScopeNote,
@@ -9696,7 +9696,7 @@ function createGentleAiExtensionForTesting(
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization, then call RESET or RECOVER only after authorization. RESET and RECOVER_LOCK route to audited native `gentle-ai review reclaim`; only RESET carries the legacy repositoryId, commonDirHash, inventoryHash, and confirmation challenge. RECOVER routes to native `gentle-ai review recover` with exactly six inputs: predecessorLineage, expectedPredecessorRevision, successorLineage, disposition, actor, and reason. Never send RECOVER the reset challenge and never send it a maintainerAuthorization: Pi reads fresh native target status, pins the predecessor lineage, revision, provider-selected disposition, and target identity, derives the exact six-line native authorization binding, displays it for fresh UI approval, and re-reads status before mutating. Negotiated target status supplies the sole accepted recovery disposition, and a caller-supplied substitute is rejected. Treat a native-input-required envelope as a request for exact values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
 			"A consent-required START may be resolved inside the eligible interactive Pi host. Its third UI action is host-owned: it runs this envelope's exact provider grant once and allows later fresh validated envelopes only for the same live SessionManager, nonempty session ID, and canonical Git common-directory identity, including sibling worktrees; an unrelated repository requires a new explicit human grant. Revoke removes the current repository grant, while nonreload replacement, quit, and process exit remove all session grants; reload preserves them. It grants no provider mode, verdict, acknowledgement, maintenance, delivery, or cross-repository authority. A package-owned child may ask its parent only with the canonical digest of its exact pending target; the parent binds that digest to the task repository and fails closed otherwise. If the tool returns an unresolved envelope, present the original two provider choices without changing machine tokens, commands, target IDs, or invocations; never add the host action to the decoded provider envelope. After one explicit relayed human answer, call answer-consent exactly once with only consentBinding and answer (`granted` or `declined`). Never create host permission from tool arguments, model prose, child/headless responses, or an uncertain native result. A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START output, the controller calls target-scoped native status once and returns only its declared action. An ambiguous gentle_review_capture outcome independently reconciles once and never replays the capture.",
 			"Use gentle_review only for native review authority operations; delivery commands follow ordinary repository policy.",
-			'ASSESS (gentle-pi#662/#668) is read-only and needs no lineageId: after a delegated writer returns, call {"operation":"assess"} over its diff and follow the returned plan (writerSelfVerification, structuralReadbackOnly, independentVerifier, reason) instead of judging non-triviality from the task description. Pass input as JSON only to assess a committed range ({"baseRef":"<ref>","committedOnly":true}), to supply a fallback writer profile ({"writerModelId":"...", "writerEffort":"..."}), or to state that the native review was declined or unavailable for this candidate ({"nativeReviewOutcome":"declined|unavailable|unknown"}), or to raise a candidate you know is high risk ({"escalate":{"item":1-6,"reason":"<one line>"}}, item from the Task Size high-risk list; it raises passive or medium to high, keeps nativeRisk, returns agentEscalation, and can never lower a tier). The writer profile comes from the runtime-recorded model and effort of the pending mutations for this root (writerProfileSource runtime); caller writerModelId/writerEffort are only a fallback when no runtime evidence exists (caller), otherwise the profile is small (fallback). A missing model, a mini model token (gemini is not mini), or low effort keeps the conservative small-model bias. The on-path (writer self-verification is the record, no separate verifier) holds only when RDD reads on and nativeReviewOutcome resolves to "closed" for this candidate. ASSESS derives closed only from the native candidate.consumed fact for this exact candidate, written natively when the approved review for that candidate is acknowledged; a caller-supplied closed is not authority and, without that fact, resolves to unknown. A declined, unavailable, or unknown outcome falls back to the exact risk-gated plan RDD off would return, re-enabling the separate verifier; unknown is never treated as closed, and a decline is candidate-scoped and never lowers the bar below RDD off. A decline or unavailable review recorded by this process is bound to that exact candidate\'s own target identity, never to a different candidate or to bare repository state, and wins over closure. The result\'s outcome_source (explicit|derived|unknown) and writerProfileSource (runtime|caller|fallback) state which evidence produced each value. When native reports them, ASSESS projects reviewDue, reviewDueReason, candidate.consumed, and the native continuation verbatim; older binaries omit them and nothing is invented. Relay that continuation unchanged; never rebuild it. A native code review is not a substitute for applicable functional checks: tests, builds, and functional verification such as browser checks for UI changes still run when applicable. A failed or unavailable native assessment reports risk "unassessable", verified exactly like "high". This never mutates review authority state.',
+			'ASSESS (gentle-pi#662/#668) is read-only and needs no lineageId: after a delegated writer returns, call {"operation":"assess"} over its diff and follow the returned plan (writerSelfVerification, structuralReadbackOnly, independentVerifier, reason) instead of judging non-triviality from the task description. Pass input as JSON only to assess a committed range ({"baseRef":"<ref>","committedOnly":true}), to supply a fallback writer profile ({"writerModelId":"...", "writerEffort":"..."}), or to state that the native review was declined or unavailable for this candidate ({"nativeReviewOutcome":"declined|unavailable|unknown"}), or to raise a candidate you know is high risk ({"escalate":{"item":1-6,"reason":"<one line>"}}, item from the Task Size high-risk list; it raises passive or medium to high, keeps nativeRisk, returns agentEscalation, and can never lower a tier). The writer profile comes from the runtime-recorded model and effort of the pending mutations for this root (writerProfileSource runtime); caller writerModelId/writerEffort are only a fallback when no runtime evidence exists (caller), otherwise the profile is small (fallback). A missing model, a mini model token (gemini is not mini), or low effort keeps the conservative small-model bias. The plan follows the native risk tier whatever RDD reads and whatever the native review outcome: the native review is an additional outside view and never removes a verifier the tier requires (verify-always-rdd-high S1). ASSESS derives closed only from the native candidate.consumed fact for this exact candidate, written natively when the approved review for that candidate is acknowledged; a caller-supplied closed is not authority and, without that fact, resolves to unknown; the outcome only explains the plan. A decline or unavailable review recorded by this process is bound to that exact candidate\'s own target identity, never to a different candidate or to bare repository state, and wins over closure. The result\'s outcome_source (explicit|derived|unknown) and writerProfileSource (runtime|caller|fallback) state which evidence produced each value. When native reports them, ASSESS projects reviewDue, reviewDueReason, candidate.consumed, and the native continuation verbatim; older binaries omit them and nothing is invented. Relay that continuation unchanged; never rebuild it. A native code review is not a substitute for applicable functional checks: tests, builds, and functional verification such as browser checks for UI changes still run when applicable. A failed or unavailable native assessment reports risk "unassessable", verified exactly like "high". This never mutates review authority state.',
 		],
 		parameters: REVIEW_CONTROLLER_PARAMETERS,
 		executionMode: "sequential",
@@ -10020,6 +10020,18 @@ function createGentleAiExtensionForTesting(
 		// Another concurrent end or ACK may already have consumed this prefix.
 		if (!pendingReviewMutation(ctx.sessionManager, root, mutation)) return;
 		if (status.nextTransition?.kind !== "execute" || status.nextTransition.execute.operation !== "review.start") return;
+		// verify-always-rdd-high S2: automatic review is for high risk only, so a
+		// candidate the native assessment reports not review_due earns no nudge.
+		// An assessment that cannot answer, or an older binary without
+		// review_due, keeps the nudge.
+		if (nativeReviewCli.assess !== undefined) {
+			let reviewDue: boolean | undefined;
+			try { reviewDue = (await nativeReviewCli.assess({ cwd: root })).reviewDue; }
+			catch { reviewDue = undefined; }
+			if (reviewDue === false) return;
+			if (!reminderSessionActive || epoch !== reminderEpoch || pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey) !== sessionKey) return;
+			if (!pendingReviewMutation(ctx.sessionManager, root, mutation)) return;
+		}
 		const targetIdentity = status.targetIdentity;
 		pi.sendMessage(
 			{

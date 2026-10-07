@@ -16,7 +16,7 @@
     {
       "runtime": "pi",
       "path": "orchestration/pi.md",
-      "sha256": "e0c8844dc8be7c710c5da31a02ac53b075253008dd62452ab13c1bcdee09426a"
+      "sha256": "be97e59e9b4dd91c260a68be282bbc822554381e5aa4bebbaf1a3adabd31eb16"
     }
   ]
 }
