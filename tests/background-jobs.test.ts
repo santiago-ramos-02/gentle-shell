@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
-import { createJobRegistry, createOutputTail, MAX_RUNNING_JOBS, TAIL_LINES, type JobExecOperations, type JobRecord } from "../lib/background-jobs.ts";
+import { createJobRegistry, createOutputTail, MAX_RUNNING_JOBS, MAX_TAIL_LINE_CHARS, TAIL_LINES, type JobExecOperations, type JobRecord } from "../lib/background-jobs.ts";
 
 // Background jobs run a shell command while the parent keeps working or stays
 // idle; the registry reports each job's own exit exactly once.
@@ -18,6 +18,18 @@ test("output tail keeps the last TAIL_LINES lines, joins partial chunks, and str
 	tail.push("tial");
 	assert.deepEqual(tail.lines().at(-1), "partial");
 	assert.equal(tail.lines().length, TAIL_LINES);
+});
+
+test("output tail bounds a line that never ends, keeping its newest characters", () => {
+	const tail = createOutputTail();
+	for (let i = 0; i < 50; i++) tail.push(`${"x".repeat(MAX_TAIL_LINE_CHARS)}`);
+	tail.push("END");
+	const [line] = tail.lines();
+	assert.ok(line!.length <= MAX_TAIL_LINE_CHARS + 1, `kept ${line!.length} characters`);
+	assert.ok(line!.startsWith("…") && line!.endsWith("xEND"));
+	tail.push(`\n${"y".repeat(MAX_TAIL_LINE_CHARS * 3)}\nshort\n`);
+	assert.ok(tail.lines().every((entry) => entry.length <= MAX_TAIL_LINE_CHARS + 1));
+	assert.equal(tail.lines().at(-1), "short");
 });
 
 interface FakeRun {
@@ -79,6 +91,30 @@ test("start returns a running job at once and its exit settles it exactly once w
 		assert.deepEqual(done.tail, ["building", "ok"]);
 		assert.equal(readFileSync(done.outputPath, "utf8"), "building\nok\n");
 		assert.equal(registry.get("job-1")?.status, "exited");
+	} finally { cleanup(); }
+});
+
+test("a multibyte character split across output chunks reaches the tail intact", async () => {
+	const { fake, settled, registry, cleanup } = setup();
+	try {
+		registry.start({ command: "echo", cwd: "/repo", ownerSessionId: "s1" });
+		const bytes = Buffer.from("ñandú listo\n");
+		fake.runs[0]!.onData(bytes.subarray(0, 1));
+		fake.runs[0]!.onData(bytes.subarray(1, 5));
+		fake.runs[0]!.onData(bytes.subarray(5));
+		fake.runs[0]!.resolve(0);
+		await settle();
+		assert.deepEqual(settled[0]!.tail, ["ñandú listo"]);
+	} finally { cleanup(); }
+});
+
+test("stopAll resolves only after every job's log file is closed", async () => {
+	const { registry, cleanup } = setup();
+	try {
+		const job = registry.start({ command: "sleep 100", cwd: "/repo", ownerSessionId: "s1" });
+		await registry.stopAll();
+		assert.equal(job.status, "stopped");
+		assert.equal(registry.pending(), 0);
 	} finally { cleanup(); }
 });
 

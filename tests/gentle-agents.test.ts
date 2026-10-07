@@ -52,6 +52,10 @@ interface Registered {
 }
 
 const plainTheme = { fg: (_color: string, text: string) => text };
+// Session shutdown persists finished subagent history asynchronously, so a
+// late write can race a teardown removal; Node retries ENOTEMPTY/EBUSY here
+// instead of failing the test (macOS showed it, #1840).
+const TEST_DIR_REMOVAL = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as const;
 const fakeTui = { requestRender() {} };
 const inertSessionTransport: SessionTransportFactory = {
 	createRegistry: async () => ({ list: async () => [], listActivations: async () => [] }),
@@ -102,7 +106,7 @@ after(async () => {
 	finally {
 		if (previousGentlePiConfigHome === undefined) delete process.env.GENTLE_PI_CONFIG_HOME;
 		else process.env.GENTLE_PI_CONFIG_HOME = previousGentlePiConfigHome;
-		rmSync(root, { recursive: true, force: true });
+		rmSync(root, TEST_DIR_REMOVAL);
 	}
 });
 const home = join(root, "home");
@@ -1868,9 +1872,9 @@ test("C1 investigation: the relay mechanism is correct when every guard input is
 		await h.fire("session_shutdown", ctx);
 		await tick();
 	} finally {
-		rmSync(repoRoot, { recursive: true, force: true });
-		rmSync(gitHome, { recursive: true, force: true });
-		rmSync(gitHooksDir, { recursive: true, force: true });
+		rmSync(repoRoot, TEST_DIR_REMOVAL);
+		rmSync(gitHome, TEST_DIR_REMOVAL);
+		rmSync(gitHooksDir, TEST_DIR_REMOVAL);
 	}
 });
 
@@ -2243,7 +2247,7 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 		mkdirSync(gitTemplate);
 		execFileSync("git", ["init", "--quiet", `--template=${gitTemplate}`, canonicalGitCwd]);
 	} catch (error) {
-		rmSync(canonicalGitFixture, { recursive: true, force: true });
+		rmSync(canonicalGitFixture, TEST_DIR_REMOVAL);
 		throw error;
 	}
 	childProcess.spawn = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
@@ -2300,7 +2304,7 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 		try {
 			await shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => Promise.all(shutdown.map((close) => close())));
 		} finally {
-			rmSync(canonicalGitFixture, { recursive: true, force: true });
+			rmSync(canonicalGitFixture, TEST_DIR_REMOVAL);
 		}
 	}
 });
@@ -2463,7 +2467,7 @@ test("foreign clone tool requires consent before queueing and never enters paren
 		await tick();
 		assert.equal(runtime.children.length, 3, "stale queued foreign task must fail before OS spawn");
 		await h.fire("session_shutdown", successor);
-	} finally { rmSync(fixture, { recursive: true, force: true }); }
+	} finally { rmSync(fixture, TEST_DIR_REMOVAL); }
 });
 
 test("foreign child Changes require successful target-bound tool evidence, never model claims or sibling writes", async () => {
@@ -2547,7 +2551,7 @@ test("foreign child Changes require successful target-bound tool evidence, never
 		assert.equal(h.entries.filter(entry => entry.customType === "gentle-pi.session-change/v1").length, 3, "session replacement during a tool cannot attribute its result");
 		assert.equal(h.entries.filter(entry => entry.customType === SESSION_WORKTREE_ENTRY).length, 0);
 		await h.fire("session_shutdown", successor);
-	} finally { rmSync(fixture, { recursive: true, force: true }); }
+	} finally { rmSync(fixture, TEST_DIR_REMOVAL); }
 });
 
 test("foreign task mode waits for the child and continuation reuses its live grant", async () => {
@@ -2595,7 +2599,7 @@ test("foreign task mode waits for the child and continuation reuses its live gra
 		assert.equal(((await continued).details.gentleAgents as { cwd: string }).cwd, foreign);
 		assert.equal(runtime.spawned.length, 2);
 		await h.fire("session_shutdown", ctx);
-	} finally { rmSync(fixture, { recursive: true, force: true }); }
+	} finally { rmSync(fixture, TEST_DIR_REMOVAL); }
 });
 
 test("aborting during foreign consent cannot grant or queue a background child", async () => {
@@ -2620,7 +2624,7 @@ test("aborting during foreign consent cannot grant or queue a background child",
 		assert.equal(runtime.children.length, 0);
 		assert.deepEqual(h.entries.filter(entry => entry.customType === SESSION_WORKTREE_ENTRY), []);
 		await h.fire("session_shutdown", ctx);
-	} finally { rmSync(fixture, { recursive: true, force: true }); }
+	} finally { rmSync(fixture, TEST_DIR_REMOVAL); }
 });
 
 test("an interactive non-Git umbrella can target an independent repository without registering it", async () => {
@@ -2640,7 +2644,7 @@ test("an interactive non-Git umbrella can target an independent repository witho
 		assert.equal((launched.details.gentleAgents as { cwd: string }).cwd, foreign);
 		assert.deepEqual(h.entries.filter(entry => entry.customType === SESSION_WORKTREE_ENTRY), []);
 		await h.fire("session_shutdown", ctx);
-	} finally { rmSync(fixture, { recursive: true, force: true }); }
+	} finally { rmSync(fixture, TEST_DIR_REMOVAL); }
 });
 
 test("foreign selector rejects RPC and retired SDD selections before consent", async () => {
@@ -2676,7 +2680,7 @@ test("foreign selector rejects RPC and retired SDD selections before consent", a
 		assert.equal(dialogs.length, 0);
 		assert.equal(runtime.children.length, 0);
 		await h.fire("session_shutdown", ctx);
-	} finally { rmSync(fixture, { recursive: true, force: true }); }
+	} finally { rmSync(fixture, TEST_DIR_REMOVAL); }
 });
 
 test("foreign clone rejects aliases, absent UI, decline and changed session before any child starts", async () => {
@@ -2710,7 +2714,7 @@ test("foreign clone rejects aliases, absent UI, decline and changed session befo
 		assert.equal(dialogs.filter(dialog => dialog.startsWith("confirm:")).length, 2);
 		assert.deepEqual(h.entries.filter(entry => entry.customType === SESSION_WORKTREE_ENTRY), []);
 		await h.fire("session_shutdown", ctx);
-	} finally { rmSync(fixture, { recursive: true, force: true }); }
+	} finally { rmSync(fixture, TEST_DIR_REMOVAL); }
 });
 
 test("explicit child roots launch and continue in the actual cwd, persist without shell, and reject other clones", async () => {
@@ -5688,7 +5692,7 @@ test("a writer continuation without its own section inherits the admitted surfac
 	runtime.children[1].emit({ type: "agent_settled" });
 	await continued;
 	await h.fire("session_shutdown", ctx);
-	rmSync(profile, { recursive: true, force: true });
+	rmSync(profile, TEST_DIR_REMOVAL);
 });
 
 // #1690: the launcher's injection signal in the host env replaces the curated
@@ -5780,7 +5784,7 @@ test("parallel writers are admitted only with disjoint Allowed edit surfaces end
 		assert.equal(runtime.children.length, 5, "the continuation is admitted once its surfaces are free");
 	} finally {
 		await h.fire("session_shutdown", ctx);
-		rmSync(profile, { recursive: true, force: true });
+		rmSync(profile, TEST_DIR_REMOVAL);
 	}
 });
 
@@ -5813,7 +5817,7 @@ test("a subdirectory session cwd and workspace_root of the same worktree share o
 		await assert.rejects(h.tools.get("subagent_run")!.execute("run", { agent: "gentle-ai-worker", task, workspace_root: cwd, mode: "background" }, undefined, undefined, ctx), new RegExp(`task ${firstId}`));
 	} finally {
 		await h.fire("session_shutdown", ctx);
-		rmSync(profile, { recursive: true, force: true });
+		rmSync(profile, TEST_DIR_REMOVAL);
 	}
 });
 
@@ -5830,7 +5834,7 @@ function fakeJobShell() {
 		},
 	});
 	const dir = mkdtempSync(join(tmpdir(), "gentle-jobs-agents-"));
-	return { runs, shell, dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+	return { runs, shell, dir, cleanup: () => rmSync(dir, TEST_DIR_REMOVAL) };
 }
 // A job settles only after its log file closes, which takes real I/O turns.
 const jobIo = () => new Promise((done) => setTimeout(done, 50));
@@ -6015,3 +6019,37 @@ for (const boundary of ["session_compact", "session_compact_failed"] as const) {
 		}
 	});
 }
+
+test("session shutdown removes the default background job log directory", async () => {
+	const { pi, tools, fire } = fakePi();
+	const jobs = fakeJobShell();
+	gentleAgents(pi, {}, { ...deps().deps, jobShell: jobs.shell });
+	const { ctx } = fakeContext();
+	try {
+		await fire("session_start", ctx);
+		const started = toolText(await tools.get("bash_background")!.execute("b1", { command: "sleep 100" }, undefined, undefined, ctx));
+		const outputPath = /Output: (.+)$/m.exec(started)![1]!;
+		assert.ok(existsSync(dirname(outputPath)), "the job log directory exists while the session runs");
+		await fire("session_shutdown", ctx);
+		assert.equal(existsSync(dirname(outputPath)), false, "the job log directory is removed with the session");
+	} finally {
+		jobs.cleanup();
+	}
+});
+
+test("session shutdown never hangs on a job whose process ignores the stop", { timeout: 5000 }, async () => {
+	const { pi, tools, fire } = fakePi();
+	const dir = mkdtempSync(join(tmpdir(), "gentle-jobs-stuck-"));
+	// A process that never exits, even after its abort signal.
+	const stuck = () => ({ operations: { exec: () => new Promise<{ exitCode: number | null }>(() => {}) } });
+	const schedule: AgentsDeps["schedule"] = (fn, ms) => { const timer = setTimeout(fn, Math.min(ms, 10)); timer.unref(); return () => clearTimeout(timer); };
+	gentleAgents(pi, {}, { ...deps().deps, schedule, jobShell: stuck });
+	const { ctx } = fakeContext();
+	try {
+		await fire("session_start", ctx);
+		await tools.get("bash_background")!.execute("b1", { command: "sleep 100" }, undefined, undefined, ctx);
+		await fire("session_shutdown", ctx);
+	} finally {
+		rmSync(dir, TEST_DIR_REMOVAL);
+	}
+});

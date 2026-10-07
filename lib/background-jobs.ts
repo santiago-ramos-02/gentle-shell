@@ -26,6 +26,11 @@ export const SHELL_COMMAND_TOOLS: ReadonlySet<string> = new Set(["bash", BASH_BA
 
 /** Lines kept for the exit notice and job listings. */
 export const TAIL_LINES = 20;
+/**
+ * Characters kept per tail line. Progress bars and minified output can print
+ * one endless line; only its newest characters are kept, after an ellipsis.
+ */
+export const MAX_TAIL_LINE_CHARS = 2000;
 /** Running jobs allowed at once across the process. */
 export const MAX_RUNNING_JOBS = 25;
 
@@ -33,18 +38,29 @@ export const MAX_RUNNING_JOBS = 25;
 export function createOutputTail() {
 	const complete: string[] = [];
 	let partial = "";
+	let partialTruncated = false;
+	const bound = (line: string, truncated: boolean) => {
+		const cut = line.length > MAX_TAIL_LINE_CHARS;
+		const kept = cut ? line.slice(-MAX_TAIL_LINE_CHARS) : line;
+		return cut || truncated ? `…${kept}` : kept;
+	};
 	const clean = (line: string) => (line.endsWith("\r") ? line.slice(0, -1) : line);
 	return {
 		push(text: string) {
 			const parts = (partial + text).split("\n");
 			partial = parts.pop() ?? "";
-			for (const part of parts) {
-				complete.push(clean(part));
+			for (const [index, part] of parts.entries()) {
+				complete.push(bound(clean(part), index === 0 && partialTruncated));
 				if (complete.length > TAIL_LINES) complete.shift();
+				if (index === 0) partialTruncated = false;
+			}
+			if (partial.length > MAX_TAIL_LINE_CHARS) {
+				partial = partial.slice(-MAX_TAIL_LINE_CHARS);
+				partialTruncated = true;
 			}
 		},
 		lines(): string[] {
-			const all = partial.length > 0 ? [...complete, clean(partial)] : [...complete];
+			const all = partial.length > 0 ? [...complete, bound(clean(partial), partialTruncated)] : [...complete];
 			return all.slice(-TAIL_LINES);
 		},
 	};
@@ -93,6 +109,8 @@ export interface JobRegistryDeps {
 export function createJobRegistry(deps: JobRegistryDeps) {
 	const jobs = new Map<string, JobRecord>();
 	const aborts = new Map<string, AbortController>();
+	// Every job's run, until its log file is closed and its exit reported.
+	const runs = new Set<Promise<void>>();
 	let counter = 0;
 
 	const running = () => [...jobs.values()].filter((job) => job.status === "running").length;
@@ -123,23 +141,34 @@ export function createJobRegistry(deps: JobRegistryDeps) {
 		const output = createWriteStream(job.outputPath);
 		output.on("error", () => { /* A lost log must not crash the session; the tail survives. */ });
 		const tail = createOutputTail();
+		// Streaming decode keeps a multibyte character split across chunks intact.
+		const decoder = new TextDecoder("utf-8");
 		const abort = new AbortController();
 		jobs.set(id, job);
 		aborts.set(id, abort);
 		const execCommand = commandPrefix ? `${commandPrefix}\n${request.command}` : request.command;
+		const flushDecoder = () => {
+			const rest = decoder.decode();
+			if (rest) {
+				tail.push(rest);
+				job.tail = tail.lines();
+			}
+		};
 		const onData = (data: Buffer) => {
 			output.write(data);
-			tail.push(data.toString("utf8"));
+			tail.push(decoder.decode(data, { stream: true }));
 			job.tail = tail.lines();
 		};
-		operations.exec(execCommand, request.cwd, { onData, signal: abort.signal }).then(
+		const run = operations.exec(execCommand, request.cwd, { onData, signal: abort.signal }).then(
 			({ exitCode }) => finish(job, output, () => {
+				flushDecoder();
 				if (job.status !== "running") return;
 				job.status = "exited";
 				job.exitCode = exitCode;
 				job.endedAt = deps.now();
 			}),
 			(error: unknown) => finish(job, output, () => {
+				flushDecoder();
 				if (job.status !== "running") return;
 				job.status = "failed";
 				job.error = error instanceof Error ? error.message : String(error);
@@ -147,7 +176,8 @@ export function createJobRegistry(deps: JobRegistryDeps) {
 			}),
 		).then(() => {
 			if (job.status === "exited" || job.status === "failed") deps.onSettled(job);
-		});
+		}).finally(() => runs.delete(run));
+		runs.add(run);
 		return job;
 	};
 
@@ -169,7 +199,13 @@ export function createJobRegistry(deps: JobRegistryDeps) {
 		/** Jobs in start order, optionally only those one session owns. */
 		list: (ownerSessionId?: string) => [...jobs.values()].filter((job) => ownerSessionId === undefined || job.ownerSessionId === ownerSessionId),
 		running,
-		stopAll: () => { for (const id of jobs.keys()) stop(id); },
+		/** Runs not yet finished: still executing or closing their log. */
+		pending: () => runs.size,
+		/** Stops every running job and resolves once every log file is closed. */
+		stopAll: async () => {
+			for (const id of jobs.keys()) stop(id);
+			await Promise.allSettled([...runs]);
+		},
 	};
 }
 
