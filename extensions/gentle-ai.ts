@@ -1,5 +1,6 @@
 import { appendSystemPromptOnce } from "../lib/append-system-prompt.ts";
 import { recognizeDestructiveCommands } from "../lib/destructive-command-guard.ts";
+import { SHELL_COMMAND_TOOLS } from "../lib/background-jobs.ts";
 import { blockChildDestructiveCommand } from "./child-safety.ts";
 import { allowedEditSurfaces as hasTaskScopedAllowedEditSurfaces, bindSessionRepositoryPreparation, captureBoundSessionRepositoryAuthority, prepareBoundSessionRepository, rejectUnscopedBoundedWriterDispatch, safeBootstrapDirectory, sourcePathWithinProject } from "../lib/bounded-writer-admission.ts";
 import { consumeReviewMutation, pendingReviewMutation, pendingReviewMutationProfiles, recordReviewMutation, type ReceiptSession } from "../lib/review-reminder-receipt.ts";
@@ -10040,15 +10041,14 @@ function createGentleAiExtensionForTesting(
 				};
 			}
 		}
-		if (event.toolName !== "bash") return undefined;
-		if (!isRecord(event.input) || typeof event.input.command !== "string") {
-			return undefined;
-		}
+		if (!SHELL_COMMAND_TOOLS.has(event.toolName) || !isRecord(event.input)) return undefined;
+		const command = (event.input as { command?: unknown }).command;
+		if (typeof command !== "string") return undefined;
 		if (permissionEnvironment.GENTLE_PI_AGENTS_CHILD === "1") {
-			const childDenied = blockChildDestructiveCommand(event.input.command);
+			const childDenied = blockChildDestructiveCommand(command);
 			if (childDenied) return childDenied;
 		}
-		return await confirmCommand(event.input.command, ctx, pi.events, herdrLifecycle, yoloActive);
+		return await confirmCommand(command, ctx, pi.events, herdrLifecycle, yoloActive);
 	});
 
 	for (const owner of ["delegation", "review"] as const) {

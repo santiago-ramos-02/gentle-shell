@@ -135,6 +135,8 @@ When the policy is on and `subagent_run` is available:
 - Finished tasks persist across restarts; running ones are stopped when pi exits and must be relaunched, never claimed as recovered.
 <!-- /gentle-pi:background-subagents -->
 
+Waiting on CI, a build, or a server is not delegation: use `bash_background` with the wait inside the command and end the turn. Never `sleep`, poll, or spend a subagent to wait.
+
 For generic mapping, follow the Evidence-budget rule under Pi Trigger Runtime Bindings.
 
 The canonical Writer rule under Mandatory Delegation Triggers overrides the general runtime preference above.
