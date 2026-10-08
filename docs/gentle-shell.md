@@ -59,6 +59,7 @@ The prompt follows the selected card style. `neon` keeps pi's editor in its roun
 - `float` paints the prompt with the card's quieter `toolSuccessBg`, one-column transparent margins and a full-height `▎` accent in the editor's current frame/mode color. The painted top row contains the petal and working state; editable rows have an interior inset and painted bottom padding replaces the bottom rule. Cursor, selection, autocomplete and mouse geometry remain native.
 - The petal is still with a `waiting for input` label in float while pi waits, spins with a `working` label while the agent works, and turns amber with a `queued` label when messages are waiting behind the current turn. In float it lives inside the painted top row; in neon it lives in the top rule. Pi's own "Working" row above the editor is hidden.
 - The empty-editor typing hint appears only while the editor is empty; Esc/queued hints remain inside the painted top row even with a nonempty float draft. Widths below 10 columns or a missing/unusable background keep the complete neon prompt path.
+- With Vim editing off, the prompt selects text natively: `shift+home` / `shift+end` select to the line edge and `alt+e` selects the whole draft; backspace, delete, a printable key or a paste replaces the selection in one undoable edit. `alt+a` also selects all, but only when no extension shortcut claims it: by default it opens Gentle Agents. A registered extension shortcut always wins over these selection keys.
 - If another extension already installed a custom editor, Gentle Shell leaves it alone.
 
 Changes shows **captured write/edit operations from this agent session and its owned subagents**. It does not scan the repository on startup, read all untracked files, or poll live files in the background. Fullscreen, the sidebar, and mouse interaction are unchanged.
@@ -174,6 +175,17 @@ Pick the conversation-card and shell-chrome style in `/gentle:customize` → **C
 
 - `float` applies to tool, Code and 🌹 cards, Agent result and stale cards, the review preflight reminder, the dev-binary notice, and the Agents, Todos and Status panels. The prompt and fullscreen header/footer use their specialized float chrome described above. The regular-mode one-line Status bar is unchanged.
 - A theme without a tool background, or a card narrower than 10 columns, falls back to `neon`. A malformed `card-style.json` reads as `float` and the panel refuses to overwrite it.
+
+### Card content
+
+Pick how much a collapsed quiet-tool card shows in `/gentle:customize` → **Cards** → **Card content**. The choice is saved in `card-content.json` in the Gentle Pi config home; a missing, malformed, or unreadable file reads as `default`, and a malformed file is never overwritten.
+
+| Level | Collapsed quiet-tool cards |
+|-------|----------------------------|
+| `default` | Result previews, counts, and summaries, as described above. Bash rows keep pi's native drawing. |
+| `minimal` | Only the command row for `read`, `write`, `bash`, `grep`, `find`, `ls`, and `edit`; the expand key still reveals the full result. Failed calls keep their bounded error tail. Bash rows draw as a Gentle card when the host supports `pi.registerToolRenderer`, with the bare command as the title. |
+
+Quiet tool cards redraw immediately after a change; bash rows follow on new calls. Gentle AI cards keep their full card and elapsed time at both levels.
 
 ### Compact Code card
 
