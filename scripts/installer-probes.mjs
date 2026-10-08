@@ -105,10 +105,11 @@ export function userEnvironment({ platform, env }) {
  * `stderrTail`. Callers must sanitize that text before showing it anywhere.
  * The deadline signals the direct child only, not its descendants, and settles
  * the result as timed out without waiting for the child's pipes to close.
+ * An optional `cwd` sets the child's working directory.
  * `spawn` is injectable only for trusted tests.
  */
 export function hostAdapters({ maxOutputBytes = 1024 * 1024, maxTextBytes = 1024 * 1024, spawn = spawnProcess } = {}) {
-	const run = (command, argv, { env, deadlineMs, stderrTail }) => new Promise((resolve) => {
+	const run = (command, argv, { env, cwd, deadlineMs, stderrTail }) => new Promise((resolve) => {
 		let size = 0;
 		let truncated = false;
 		let timedOut = false;
@@ -118,7 +119,7 @@ export function hostAdapters({ maxOutputBytes = 1024 * 1024, maxTextBytes = 1024
 		const withTail = (result) => (tailBytes > 0 ? { ...result, stderrTail: tail.toString("utf8") } : result);
 		let child;
 		try {
-			child = spawn(command, argv, { env, shell: false, stdio: ["ignore", "pipe", tailBytes > 0 ? "pipe" : "ignore"], windowsHide: true });
+			child = spawn(command, argv, { env, cwd, shell: false, stdio: ["ignore", "pipe", tailBytes > 0 ? "pipe" : "ignore"], windowsHide: true });
 		} catch {
 			resolve(withTail({ code: null, signal: null, timedOut: false, truncated: false, stdout: "" }));
 			return;
@@ -226,11 +227,14 @@ export function createProbes({ platform, env, run, fs, home, verifyGentleAi = pa
 	const globalPackage = async (name, command) => {
 		const packages = await globalPackages();
 		if (!packages) return { state: "unknown" };
-		if (!packages.has(name)) return { state: (await persistentOn(command)) ? "unknown" : "absent" };
+		if (!packages.has(name)) return (await persistentOn(command)) ? { state: "unknown", outsidePnpm: true } : { state: "absent" };
 		const entry = packages.get(name);
 		const version = exactVersion(entry?.version, STABLE);
 		return entry && version ? { state: "present", entry, version } : { state: "unknown" };
 	};
+	// Still unknown (never absent or replaced), but says the command comes from
+	// another installation so the wizard can explain the blocker.
+	const notPnpmGlobal = (found) => (found.outsidePnpm ? { ...unknown(), outsidePnpm: true } : unknown());
 	const shellBin = () => path.join(globalBin.path, platform === "win32" ? "gentle-shell.cmd" : "gentle-shell");
 
 	const probes = {
@@ -262,12 +266,12 @@ export function createProbes({ platform, env, run, fs, home, verifyGentleAi = pa
 		},
 		async pi() {
 			const pi = await globalPackage(PI_PACKAGE, "pi");
-			if (pi.state !== "present") return pi.state === "absent" ? absent() : unknown();
+			if (pi.state !== "present") return pi.state === "absent" ? absent() : notPnpmGlobal(pi);
 			return { available: true, version: pi.version, usable: true };
 		},
 		async shell() {
 			const shell = await globalPackage(SHELL_PACKAGE, "gentle-shell");
-			if (shell.state !== "present") return shell.state === "absent" ? absent() : unknown();
+			if (shell.state !== "present") return shell.state === "absent" ? absent() : notPnpmGlobal(shell);
 			return { available: true, version: shell.version, usable: await fs.isFile(shellBin()), global: true };
 		},
 		async gentleAi() {

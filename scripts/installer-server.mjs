@@ -2,6 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
+import { requirements } from "./installer-preflight.mjs";
 
 // Local wizard host: a dependency-free loopback HTTP server with a fixed route
 // allowlist. The browser never sends commands, paths, plans or environment:
@@ -75,6 +76,9 @@ export const actionDescriptions = Object.freeze({
 	"provision-native": "Provision the package-native Gentle AI binary with the existing installer.",
 	"setup-shell": "Run the normal `gentle-shell setup`.",
 	"verify-readiness": "Verify that the installed stack is ready.",
+	"build-gentle-ai-main": "Build Gentle AI from the latest commit of its `main` branch with Go, verified by Go's checksum database, and use it instead of the pinned release binary.",
+	"install-shell-main": "Install Gentle Shell from the latest commit of its `main` branch with pnpm, replacing the release package.",
+	"record-channel": "Remember the `main` channel, so `gentle-shell upgrade` keeps following `main`.",
 });
 
 const tryAgain = "Fix the cause, then run the installer again.";
@@ -85,7 +89,7 @@ export const guidance = Object.freeze({
 		"consent-required": "Nothing was installed because consent was not given. Review the plan and confirm to continue.",
 		"preflight-blocked": "Preflight found a blocker, so nothing was installed. Resolve the listed blockers and run the installer again.",
 		"go-required": "Windows needs Go 1.25.10 or newer on PATH before Gentle AI can be provisioned. Install Go, then run the installer again.",
-		"unsupported-plan": "This machine needs steps the wizard does not run yet, such as updating an existing installation. Use `gentle-shell update` or follow the README.",
+		"unsupported-plan": "This machine needs steps the wizard does not run yet, such as updating an existing installation. Use `gentle-shell upgrade` or follow the README.",
 		"pnpm-home-unknown": "The pnpm home directory could not be determined. Set PNPM_HOME to an absolute directory, then run the installer again.",
 		"node-unavailable": "The installer could not find its own Node.js executable. Run the installer again from the bootstrap script.",
 		"pnpm-unavailable": "pnpm could not be started. Run the installer again from the bootstrap script so it can provide pnpm.",
@@ -93,7 +97,7 @@ export const guidance = Object.freeze({
 		"npm-shadowed": "Another `npm` program appears on PATH before Node.js's npm. Remove or reorder it, then run the installer again.",
 		"global-bin-mismatch": "pnpm reported a different global bin directory than expected. Check PNPM_HOME, then run the installer again.",
 		"global-list-unavailable": "pnpm could not list global packages. Check that `pnpm list -g` works, then run the installer again.",
-		"existing-stack": "Pi or Gentle Shell is already installed globally. Nothing was changed; use `gentle-shell update` instead.",
+		"existing-stack": "Pi or Gentle Shell is already installed globally. Nothing was changed; use `gentle-shell upgrade` instead.",
 		"existing-stack-unverified": "The installed Pi and Gentle Shell changed after the plan was made, or are no longer the versions this installer set up. Nothing was changed; run the installer again to check this computer again.",
 	}),
 	failed: Object.freeze({
@@ -111,11 +115,15 @@ export const guidance = Object.freeze({
 		"verify-gentle-ai": `The package-native Gentle AI binary could not be verified. ${tryAgain}`,
 		"shell-setup": "`gentle-shell setup` did not finish. Run `gentle-shell setup` in a terminal to see the details.",
 		"persist-path": "`pnpm setup` could not add the global bin directory to your PATH. Run `pnpm setup` in a terminal, then open a new terminal.",
+		"build-gentle-ai-main": `Gentle AI could not be built from its latest \`main\` commit. Check your network connection and that \`go\` runs in a terminal. ${tryAgain}`,
+		"install-shell-main": `Gentle Shell could not be installed from its latest \`main\` commit. Check your network connection. ${tryAgain}`,
+		"record-channel": "Gentle Shell is installed from `main`, but the channel could not be saved under `~/.pi/gentle-ai`. Check that folder's permissions, then run the installer again.",
 	}),
 	blockers: Object.freeze({
 		"unsupported-target": "This operating system or CPU is not supported by the wizard. Follow the README for a manual installation.",
 		"unknown-tool": "A required tool could not be checked safely. Make sure it runs from a terminal, or remove the broken installation, then run the installer again.",
 		"incompatible-tool": "A required tool is installed at an incompatible version. Update it, then run the installer again.",
+		"main-requires-go": `The \`main\` channel builds Gentle AI from source and needs Go ${requirements.go} or newer on your PATH. Install Go, or choose the release channel, then select Check again.`,
 	}),
 	outcomes: Object.freeze({
 		ready: "Gentle Shell is installed. Run `gentle-shell` in a terminal.",
@@ -167,6 +175,49 @@ function fingerprint(collected) {
 }
 
 /** Browser view of a server-held plan: fixed descriptions, never commands. */
+// Tools whose requirement is a minimum version, with their fixed labels. The
+// Shell probe only inspects pnpm's global packages, so its remedy names pnpm.
+const minimumTools = Object.freeze({
+	node: { label: "Node.js", where: "" },
+	pi: { label: "Pi", where: "" },
+	shell: { label: "Gentle Shell", where: " globally with pnpm",
+		remedy: (required) => `Update it with \`pnpm add -g gentle-pi@${required}\`, or remove it with \`pnpm remove -g gentle-pi\`` },
+});
+// A Pi or Shell command found on PATH that pnpm does not manage.
+const outsidePnpmTools = Object.freeze({
+	pi: { label: "Pi", command: "pi", pkg: "@earendil-works/pi-coding-agent" },
+	shell: { label: "Gentle Shell", command: "gentle-shell", pkg: "gentle-pi" },
+});
+const STABLE = /^v?(\d{1,6})\.(\d{1,6})\.(\d{1,6})$/;
+function older(found, required) {
+	const [a, b] = [STABLE.exec(found), STABLE.exec(required)];
+	if (!a || !b) return false;
+	for (let index = 1; index <= 3; index += 1) {
+		if (Number(a[index]) !== Number(b[index])) return Number(a[index]) < Number(b[index]);
+	}
+	return false;
+}
+/** Names the found and required versions when an incompatible tool is simply
+ * older than its minimum, and explains a Pi or Shell installed outside pnpm;
+ * anything else keeps the fixed guidance. */
+function blockerGuidance(blocker, inventory, plan) {
+	const fixed = guidance.blockers[blocker.code] ?? guidance.fallback;
+	if (blocker.code === "unknown-tool" && Object.hasOwn(outsidePnpmTools, blocker.tool) && inventory?.[blocker.tool]?.outsidePnpm === true) {
+		const { label, command, pkg } = outsidePnpmTools[blocker.tool];
+		return `${label} is already installed, but not with pnpm: the \`${command}\` command on your PATH comes from another installation, ` +
+			"so this installer cannot check or update it. Nothing was replaced. Keep using that installation, or remove it " +
+			`(for example with \`npm uninstall -g ${pkg}\`), then select Check again.`;
+	}
+	const tool = Object.hasOwn(minimumTools, blocker.tool) ? minimumTools[blocker.tool] : null;
+	if (blocker.code !== "incompatible-tool" || tool === null) return fixed;
+	const found = inventory?.[blocker.tool]?.version;
+	const required = plan.tools?.[blocker.tool]?.required;
+	if (typeof found !== "string" || typeof required !== "string" || !older(found, required)) return fixed;
+	const version = found.replace(/^v/, "");
+	const remedy = tool.remedy ? tool.remedy(required) : "Update it";
+	return `${tool.label} ${version} is installed${tool.where}, but this installer needs ${required} or newer. Nothing was replaced. ${remedy}, then select Check again.`;
+}
+
 function planView(planId, { inventory, plan }) {
 	const ids = plan.actions.map((action) => action.id);
 	const binDir = typeof inventory?.globalBin?.path === "string" ? inventory.globalBin.path : null;
@@ -187,7 +238,7 @@ function planView(planId, { inventory, plan }) {
 		blockers: plan.blockers.map((blocker) => ({
 			code: identifier(blocker.code),
 			tool: toolName(blocker.tool),
-			guidance: guidance.blockers[blocker.code] ?? guidance.fallback,
+			guidance: blockerGuidance(blocker, inventory, plan),
 		})),
 		profileChange: {
 			changesProfile,
@@ -234,7 +285,7 @@ function outcomeView(result) {
 
 /**
  * createInstallerServer({ collectPlan, runInstall, assetsDir, now?, random?, limits?, onRedeemed? })
- * collectPlan() -> { inventory, plan } (fresh preflight, trusted local code);
+ * collectPlan(channel) -> { inventory, plan } for "release" or "main" (fresh preflight, trusted local code);
  * runInstall({ plan, consent: true }, log) -> runner result; onRedeemed() runs once
  * when the one-time code is used (it must not throw). Returns
  * { listen(), close(reason), closed, checkIdle(), outcome() }.
@@ -249,7 +300,7 @@ export function createInstallerServer({ collectPlan, runInstall, assetsDir, now 
 	let origin = "";
 	let lastActivity = now();
 	let stored = null;
-	let planning = null;
+	const planning = { release: null, main: null };
 	let installing = false;
 	let lastOutcome = null;
 	let seq = 0;
@@ -318,12 +369,21 @@ export function createInstallerServer({ collectPlan, runInstall, assetsDir, now 
 		while (log.length > limit.logEntries) log.shift();
 	}
 
-	function collect() {
-		planning ??= Promise.resolve().then(collectPlan).finally(() => { planning = null; });
-		return planning;
+	// One in-flight inventory per channel: the channels plan different steps.
+	function collect(channel) {
+		planning[channel] ??= Promise.resolve().then(() => collectPlan(channel)).finally(() => { planning[channel] = null; });
+		return planning[channel];
 	}
 
-	async function getPlan(res) {
+	async function getPlan(query, res) {
+		// Only `?channel=release` or `?channel=main`; no query means release.
+		const params = new URLSearchParams(query);
+		const keys = [...params.keys()];
+		const channel = query === "" ? "release" : params.get("channel");
+		if ((query !== "" && (keys.length !== 1 || keys[0] !== "channel")) || !["release", "main"].includes(channel)) {
+			reply(res, 400, { error: "invalid-request" });
+			return;
+		}
 		// Probing while the runner mutates the machine would describe a moving target.
 		if (installing) {
 			reply(res, 409, { error: "install-running" });
@@ -331,7 +391,7 @@ export function createInstallerServer({ collectPlan, runInstall, assetsDir, now 
 		}
 		let collected;
 		try {
-			collected = await collect();
+			collected = await collect(channel);
 		} catch {
 			reply(res, 500, { error: "plan-unavailable" });
 			return;
@@ -340,8 +400,8 @@ export function createInstallerServer({ collectPlan, runInstall, assetsDir, now 
 			reply(res, 409, { error: "install-running" });
 			return;
 		}
-		stored = { planId: token(random, 18), collected: structuredClone(collected), fingerprint: fingerprint(collected) };
-		reply(res, 200, planView(stored.planId, stored.collected));
+		stored = { planId: token(random, 18), channel, collected: structuredClone(collected), fingerprint: fingerprint(collected) };
+		reply(res, 200, { ...planView(stored.planId, stored.collected), channel });
 	}
 
 	async function install(req, res) {
@@ -372,7 +432,7 @@ export function createInstallerServer({ collectPlan, runInstall, assetsDir, now 
 		let fresh;
 		try {
 			// Re-inventory: install only when the machine still matches the consented plan.
-			fresh = await collect();
+			fresh = await collect(current.channel);
 		} catch {
 			fresh = null;
 		}
@@ -471,9 +531,9 @@ export function createInstallerServer({ collectPlan, runInstall, assetsDir, now 
 			const type = String(req.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
 			if (type !== "application/json") return reply(res, 415, { error: "unsupported-media-type" });
 		}
-		if (query !== "" && path !== "/api/progress") return reply(res, 400, { error: "invalid-request" });
+		if (query !== "" && path !== "/api/progress" && path !== "/api/plan") return reply(res, 400, { error: "invalid-request" });
 		if (Object.hasOwn(assets, path)) return asset(path, res);
-		if (path === "/api/plan") return getPlan(res);
+		if (path === "/api/plan") return getPlan(query, res);
 		if (path === "/api/progress") return progress(query, res);
 		if (path === "/api/install") return install(req, res);
 		// /api/shutdown

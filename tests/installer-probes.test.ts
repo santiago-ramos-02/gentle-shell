@@ -245,11 +245,11 @@ test("a failed, unparseable or ambiguous global list makes Pi, Shell, Gentle AI 
 	assert.deepEqual(await h.probes.shell(), { available: null });
 });
 
-test("Pi or Shell on the user's PATH but not pnpm-global is unknown, never absent", async () => {
+test("Pi or Shell on the user's PATH but not pnpm-global is unknown, never absent, and says so", async () => {
 	const h = probes({ files: [TOOLS_PNPM, "/usr/local/bin/pi", "/usr/local/bin/gentle-shell"],
 		env: { HOME, PATH: `${TOOLS}/pnpm/bin:/usr/local/bin` }, results: pnpmVersion });
-	assert.deepEqual(await h.probes.pi(), { available: null });
-	assert.deepEqual(await h.probes.shell(), { available: null });
+	assert.deepEqual(await h.probes.pi(), { available: null, outsidePnpm: true });
+	assert.deepEqual(await h.probes.shell(), { available: null, outsidePnpm: true });
 	assert.deepEqual(await h.probes.setup(), { available: null });
 });
 
@@ -326,6 +326,20 @@ test("host adapters: argv without a shell, exit codes, deadlines and bounded out
 	const missing = await run(join(tmpdir(), "gentle-probe-missing-command"), [], { env, deadlineMs: 10_000 });
 	assert.equal(missing.code, null);
 	assert.equal(missing.timedOut, false);
+});
+
+test("host run runs in the requested working directory, and in the current one without it", async () => {
+	const { run } = hostAdapters();
+	const env = { PATH: process.env.PATH ?? "" };
+	const directory = realpathSync(mkdtempSync(join(tmpdir(), "gentle-probe-cwd-")));
+	try {
+		const inside = await run(process.execPath, ["-e", "process.stdout.write(process.cwd())"], { env, cwd: directory, deadlineMs: 10_000 });
+		assert.equal(inside.stdout, directory);
+		const ambient = await run(process.execPath, ["-e", "process.stdout.write(process.cwd())"], { env, deadlineMs: 10_000 });
+		assert.equal(ambient.stdout, process.cwd());
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
 });
 
 test("host run discards stderr unless a bounded stderr tail is requested", async () => {

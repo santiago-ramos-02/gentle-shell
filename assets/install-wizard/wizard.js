@@ -29,6 +29,9 @@ export const stepLabels = Object.freeze({
 	"verify-gentle-ai": "Verify Gentle AI",
 	"shell-setup": "Run gentle-shell setup",
 	"persist-path": "Add the global bin directory to PATH",
+	"build-gentle-ai-main": "Build Gentle AI from main",
+	"install-shell-main": "Install Gentle Shell from main",
+	"record-channel": "Save the main channel",
 });
 export function stepLabel(id) {
 	return typeof id === "string" && Object.hasOwn(stepLabels, id) ? stepLabels[id] : String(id);
@@ -76,6 +79,14 @@ function list(value) {
  * The runner's fixed step sequence for a plan, used to show upcoming steps.
  * It mirrors runStandardInstall; progressModel tolerates any divergence.
  */
+// The main channel overlay the runner adds after verifying the release install.
+const mainSteps = ["build-gentle-ai-main", "install-shell-main", "record-channel"];
+function withMain(ids, steps) {
+	if (!ids.has("install-shell-main")) return steps;
+	const at = steps.indexOf("shell-setup");
+	return [...steps.slice(0, at), ...mainSteps, ...steps.slice(at)];
+}
+
 export function expectedSteps(actionIds) {
 	const ids = new Set(list(actionIds));
 	const addNpm = ids.has("persist-package-managers") || ids.has("persist-npm");
@@ -84,7 +95,7 @@ export function expectedSteps(actionIds) {
 		// Setup recovery re-verifies the installed stack and never reinstalls it.
 		const steps = ["check-npm", "check-global-bin", "check-recoverable-stack", "verify-global-list", "verify-shell-bin",
 			"verify-gentle-ai", "shell-setup"];
-		return ids.has("setup-global-bin") ? [...steps, "persist-path"] : steps;
+		return withMain(ids, ids.has("setup-global-bin") ? [...steps, "persist-path"] : steps);
 	}
 	// An npm that is about to be installed is checked after it is added.
 	const steps = [...(addNpm ? [] : ["check-npm"]), "check-global-bin", "check-existing-stack"];
@@ -98,12 +109,12 @@ export function expectedSteps(actionIds) {
 	}
 	steps.push("install-global", "verify-global-list", "verify-shell-bin", "verify-gentle-ai", "shell-setup");
 	if (ids.has("setup-global-bin")) steps.push("persist-path");
-	return steps;
+	return withMain(ids, steps);
 }
 
 /** The runner's fixed setup recovery: only setup, readiness and optionally PATH. */
 function recoveryPlan(actionIds) {
-	const ids = list(actionIds);
+	const ids = list(actionIds).filter((id) => !mainSteps.includes(id));
 	return ["setup-shell", "verify-readiness"].every((id) => ids.includes(id)) &&
 		ids.every((id) => ["setup-global-bin", "setup-shell", "verify-readiness"].includes(id));
 }
@@ -126,6 +137,7 @@ export function planModel(view) {
 	const tools = list(persistence.tools).filter((tool) => typeof tool === "string");
 	return {
 		planId: text(view?.planId),
+		channel: view?.channel === "main" ? "main" : "release",
 		kind,
 		actions,
 		blockers,
@@ -339,12 +351,36 @@ function disclosureCard(doc, item) {
 		item.detail ? el(doc, "p", { class: "detail" }, el(doc, "code", {}, item.detail)) : null);
 }
 
-/** Review screen. handlers: install({ consent, checkbox, button }), reload(), close(). */
+const channels = Object.freeze([
+	{ value: "release", label: "Latest release", hint: "Recommended. The published Gentle Shell and its pinned Gentle AI binary." },
+	{ value: "main", label: "Latest main", hint: "Development builds: Gentle Shell and Gentle AI from the latest commit of `main`, built on this computer. Needs Go." },
+]);
+
+/** Channel choice shown on every review screen; a change reloads the plan. */
+function channelChoice(doc, model, handlers) {
+	return el(doc, "fieldset", { class: "block channel" },
+		el(doc, "legend", { class: "section-title" }, "What to install"),
+		channels.map((channel) => {
+			const id = `channel-${channel.value}`;
+			const input = el(doc, "input", { type: "radio", name: "channel", id, value: channel.value, class: "channel-input" });
+			input.checked = model.channel === channel.value;
+			input.addEventListener("change", () => {
+				if (input.checked && model.channel !== channel.value) handlers.channelChanged?.(channel.value);
+			});
+			return el(doc, "div", { class: "channel-option" }, input,
+				el(doc, "label", { for: id, class: "channel-label" }, channel.label),
+				el(doc, "p", { class: "hint" }, rich(doc, channel.hint)));
+		}));
+}
+
+/** Review screen. handlers: install({ consent, checkbox, button }), reload(), close(), channelChanged(channel). */
 export function renderPlan(doc, model, handlers) {
 	const close = actionButton(doc, "Close installer", "ghost", () => handlers.close());
+	const choice = channelChoice(doc, model, handlers);
 	if (model.kind === "blocked") {
 		return panel(doc, { stage: "review", eyebrow: "Step 2 of 4 · Review", title: "Something needs attention first",
 			lead: "Nothing was changed. Resolve these items, then check again.", tone: "warning" },
+		choice,
 		el(doc, "ul", { class: "blockers", role: "list" }, model.blockers.map((blocker) => el(doc, "li", { class: "alert alert-warning" },
 			el(doc, "h2", { class: "alert-title" }, el(doc, "span", { "aria-hidden": "true" }, "! "), blocker.toolLabel),
 			el(doc, "p", {}, rich(doc, blocker.guidance)),
@@ -354,7 +390,10 @@ export function renderPlan(doc, model, handlers) {
 	if (model.kind === "nothing") {
 		return panel(doc, { stage: "review", eyebrow: "Step 2 of 4 · Review", title: "Gentle Shell is already set up",
 			lead: "This computer already has everything the wizard installs." },
-		el(doc, "p", {}, rich(doc, "Run `gentle-shell` in a terminal. To upgrade, run `gentle-shell update`.")),
+		choice,
+		el(doc, "p", {}, rich(doc, model.channel === "main"
+			? "Run `gentle-shell` in a terminal. To follow main, run `gentle-shell upgrade --channel main`."
+			: "Run `gentle-shell` in a terminal. To upgrade, run `gentle-shell upgrade`.")),
 		el(doc, "div", { class: "actions" }, close));
 	}
 	const recovery = model.kind === "recovery";
@@ -371,6 +410,7 @@ export function renderPlan(doc, model, handlers) {
 		: { title: "Review the installation plan",
 			lead: "Nothing changes until you confirm. This is exactly what the installer will do on this computer." };
 	return panel(doc, { stage: "review", eyebrow: "Step 2 of 4 · Review", ...heading },
+	choice,
 	el(doc, "section", { class: "block", "aria-labelledby": "changes-title" },
 		el(doc, "h2", { id: "changes-title", class: "section-title" }, "What changes on this computer"),
 		el(doc, "div", { class: "grid" }, model.disclosures.map((item) => disclosureCard(doc, item)))),
@@ -531,7 +571,7 @@ export function createWizard({ document: doc, fetch: request, setTimeout: later,
 		status: doc.getElementById("status"),
 	};
 	const state = { plan: null, steps: [], entries: [], lastSeq: 0, poll: initialPoll(), timer: null, outcome: null, busy: false,
-		progress: null, running: false };
+		progress: null, running: false, channel: "release" };
 
 	async function api(path, { method = "GET", body } = {}) {
 		const init = { method, headers: { ...API_HEADERS }, credentials: "same-origin", cache: "no-store" };
@@ -607,7 +647,7 @@ export function createWizard({ document: doc, fetch: request, setTimeout: later,
 		clearError();
 		let result;
 		try {
-			result = await api("/api/plan");
+			result = await api(`/api/plan?channel=${state.channel === "main" ? "main" : "release"}`);
 		} catch {
 			showError(noAnswer, () => loadPlan(notice));
 			return;
@@ -620,7 +660,11 @@ export function createWizard({ document: doc, fetch: request, setTimeout: later,
 		}
 		state.plan = planModel(result.body);
 		state.steps = state.plan.steps;
-		show(renderPlan(doc, state.plan, { install, reload: () => loadPlan(), close, consentChanged: (checked) => { if (checked) clearError(); } }));
+		show(renderPlan(doc, state.plan, { install, reload: () => loadPlan(), close, consentChanged: (checked) => { if (checked) clearError(); },
+			channelChanged: (channel) => {
+				state.channel = channel;
+				return loadPlan();
+			} }));
 		if (notice) showError(notice, null, { tone: "warning", title: "Plan updated" });
 	}
 

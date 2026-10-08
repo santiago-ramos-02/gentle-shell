@@ -1059,6 +1059,114 @@ test("Windows setup recovery needs no Go: it never runs add -g, and the native b
 });
 
 // Declared last: node:test runs a file's top-level tests in order.
+const AI_SHA = "1f9d5e6423e37f7d2316859045f379ba9b5d8c3a";
+const SHELL_SHA = "6e7e3a18f794223396527a54c7c36d19c7d236c6";
+const MAIN_VERSION = `${requirements.shell}-main.6e7e3a18f794`;
+const MAIN_ROOT = `${PNPM_HOME}/global/v11/def/node_modules/gentle-pi`;
+const MAIN_TGZ = `${HOME}/.pi/gentle-ai/main/packages/gentle-pi-${MAIN_VERSION}.tgz`;
+function mainPlan(change: object = {}) {
+	return planPreflight({ platform: "linux", arch: "x64", node: tool("24.18.0"), pnpm: { ...tool("11.1.1"), compatible: true },
+		pi: absent, shell: absent, gentleAi: absent, go: tool("1.26.0"),
+		globalBin: { available: true, path: BIN, writable: true, onPath: true }, setup: false, ...change }, { channel: "main" });
+}
+function mainChannel() {
+	const calls: Array<[string, object]> = [];
+	return {
+		calls,
+		adapter: {
+			resolveCommit: async (repository: string) => {
+				calls.push(["resolveCommit", { repository }]);
+				return repository.endsWith("/gentle-ai") ? AI_SHA : SHELL_SHA;
+			},
+			buildGentleAi: async (request: { commit: string; goPath: string; platform: string; ctx: object }) => {
+				calls.push(["buildGentleAi", { commit: request.commit, goPath: request.goPath, platform: request.platform, ctx: request.ctx }]);
+				return { binaryPath: "/main/gentle-ai", version: "4.0.1-0.20261008202137-1f9d5e6423e3" };
+			},
+			packShell: async (request: { commit: string; ctx: object }) => {
+				calls.push(["packShell", { commit: request.commit, ctx: request.ctx }]);
+				return MAIN_TGZ;
+			},
+			writeChannel: async (ctx: object, state: object) => {
+				calls.push(["writeChannel", { ctx, state }]);
+			},
+		},
+	};
+}
+const MAIN_ADD = `add -g ${MAIN_TGZ} --allow-build=gentle-pi`;
+function mainHarness(mainListing = listing(PI_INSTALL_VERSION, MAIN_VERSION, MAIN_ROOT), extra: object = {}) {
+	const h = harness({ files: ["/usr/bin/go"], realpaths: { [MAIN_ROOT]: MAIN_ROOT },
+		results: { [LIST]: [emptyList, { code: 0, stdout: listing() }, { code: 0, stdout: mainListing }],
+			[`${MAIN_ROOT}/bin/gentle-shell.mjs setup`]: { code: 0 } }, ...extra });
+	const main = mainChannel();
+	return { ...h, main, adapters: { ...h.adapters, mainChannel: main.adapter } };
+}
+
+test("the main plan builds Gentle AI and installs the main Shell after the verified release install, then sets up the main Shell", async () => {
+	const h = mainHarness();
+	const result = await runStandardInstall({ plan: mainPlan(), consent: true }, h.adapters);
+	assert.equal(result.outcome, "ready");
+	assert.deepEqual(result.completed, ["check-npm", "check-global-bin", "check-existing-stack", "install-global",
+		"verify-global-list", "verify-shell-bin", "verify-gentle-ai", "build-gentle-ai-main", "install-shell-main", "record-channel", "shell-setup"]);
+	assert.deepEqual(h.pnpmCalls(), ["bin -g", LIST, INSTALL, LIST, MAIN_ADD, LIST]);
+	const ctx = { env: h.adapters.env, home: HOME };
+	assert.deepEqual(h.main.calls, [
+		["resolveCommit", { repository: "Gentleman-Programming/gentle-ai" }],
+		["buildGentleAi", { commit: AI_SHA, goPath: "/usr/bin/go", platform: "linux", ctx }],
+		["resolveCommit", { repository: "Gentleman-Programming/gentle-shell" }],
+		["packShell", { commit: SHELL_SHA, ctx }],
+		["writeChannel", { ctx, state: { channel: "main", shellCommit: SHELL_SHA, gentleAiCommit: AI_SHA } }],
+	]);
+	assert.deepEqual(h.calls.at(-1)?.args, [`${MAIN_ROOT}/bin/gentle-shell.mjs`, "setup"]);
+	// The release package's own integrity check ran before the override was registered.
+	assert.deepEqual(h.integrityCalls, [{ packageRoot: PACKAGE_ROOT, platform: "linux", env: h.adapters.env, home: HOME }]);
+});
+
+test("a main Shell that pnpm does not list at the main version of that commit fails before recording the channel", async () => {
+	for (const mainListing of [listing(), listing(PI_INSTALL_VERSION, `${requirements.shell}-main.aaaaaaaaaaaa`, MAIN_ROOT)]) {
+		const h = mainHarness(mainListing);
+		const result = await runStandardInstall({ plan: mainPlan(), consent: true }, h.adapters);
+		assert.equal(result.outcome, "failed");
+		assert.equal(result.failedStep, "install-shell-main");
+		assert.equal(h.main.calls.some(([name]) => name === "writeChannel"), false);
+		assert.equal(h.calls.some((call) => call.args[1] === "setup"), false);
+	}
+});
+
+test("the main build fails without Go on PATH and runs nothing after it", async () => {
+	const h = harness({ results: { [LIST]: [emptyList, { code: 0, stdout: listing() }] } });
+	const main = mainChannel();
+	const result = await runStandardInstall({ plan: mainPlan(), consent: true }, { ...h.adapters, mainChannel: main.adapter });
+	assert.equal(result.outcome, "failed");
+	assert.equal(result.failedStep, "build-gentle-ai-main");
+	assert.deepEqual(main.calls.map(([name]) => name), []);
+});
+
+test("a channel that cannot be recorded fails the record step after the main Shell is installed", async () => {
+	const h = mainHarness();
+	h.adapters.mainChannel.writeChannel = async () => { throw new Error("EACCES /home/u/.pi"); };
+	const result = await runStandardInstall({ plan: mainPlan(), consent: true }, h.adapters);
+	assert.equal(result.outcome, "failed");
+	assert.equal(result.failedStep, "record-channel");
+	assert.equal(JSON.stringify(result).includes("EACCES"), false);
+});
+
+test("a release plan never uses the main channel", async () => {
+	const h = harness();
+	const main = mainChannel();
+	const result = await runStandardInstall({ plan: plan(), consent: true }, { ...h.adapters, mainChannel: main.adapter });
+	assert.equal(result.outcome, "ready");
+	assert.deepEqual(main.calls, []);
+});
+
+test("a partial set of main steps is an unsupported plan", async () => {
+	const partial = mainPlan();
+	partial.actions = partial.actions.filter((action: { id: string }) => action.id !== "record-channel");
+	const h = mainHarness();
+	const result = await runStandardInstall({ plan: partial, consent: true }, h.adapters);
+	assert.deepEqual([result.outcome, result.reason], ["blocked", "unsupported-plan"]);
+	assert.deepEqual(h.calls, []);
+});
+
 test("exported blocked reasons and failed steps match what the scenarios observed", () => {
 	assert.ok(Object.isFrozen(blockedReasons) && Object.isFrozen(failedSteps));
 	assert.equal(new Set(blockedReasons).size, blockedReasons.length);
@@ -1069,3 +1177,4 @@ test("exported blocked reasons and failed steps match what the scenarios observe
 	assert.deepEqual(blockedReasons.filter((reason) => !observed.reasons.has(reason)), []);
 	assert.deepEqual(failedSteps.filter((step) => !observed.steps.has(step)), ["persist-npm", "persist-pnpm"]);
 });
+

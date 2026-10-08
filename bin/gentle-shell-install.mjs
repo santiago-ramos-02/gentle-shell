@@ -8,6 +8,7 @@ import { collectInventory, planPreflight } from "../scripts/installer-preflight.
 import { createProbes, hostAdapters, userEnvironment } from "../scripts/installer-probes.mjs";
 import { packageNativeGentleAi, pnpmInvocation, runStandardInstall } from "../scripts/installer-runner.mjs";
 import { createInstallerServer } from "../scripts/installer-server.mjs";
+import { mainChannelAdapter } from "../scripts/main-channel.mjs";
 
 // Browser installation wizard entry, started by the bootstrap with no argv.
 // Thin wiring only: real probes and adapters, the standard runner and the
@@ -129,10 +130,10 @@ async function main() {
 			void redirect?.remove();
 		},
 		assetsDir: fileURLToPath(new URL("../assets/install-wizard/", import.meta.url)),
-		collectPlan: async () => {
+		collectPlan: async (channel) => {
 			// Fresh probes every time: createProbes caches its global package listing.
 			const inventory = await collectInventory({ platform, arch, probes: createProbes({ platform, env, run, fs }) });
-			return { inventory, plan: planPreflight(inventory) };
+			return { inventory, plan: planPreflight(inventory, { channel }) };
 		},
 		runInstall: async (request, log) => runStandardInstall(request, {
 			platform,
@@ -141,6 +142,8 @@ async function main() {
 			run,
 			fs,
 			verifyGentleAi: packageNativeGentleAi,
+			// Only a main plan uses it: network access and writes under ~/.pi/gentle-ai.
+			mainChannel: mainChannelAdapter({ fs: fsPromises }),
 			log,
 		}),
 	});
