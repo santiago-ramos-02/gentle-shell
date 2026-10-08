@@ -53,7 +53,7 @@ test("public Anthropic non-strict adapter preserves the complete review tool dec
 	assert.deepEqual(controller.required, ["operation"]);
 	assert.deepEqual(Object.keys(controller.properties).sort(), ["operation", "lineageId", "selectionBinding", "intendedUntracked", "untrackedScope", "changeName", "idempotencyKey", "transition", "input", "outputPath", "inputPath", "operationId", "lineageIds", "workspaceRoot"].sort());
 	assert.ok(controller.properties.input.anyOf.some((schema: any) => schema.type === "object"));
-	assert.match(controller.properties.input.description, /START\/ASSESS only/);
+	assert.match(controller.properties.input.description, /START\/ASSESS\/answer-consent only/);
 	assert.deepEqual(controller.properties.operation.enum, tools.get("gentle_review").parameters.properties.operation.enum);
 	for (const name of ["gentle_review_capture", "gentle_review_capture_group"]) {
 		const schema = emitted.get(name);
@@ -66,7 +66,7 @@ test("public Anthropic non-strict adapter preserves the complete review tool dec
 	let nativeCalls = 0;
 	const native = new Proxy({}, { get() { return async () => { nativeCalls++; }; } }) as NativeReviewCli;
 	for (const operation of ["start", "assess", "answer-consent", "inspect", "reset", "recover"]) {
-		const inputs = operation === "start" || operation === "assess" ? [null] : [null, { consentBinding: "opaque", answer: "granted" }];
+		const inputs = operation === "start" || operation === "assess" || operation === "answer-consent" ? [null] : [null, { consentBinding: "opaque", answer: "granted" }];
 		for (const input of inputs) {
 			const args = validateToolArguments({ ...tools.get("gentle_review"), parameters: controller }, { type: "toolCall", id: "provider-shell", name: "gentle_review", arguments: { operation, input } });
 			assert.deepEqual(args.input, input, "provider-shell validation accepts and retains this input");
@@ -131,8 +131,17 @@ test("actual validation rejects arrays, null and coerced primitives rather than 
 	assert.equal(calls, 0);
 });
 
+test("answer-consent accepts the consent object the same as its serialized string", async () => {
+	const input = { consentBinding: "unknown-binding", answer: "granted" };
+	const native = {} as NativeReviewCli;
+	assert.equal(__testing.parseReviewControllerParameters(validate("gentle_review", { operation: "answer-consent", input })).input, JSON.stringify(input));
+	const fromObject = await __testing.executeReviewControllerOperation(validate("gentle_review", { operation: "answer-consent", input }), process.cwd(), native);
+	const fromString = await __testing.executeReviewControllerOperation(validate("gentle_review", { operation: "answer-consent", input: JSON.stringify(input) }), process.cwd(), native);
+	assert.deepEqual(fromObject, fromString);
+});
+
 test("all other controller operations keep object input fail-closed at the facade boundary (#1698)", async () => {
-	const operations = (tools.get("gentle_review").parameters.properties.operation.enum as string[]).filter((operation) => operation !== "start" && operation !== "assess" && operation !== "select-intended-untracked");
+	const operations = (tools.get("gentle_review").parameters.properties.operation.enum as string[]).filter((operation) => operation !== "start" && operation !== "assess" && operation !== "answer-consent" && operation !== "select-intended-untracked");
 	let calls = 0;
 	const native = new Proxy({}, { get() { return async () => { calls++; throw new Error("unexpected native execution"); }; } }) as NativeReviewCli;
 	for (const operation of operations) {
