@@ -2150,6 +2150,35 @@ test("an existing isolated home gains the exclusion after its own extension entr
 	}
 });
 
+// Pi 1.0.1 lets gentle-pi draw the builtin codemode instead of replacing it.
+// There the exclusion silences nothing and removes codemode, the only way a
+// child reaches MCP tools, so an owned home loses it instead of gaining it.
+test("on Pi 1.0.1 or later a fresh owned home gets no exclusion and an existing one loses it", (t) => {
+	const fresh = fixture(t);
+	writePiScript(fresh.piScript, "1.1.0");
+	const first = run(fresh.env, ["--mode", "rpc"]);
+	assert.equal(first.status, 0, first.stderr);
+	assert.equal(JSON.parse(settingsText(fresh.gentleShellHome)).extensions, undefined);
+
+	for (const [extensions, expected] of [[["./ext/a.ts", CODEMODE_EXCLUSION], ["./ext/a.ts"]], [[CODEMODE_EXCLUSION], undefined]] as const) {
+		const f = fixture(t);
+		writePiScript(f.piScript, "1.1.0");
+		mkdirSync(f.gentleShellHome, { recursive: true });
+		writeFileSync(join(f.gentleShellHome, "settings.json"), `${JSON.stringify({ tuiMode: "fullscreen", extensions }, null, 2)}\n`);
+
+		const result = run(f.env, ["--mode", "rpc"]);
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(settingsText(f.gentleShellHome), `${JSON.stringify({ tuiMode: "fullscreen", ...(expected ? { extensions: expected } : {}) }, null, 2)}\n`);
+		assert.match(result.stderr, /re-enabled Pi's builtin codemode/);
+
+		const before = settingsText(f.gentleShellHome);
+		const second = run(f.env, ["--mode", "rpc"]);
+		assert.equal(second.status, 0, second.stderr);
+		assert.equal(settingsText(f.gentleShellHome), before);
+		assert.doesNotMatch(second.stderr, /builtin codemode/);
+	}
+});
+
 test("an explicit user entry for builtin:codemode is left byte-identical", (t) => {
 	for (const entry of ["+builtin:codemode", "!builtin:codemode", "builtin:codemode", CODEMODE_EXCLUSION]) {
 		const f = fixture(t);

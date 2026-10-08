@@ -14,8 +14,8 @@ import { isAbsolute } from "node:path";
 import { resolveGentleAiDevBinaryOverride, type GentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { GentleAiElapsedTimingLedger } from "../lib/gentle-ai-elapsed-store.ts";
 import { quietToolsEnabled } from "../lib/quiet-tools-config.ts";
-import { registerCompactCodemode } from "../lib/codemode-renderer.ts";
-import { offerBuiltinCodemodeOptOut, type BuiltinCodemodeOptOutOptions } from "../lib/builtin-codemode-optout.ts";
+import { hasToolRenderers, registerCompactCodemode } from "../lib/codemode-renderer.ts";
+import { offerBuiltinCodemodeOptOut, restoreBuiltinCodemode, type BuiltinCodemodeOptOutOptions } from "../lib/builtin-codemode-optout.ts";
 import { getGentleAiRenderState, renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import {
 	CARD_TONE, cardAwaitingResult, cardBottom, cardInnerWidth, cardLine, cardRunningLine, cardStyle, cardTopRows, floatRows, markCardResult,
@@ -822,11 +822,17 @@ export default function quietTools(
 	let codemodeOptOutOffered = false;
 	pi.on("session_start", (_event, ctx) => {
 		elapsedTiming = new GentleAiElapsedTimingLedger(ctx.sessionManager, pi);
-		// The compact codemode below displaces Pi's builtin, which makes Pi warn
-		// at startup. Offer the settings opt-out once per process, detached so
-		// the dialog never holds up startup; the offer itself never throws.
+		// On older Pi the compact codemode below displaces Pi's builtin, which
+		// makes Pi warn at startup. Offer the settings opt-out once per process,
+		// detached so the dialog never holds up startup; the offer itself never
+		// throws. Pi 1.0.1 and later let gentle-pi draw the builtin instead, so
+		// an opt-out there is taken back.
 		if (codemodeOptOutOffered) return;
 		codemodeOptOutOffered = true;
+		if (hasToolRenderers(pi)) {
+			restoreBuiltinCodemode(ctx, codemodeOptOut);
+			return;
+		}
 		let effectiveExtensions: unknown;
 		try { effectiveExtensions = pi.getSettings().extensions; } catch { /* Fall back to the settings file alone. */ }
 		void offerBuiltinCodemodeOptOut(ctx, { ...codemodeOptOut, effectiveExtensions });

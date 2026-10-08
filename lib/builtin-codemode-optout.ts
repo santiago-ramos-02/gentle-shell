@@ -69,6 +69,27 @@ export function withBuiltinExtensionExcluded(settingsText: string, builtin = BUI
 	return settingsText.endsWith("\n") ? `${serialized}\n` : serialized;
 }
 
+// Pure: mirrors withBuiltinExtensionRestored in bin/gentle-shell.mjs. Returns
+// `settingsText` without its `-<builtin>` entries, dropping an `extensions`
+// array that held only them, or undefined when there is none or the text is
+// not a JSON object with an `extensions` array.
+export function withBuiltinExtensionRestored(settingsText: string, builtin = BUILTIN_CODEMODE_EXTENSION): string | undefined {
+	let settings: unknown;
+	try {
+		settings = JSON.parse(settingsText);
+	} catch {
+		return undefined;
+	}
+	if (typeof settings !== "object" || settings === null || Array.isArray(settings)) return undefined;
+	const { extensions: current, ...rest } = settings as { extensions?: unknown };
+	if (!Array.isArray(current)) return undefined;
+	const extensions = current.filter((entry) => entry !== `-${builtin}`);
+	if (extensions.length === current.length) return undefined;
+	const indent = settingsText.match(/\{\r?\n([ \t]+)/)?.[1];
+	const serialized = JSON.stringify(extensions.length > 0 ? { ...settings, extensions } : rest, null, indent);
+	return settingsText.endsWith("\n") ? `${serialized}\n` : serialized;
+}
+
 export function builtinCodemodeOptOutStatePath(configHome = gentlePiConfigHome()): string {
 	return join(configHome, "builtin-codemode-optout.json");
 }
@@ -82,24 +103,28 @@ function readIfExists(path: string): string | undefined {
 	}
 }
 
-function readDeclined(configHome: string): string[] {
+// `declined` lists settings files whose opt-out prompt was declined;
+// `restored` lists settings files whose opt-out gentle-pi took back.
+type OptOutState = { declined: string[]; restored: string[] };
+
+function readState(configHome: string): OptOutState {
 	try {
 		const value: unknown = JSON.parse(readIfExists(builtinCodemodeOptOutStatePath(configHome)) ?? "null");
-		if (typeof value !== "object" || value === null || (value as { schema?: unknown }).schema !== BUILTIN_CODEMODE_OPTOUT_SCHEMA) return [];
-		const declined = (value as { declined?: unknown }).declined;
-		return Array.isArray(declined) ? declined.filter((path): path is string => typeof path === "string") : [];
-	} catch { return []; }
+		if (typeof value !== "object" || value === null || (value as { schema?: unknown }).schema !== BUILTIN_CODEMODE_OPTOUT_SCHEMA) return { declined: [], restored: [] };
+		const paths = (list: unknown) => (Array.isArray(list) ? list.filter((path): path is string => typeof path === "string") : []);
+		return { declined: paths((value as { declined?: unknown }).declined), restored: paths((value as { restored?: unknown }).restored) };
+	} catch { return { declined: [], restored: [] }; }
 }
 
 /** Same-directory rename prevents readers from seeing a partially written state file. */
-function recordDeclined(configHome: string, settingsPath: string): void {
-	const declined = readDeclined(configHome);
-	if (declined.includes(settingsPath)) return;
+function recordState(configHome: string, key: keyof OptOutState, settingsPath: string): void {
+	const state = readState(configHome);
+	if (state[key].includes(settingsPath)) return;
 	mkdirSync(configHome, { recursive: true });
 	const path = builtinCodemodeOptOutStatePath(configHome);
 	const temporary = `${path}.${randomUUID()}.tmp`;
 	try {
-		writeFileSync(temporary, `${JSON.stringify({ schema: BUILTIN_CODEMODE_OPTOUT_SCHEMA, declined: [...declined, settingsPath] })}\n`, { flag: "wx", mode: 0o600 });
+		writeFileSync(temporary, `${JSON.stringify({ schema: BUILTIN_CODEMODE_OPTOUT_SCHEMA, ...state, [key]: [...state[key], settingsPath] })}\n`, { flag: "wx", mode: 0o600 });
 		renameSync(temporary, path);
 	} finally {
 		try { unlinkSync(temporary); } catch { /* Rename already consumed the temporary file. */ }
@@ -145,11 +170,11 @@ export async function offerBuiltinCodemodeOptOut(ctx: BuiltinCodemodeOptOutConte
 			if (hasExplicitBuiltinEntry((JSON.parse(currentText) as { extensions?: unknown } | null)?.extensions)) return "explicit-entry";
 		} catch { /* Malformed JSON is reported as unwritable below. */ }
 		if (withBuiltinExtensionExcluded(currentText) === undefined) return "unwritable";
-		if (readDeclined(configHome).includes(settingsPath)) return "declined-before";
+		if (readState(configHome).declined.includes(settingsPath)) return "declined-before";
 
 		const accepted = (await ctx.ui.confirm("Silence Pi's builtin codemode warning?", promptMessage(settingsPath))) === true;
 		if (!accepted) {
-			recordDeclined(configHome, settingsPath);
+			recordState(configHome, "declined", settingsPath);
 			ctx.ui.notify(`gentle-pi will not ask again. To silence the warning later, add "${BUILTIN_CODEMODE_OPTOUT_ENTRY}" to "extensions" in ${settingsPath}.`, "info");
 			return "declined";
 		}
@@ -160,6 +185,30 @@ export async function offerBuiltinCodemodeOptOut(ctx: BuiltinCodemodeOptOutConte
 		writeSettingsAtomically(settingsPath, newText);
 		ctx.ui.notify(`Added "${BUILTIN_CODEMODE_OPTOUT_ENTRY}" to ${settingsPath}. The builtin codemode warning disappears from the next launch.`, "info");
 		return "accepted";
+	} catch {
+		return "failed";
+	}
+}
+
+export type BuiltinCodemodeRestoreOutcome = "absent" | "restored-before" | "restored" | "failed";
+
+// On Pi 1.0.1 and later gentle-pi draws the builtin codemode instead of
+// replacing it (lib/codemode-renderer.ts), so the opt-out silences nothing
+// and removes codemode, the only way a child agent reaches MCP tools. Takes
+// back the `-builtin:codemode` entry once per settings file, in any mode; an
+// entry added again afterwards is the user's decision. Never throws.
+export function restoreBuiltinCodemode(ctx: Pick<BuiltinCodemodeOptOutContext, "hasUI" | "ui">, options: Omit<BuiltinCodemodeOptOutOptions, "effectiveExtensions"> = {}): BuiltinCodemodeRestoreOutcome {
+	try {
+		const settingsPath = resolve(options.agentDir ?? getAgentDir(), "settings.json");
+		const configHome = options.configHome ?? gentlePiConfigHome();
+		const currentText = readIfExists(settingsPath);
+		const newText = currentText === undefined ? undefined : withBuiltinExtensionRestored(currentText);
+		if (newText === undefined) return "absent";
+		if (readState(configHome).restored.includes(settingsPath)) return "restored-before";
+		writeSettingsAtomically(settingsPath, newText);
+		recordState(configHome, "restored", settingsPath);
+		if (ctx.hasUI) ctx.ui.notify(`gentle-pi re-enabled Pi's builtin codemode in ${settingsPath}: this Pi lets gentle-pi draw it, and agents reach MCP tools through it.`, "info");
+		return "restored";
 	} catch {
 		return "failed";
 	}

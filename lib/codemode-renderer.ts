@@ -183,7 +183,7 @@ type ToolRendererHost = {
 	registerToolRenderer(resolver: (toolName: string, next: () => CodemodeRenderers | undefined) => CodemodeRenderers | undefined): void;
 };
 
-function hasToolRenderers(pi: ExtensionAPI): pi is ExtensionAPI & ToolRendererHost {
+export function hasToolRenderers(pi: ExtensionAPI): pi is ExtensionAPI & ToolRendererHost {
 	return "registerToolRenderer" in pi && typeof pi.registerToolRenderer === "function";
 }
 

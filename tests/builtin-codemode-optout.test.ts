@@ -10,6 +10,7 @@ import {
 	builtinCodemodeOptOutStatePath,
 	offerBuiltinCodemodeOptOut,
 	withBuiltinExtensionExcluded,
+	withBuiltinExtensionRestored,
 } from "../lib/builtin-codemode-optout.ts";
 
 // gentle-pi replaces Pi's builtin codemode with its compact renderer, so Pi
@@ -43,10 +44,13 @@ function interactive(answer: boolean, mode: "tui" | "rpc" | "print" | "json" = "
 	return { ctx, prompts, notices };
 }
 
-function extensionHarness(settings: Record<string, unknown> = {}) {
+// `drawsBuiltins` stands for Pi 1.0.1 and later, whose registerToolRenderer
+// lets gentle-pi draw the builtin codemode instead of replacing it.
+function extensionHarness(settings: Record<string, unknown> = {}, drawsBuiltins = false) {
 	const tools: ToolDefinition[] = [];
 	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
 	const pi = {
+		...(drawsBuiltins ? { registerToolRenderer() {} } : {}),
 		registerTool(tool: ToolDefinition) { tools.push(tool); },
 		on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
 		getSettings() { return { codemode: { mode: "on" }, ...settings }; },
@@ -239,4 +243,47 @@ test("quiet-tools accepts the opt-out end to end", async (t) => {
 	assert.ok(tools.some((tool) => tool.name === "codemode"));
 	await startSession(interactive(true).ctx);
 	assert.equal(read(f.settingsPath), '{"theme":"rose","extensions":["-builtin:codemode"]}\n');
+});
+
+// On Pi 1.0.1 and later gentle-pi draws the builtin codemode instead of
+// replacing it, so the opt-out silences nothing and removes codemode, the
+// only way a child agent reaches MCP tools. gentle-pi takes back the entry it
+// asked to add, once per settings file, and never offers it again.
+test("the pure restore drops only the opt-out entry and an emptied extensions list", () => {
+	assert.equal(withBuiltinExtensionRestored('{\n  "theme": "rose",\n  "extensions": [\n    "./ext/a.ts",\n    "-builtin:codemode"\n  ]\n}\n'), '{\n  "theme": "rose",\n  "extensions": [\n    "./ext/a.ts"\n  ]\n}\n');
+	assert.equal(withBuiltinExtensionRestored('{"theme":"rose","extensions":["-builtin:codemode"]}'), '{"theme":"rose"}');
+	for (const text of ['{"extensions":["+builtin:codemode"]}', '{"extensions":["!builtin:codemode"]}', '{"theme":"rose"}', "{ not json", "[]", '{"extensions":"oops"}']) {
+		assert.equal(withBuiltinExtensionRestored(text), undefined, text);
+	}
+});
+
+test("on Pi 1.0.1 or later quiet-tools takes back the opt-out once, in any mode, and never prompts", async (t) => {
+	const f = fixture(t, '{"theme":"rose","extensions":["./ext/a.ts","-builtin:codemode"]}\n');
+	const { pi, startSession } = extensionHarness({}, true);
+	await quietTools(pi, undefined, { agentDir: f.agentDir, configHome: f.configHome });
+	const session = interactive(true, "rpc");
+	await startSession(session.ctx);
+	assert.equal(session.prompts.length, 0);
+	assert.equal(read(f.settingsPath), '{"theme":"rose","extensions":["./ext/a.ts"]}\n');
+	assert.match(session.notices.join("\n"), /re-enabled Pi's builtin codemode/);
+
+	// An entry the user adds back afterwards is their decision.
+	const readded = '{"theme":"rose","extensions":["./ext/a.ts","-builtin:codemode"]}\n';
+	writeFileSync(f.settingsPath, readded);
+	const later = extensionHarness({}, true);
+	await quietTools(later.pi, undefined, { agentDir: f.agentDir, configHome: f.configHome });
+	const next = interactive(true);
+	await later.startSession(next.ctx);
+	assert.equal(read(f.settingsPath), readded);
+	assert.equal(next.prompts.length + next.notices.length, 0);
+});
+
+test("on Pi 1.0.1 or later quiet-tools never offers the opt-out", async (t) => {
+	const f = fixture(t, '{"theme":"rose"}\n');
+	const { pi, startSession } = extensionHarness({}, true);
+	await quietTools(pi, undefined, { agentDir: f.agentDir, configHome: f.configHome });
+	const session = interactive(true);
+	await startSession(session.ctx);
+	assert.equal(session.prompts.length + session.notices.length, 0);
+	assert.equal(read(f.settingsPath), '{"theme":"rose"}\n');
 });

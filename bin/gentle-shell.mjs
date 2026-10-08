@@ -44,6 +44,7 @@ import {
 	parseLauncherArgs,
 	parseLauncherConfig,
 	parseRawLauncherConfig,
+	piDrawsBuiltinCodemode,
 	planSpawn,
 	POST_INSTALL_REMOVAL_SOURCES,
 	postInstallRemovals,
@@ -777,6 +778,38 @@ function ensureBuiltinCodemodeExcluded(settingsPath) {
 	return true;
 }
 
+// Pure: returns `settingsText` without its `-<builtin>` entries, dropping an
+// `extensions` array that held only them, or undefined when there is none or
+// the text is not a JSON object with an `extensions` array. Keeps the same
+// formatting as withBuiltinExtensionExcluded.
+function withBuiltinExtensionRestored(settingsText, builtin) {
+	let settings;
+	try {
+		settings = JSON.parse(settingsText);
+	} catch {
+		return undefined;
+	}
+	if (typeof settings !== "object" || settings === null || Array.isArray(settings) || !Array.isArray(settings.extensions)) return undefined;
+	const extensions = settings.extensions.filter((entry) => entry !== `-${builtin}`);
+	if (extensions.length === settings.extensions.length) return undefined;
+	const { extensions: _excluded, ...rest } = settings;
+	const indent = settingsText.match(/\{\r?\n([ \t]+)/)?.[1];
+	const serialized = JSON.stringify(extensions.length > 0 ? { ...settings, extensions } : rest, null, indent);
+	return settingsText.endsWith("\n") ? `${serialized}\n` : serialized;
+}
+
+// Undoes ensureBuiltinCodemodeExcluded on Pi 1.0.1 and later, where the
+// exclusion silences nothing and removes the codemode agents reach MCP tools
+// through. Returns true when it actually wrote the file.
+function ensureBuiltinCodemodeRestored(settingsPath) {
+	const currentText = readJsonIfExists(settingsPath);
+	if (currentText === undefined) return false;
+	const newText = withBuiltinExtensionRestored(currentText, BUILTIN_CODEMODE_EXTENSION);
+	if (newText === undefined) return false;
+	writeFileAtomically(settingsPath, newText);
+	return true;
+}
+
 // Provisions `home` with everything `gentle-ai install --agent pi` installs
 // into a regular Pi, by spawning the package-local pinned gentle-ai binary
 // (never a PATH `gentle-ai`) with PI_CODING_AGENT_DIR/GENTLE_PI_AGENT_HOME set
@@ -1281,13 +1314,18 @@ async function main() {
 		// auto-provisioning uses (homeIsForeign): never --link (excluded above),
 		// a foreign --home, or pi's own default agent home, since plain pi may
 		// share those and would lose its builtin codemode. `setup` (including
-		// --dry-run) returned before this point.
+		// --dry-run) returned before this point. On Pi 1.0.1 and later gentle-pi
+		// draws the builtin codemode instead, so the exclusion is taken back.
 		const settingsPath = join(home.dir, "settings.json");
-		const excluded = safely("exclude Pi's builtin codemode in your Gentle Shell settings", settingsPath, false, () => {
+		const drawsBuiltin = piDrawsBuiltinCodemode(versionCheck.version);
+		const changed = safely(`${drawsBuiltin ? "re-enable" : "exclude"} Pi's builtin codemode in your Gentle Shell settings`, settingsPath, false, () => {
 			const previous = provisionedEntry(readRawConfig(resolveConfigPath()), safeRealpath(home.dir));
-			return !homeIsForeign(home, previous, homeHadContentBeforeBootstrap) && ensureBuiltinCodemodeExcluded(settingsPath);
+			if (homeIsForeign(home, previous, homeHadContentBeforeBootstrap)) return false;
+			return drawsBuiltin ? ensureBuiltinCodemodeRestored(settingsPath) : ensureBuiltinCodemodeExcluded(settingsPath);
 		});
-		if (excluded) {
+		if (changed && drawsBuiltin) {
+			process.stderr.write(`gentle-shell: re-enabled Pi's builtin codemode in ${settingsPath} (Gentle Shell draws it on this Pi, and agents reach MCP tools through it)\n`);
+		} else if (changed) {
 			process.stderr.write(`gentle-shell: disabled Pi's builtin codemode in ${settingsPath} (Gentle Shell ships its own codemode tool)\n`);
 		}
 	}

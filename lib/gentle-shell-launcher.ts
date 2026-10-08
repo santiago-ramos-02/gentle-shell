@@ -419,6 +419,15 @@ export function checkPiVersion(output: string, minimum: string = MIN_PI_VERSION)
 	return { ok: true, version };
 }
 
+// Pi 1.0.1 added registerToolRenderer, so gentle-pi draws the builtin codemode
+// instead of replacing it (lib/codemode-renderer.ts), and the
+// `-builtin:codemode` exclusion would only remove codemode.
+export const PI_DRAWS_BUILTIN_CODEMODE_VERSION = "1.0.1";
+
+export function piDrawsBuiltinCodemode(version: string): boolean {
+	return checkPiVersion(version, PI_DRAWS_BUILTIN_CODEMODE_VERSION).ok;
+}
+
 // --- setup subcommand's gentle-ai pin gate -----------------------------------
 
 // The first gentle-ai release that honors PI_CODING_AGENT_DIR in its own
