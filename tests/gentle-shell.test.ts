@@ -6020,3 +6020,38 @@ test("active profile reader keeps the pin label when a different session is boun
 	clearSessionProfileBinding("session-other");
 	resetSessionProfileBindingsForTesting();
 });
+
+test("an explicit session binding routes the Usage scope ahead of the pin and the global layers", async (t) => {
+	const home = mkdtempSync(join(tmpdir(), "shell-usage-session-"));
+	const commonDir = mkdtempSync(join(tmpdir(), "shell-usage-session-git-"));
+	t.after(() => {
+		rmSync(home, { recursive: true, force: true });
+		rmSync(commonDir, { recursive: true, force: true });
+	});
+	mkdirSync(join(commonDir, "gentle-ai"), { recursive: true });
+	// Every shared layer points at openai-codex (the pin wins over the global
+	// active profile), while the session binds nan explicitly: the Usage panel
+	// must refresh the binding's provider, not the layers underneath it.
+	writeProfilesStore(home, {
+		team: { reviewer: { model: "openai-codex/gpt-5.5" } },
+		solo: { reviewer: { model: "openai-codex/gpt-5.5" } },
+		bound: { reviewer: { model: "nan/glm5.3" } },
+	}, "team");
+	writeFileSync(join(commonDir, "gentle-ai", "profile-pin.json"), JSON.stringify({ kind: "gentle-pi.agent_model_profile_pin", version: 1, profile: "solo" }));
+	resetSessionProfileBindingsForTesting();
+	bindSessionProfile("shell-session", "bound", { reviewer: { model: "nan/glm5.3" } });
+	try {
+		const { pi, commands } = fakePi();
+		gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { fetch: fakeFetch(NAN_QUOTA_PAYLOAD).fetchFn, now: () => 1_788_600_000_000, resolveWorktree: () => ({ root: "/repo", commonDir }) });
+		const { ctx, ui } = fakeContext({ token: JWT });
+		const opened = commands.get("gentle:usage")!.handler("", ctx);
+		await settle();
+		const lines = openPanelLines(ui).join("\n");
+		assert.ok(lines.split("\n").some((line) => /^│ nan ·/.test(line)), "the Usage panel refreshes the session binding's nan provider");
+		assert.ok(!lines.split("\n").some((line) => /^│ openai-codex ·/.test(line)), "the pinned codex route stays out of the bound session's Usage scope");
+		ui.closeOverlay?.();
+		await opened;
+	} finally {
+		resetSessionProfileBindingsForTesting();
+	}
+});

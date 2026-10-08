@@ -78,8 +78,8 @@ export const REVIEW_START_STATE = {
 const START_ACTIONS = ["created", "resumed", "closed", "blocked-scope-action"]         ;
 const RISK_LEVELS = ["low", "medium", "high"]         ;
 const REVIEW_LENSES = ["review-risk", "review-resilience", "review-readability", "review-reliability"]         ;
-const RISK_REASON_CODES = ["configuration_change", "empty_content", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"]         ;
-const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process"]         ;
+const RISK_REASON_CODES = ["agent_escalation", "configuration_change", "dangerous_sink", "empty_content", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"]         ;
+const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process", "dangerous_sink", "agent_escalation"]         ;
 // "collect" and "execute" are the v2 envelope's projection of a live
 // transaction whose next_transition is mandatory: the root action names the
 // transition kind instead of reading as a terminal stop.

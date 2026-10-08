@@ -2833,6 +2833,32 @@ test("s snapshots current routing in place without applying or reopening the pro
 	assert.match(renderComponent(firstPanel!), /Snapshot saved; live routing unchanged\. Profile "a-target" saved from current routing\./);
 });
 
+test("s snapshots the live session's orchestrator over the settings defaults", async (t) => {
+	const { fixture, settingsPath, writeStore, writeSettings } = profilesStoreFixture(t);
+	writeSettings();
+	writeStore({
+		"a-target": {},
+		"z-active": { worker: { model: "openai/beta" } },
+	}, "z-active");
+	// The session runs live on openai/omega at low effort while settings.json still
+	// defaults to nan/deepseek-v4-flash at high: the snapshot must capture the
+	// session the user is actually in, not the default new sessions would get.
+	fixture.setLiveModel("openai", "omega", "low");
+	const settingsBefore = readFileSync(settingsPath, "utf8");
+	fixture.onInput((panel) => {
+		panel.handleInput("s");
+		panel.handleInput("\x1b");
+	});
+	await fixture.run("gentle:profiles");
+	const store = JSON.parse(readFileSync(join(fixture.configHome, "profiles.json"), "utf8"));
+	assert.deepEqual(
+		store.profiles["a-target"].orchestrator,
+		{ model: "openai/omega", thinking: "low" },
+		"the orchestrator entry comes from the live session, not settings.json",
+	);
+	assert.equal(readFileSync(settingsPath, "utf8"), settingsBefore, "settings are untouched");
+});
+
 // /gentle:models can finish with `u`: the global save `ctrl+s` performs, followed
 // by the snapshot `/gentle:profiles` performs with `s` on the current profile.
 function pickWorkerModelThenUpdateProfile(panel: RoutingConsumerPanel): void {
@@ -3791,10 +3817,33 @@ test("a session-bound panel renders the binding snapshot as the current routing"
 		assert.match(rendered, /Current routing \(effective\)/);
 		assert.match(rendered, /openai\/gamma/, "the current routing is the session binding's snapshot");
 		assert.doesNotMatch(rendered, /openai\/alpha/, "the global routing stays out of a bound session's panel");
+		assert.match(
+			rendered,
+			/team \(session\) — launches resolve it ahead of pins/,
+			"the session line states what the binding governs post-#1558 (the panel truncates long lines)",
+		);
+		assert.doesNotMatch(rendered, /launch routing is unchanged/, "no stale slice-1 claim survives in the panel");
 		panel.handleInput("\x1b");
 	});
 	await fixture.run("gentle:profiles");
 	resetSessionProfileBindingsForTesting();
+});
+
+test("the now line reports the live session's orchestrator over the settings defaults", async (t) => {
+	const { fixture, writeStore, writeSettings } = profilesStoreFixture(t);
+	writeSettings();
+	writeStore({ team: { worker: { model: "openai/beta" } } }, "team");
+	// The session runs live on openai/omega at low effort while settings.json still
+	// defaults to nan/deepseek-v4-flash at high: the panel's now line must report
+	// what this session actually runs, not the default new sessions would get.
+	fixture.setLiveModel("openai", "omega", "low");
+	fixture.onInput((panel) => {
+		const rendered = renderComponent(panel);
+		assert.match(rendered, /now\s+openai\/omega/, "the now line shows the live session's orchestrator");
+		assert.doesNotMatch(rendered, /now\s+nan\//, "the settings default stays off the now line when a live model runs");
+		panel.handleInput("\x1b");
+	});
+	await fixture.run("gentle:profiles");
 });
 
 test("the (session) marker survives a snapshot refresh of the panel list", async (t) => {

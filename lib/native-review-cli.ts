@@ -782,6 +782,8 @@ const REVIEW_RISK_SUBJECT_BY_CODE: Readonly<Record<string, string>> = Object.fre
 	shell_source: "shell scripting",
 	process_boundary: "code that starts other processes",
 	process_scan_limit: "code that starts other processes",
+	dangerous_sink: "a dangerous code pattern",
+	agent_escalation: "the agent that made this change flagged it as high risk",
 	executable_mode: "an executable permission change",
 	executable_change: "an executable change",
 	configuration_change: "a configuration change",
