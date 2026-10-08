@@ -111,3 +111,47 @@ test("bad calls answer with a coded error line", () => {
 	assert.equal(call("profiles.apply", { name: "missing", cwd: root }).error.code, "missing_profile");
 	assert.equal(call("state", { cwd: "relative" }).error.code, "invalid_params");
 });
+
+test("command rules are read with every built-in rule and edited without losing other fields", () => {
+	const { configHome, project, ok, call } = sandbox("command-rules");
+	const initial = ok("state", { cwd: project }).commandRules;
+	assert.equal(initial.autonomousMode, false);
+	assert.deepEqual(initial.rules.map((rule: { key: string }) => rule.key), [
+		"gitPush", "gitRebase", "gitBranchDeleteForce", "npmPublish", "piRemove", "fileDeletion", "databaseWipe",
+	]);
+	assert.ok(initial.rules.every((rule: { action: unknown }) => rule.action === null));
+	assert.ok(initial.alwaysBlocked.includes("git reset --hard"));
+	assert.equal(initial.project, null);
+
+	const path = join(configHome, "runtime-guardrails.json");
+	mkdirSync(configHome, { recursive: true });
+	writeFileSync(path, JSON.stringify({ note: "kept", guardedCommands: { gitRebase: "allow" } }));
+	ok("commandRules.set", {
+		autonomousMode: true,
+		guardedCommands: { fileDeletion: "allow", gitRebase: null },
+		customCommands: [{ pattern: "  rm -rf   node_modules ", action: "allow" }],
+	});
+	assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), {
+		note: "kept",
+		guardedCommands: { fileDeletion: "allow" },
+		autonomousMode: true,
+		customCommands: [{ pattern: "rm -rf node_modules", action: "allow" }],
+	});
+	const edited = ok("state").commandRules;
+	assert.equal(edited.autonomousMode, true);
+	assert.equal(edited.rules.find((rule: { key: string }) => rule.key === "fileDeletion").action, "allow");
+	assert.deepEqual(edited.customCommands, [{ pattern: "rm -rf node_modules", action: "allow" }]);
+
+	const projectRules = join(project, ".pi", "gentle-ai", "runtime-guardrails.json");
+	mkdirSync(join(project, ".pi", "gentle-ai"), { recursive: true });
+	writeFileSync(projectRules, "{");
+	assert.deepEqual(ok("state", { cwd: project }).commandRules.project, { path: projectRules, readable: false });
+
+	assert.equal(call("commandRules.set", { guardedCommands: { rmEverything: "allow" } }).error.code, "invalid_params");
+	assert.equal(call("commandRules.set", { customCommands: [{ pattern: " ", action: "allow" }] }).error.code, "invalid_params");
+	assert.equal(call("commandRules.set", { customCommands: [{ pattern: "* -rf", action: "allow" }] }).error.code, "invalid_params");
+	writeFileSync(path, "not json");
+	assert.equal(call("commandRules.set", { autonomousMode: false }).error.code, "invalid_store");
+	assert.equal(readFileSync(path, "utf8"), "not json");
+	assert.match(ok("state").commandRules.error, /is not a command rules file/);
+});

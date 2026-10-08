@@ -50,7 +50,7 @@ This is permission guidance and shell-guard defense in depth, **not a sandbox or
 
 ## Recognized data-loss boundary
 
-Recognized destructive database and broad filesystem commands require **fresh primary confirmation** and are **blocked in package-owned children**, independently of YOLO and existing autonomous-mode configuration.
+Recognized destructive database and broad filesystem commands require **fresh primary confirmation** and are **blocked in package-owned children**, independently of YOLO. In autonomous mode, the `fileDeletion` and `databaseWipe` [command rules](command-rules.md) and custom commands can change the primary-session action; children still block.
 
 | Recognized executable form | Primary session | Delegated child |
 |---|---|---|
@@ -71,7 +71,7 @@ Ordinary builds, tests, read-only SQL, predicate-bounded literal deletes, Git st
 
 1. Existing hard denies and newly recognized hard-deny forms win across the command.
 2. Explicit configured blocks retain their existing semantics and win before data-loss confirmation. Active YOLO additionally honors explicit push restrictions in either configuration layer.
-3. Recognized database/filesystem data loss always requires fresh confirmation, even when autonomous mode or a matched delivery action is configured to allow.
+3. Recognized database/filesystem data loss requires fresh confirmation, even when a matched delivery action is configured to allow, unless autonomous mode configures its own [command rule](command-rules.md) or a custom command for it.
 4. No UI, cancellation, a non-true answer or a dialog error cannot authorize execution. Approval is not cached; permission and Herdr blocker lifecycle events remain balanced.
 
 Children receive the lightweight `child-safety.ts` entry alongside `child-context.ts`; they do not need the full primary extension. The safety entry registers nothing outside `GENTLE_PI_AGENTS_CHILD=1`, preventing duplicate primary prompts during package auto-discovery. If the full primary extension is explicitly loaded in a child, its destructive-command path also blocks instead of prompting.

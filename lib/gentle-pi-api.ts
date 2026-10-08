@@ -34,6 +34,20 @@ import {
 	type PersonaMode,
 } from "./model-routing.ts";
 import { applyProfile, type ProfileApplyResult } from "./profile-operations.ts";
+import {
+	ALWAYS_BLOCKED,
+	COMMAND_RULES,
+	CommandRulesFileError,
+	globalCommandRulesPath,
+	isCommandRuleAction,
+	isCommandPattern,
+	isCommandRuleKey,
+	normalizeCommandPattern,
+	projectCommandRulesPath,
+	readCommandRulesLayer,
+	writeCommandRules,
+	type CommandRulesUpdate,
+} from "./command-rules.ts";
 
 export const GENTLE_PI_API_VERSION = 1;
 
@@ -89,6 +103,66 @@ function pinLayer(read: ProfilePinReadResult): string | null {
 	return read.status === "valid" ? read.profile : null;
 }
 
+function commandRulesPath(): string {
+	return globalCommandRulesPath(gentleAiConfigHome());
+}
+
+/** The global command rules, every built-in rule with its configured action, and a project file that changes them. */
+function readCommandRules(cwd: string | undefined) {
+	const path = commandRulesPath();
+	const layer = readCommandRulesLayer(path);
+	const config = layer.status === "valid" ? layer.config : undefined;
+	const projectPath = cwd === undefined ? undefined : projectCommandRulesPath(cwd);
+	const projectLayer = projectPath === undefined ? undefined : readCommandRulesLayer(projectPath);
+	return {
+		path,
+		...(layer.status === "invalid" ? { error: new CommandRulesFileError(path).message } : {}),
+		autonomousMode: config?.autonomousMode ?? false,
+		rules: Object.entries(COMMAND_RULES).map(([key, rule]) => ({
+			key,
+			label: rule.label,
+			action: config?.guardedCommands[key as keyof typeof COMMAND_RULES] ?? null,
+			autonomousDefault: rule.autonomousDefault,
+		})),
+		customCommands: config?.customCommands ?? [],
+		alwaysBlocked: ALWAYS_BLOCKED,
+		project: projectPath === undefined || projectLayer === undefined || projectLayer.status === "missing"
+			? null
+			: { path: projectPath, readable: projectLayer.status === "valid" },
+	};
+}
+
+function commandRulesUpdate(params: Params): CommandRulesUpdate {
+	const update: CommandRulesUpdate = {};
+	if (params.autonomousMode !== undefined) {
+		if (typeof params.autonomousMode !== "boolean") throw new GentlePiApiError("invalid_params", "autonomousMode must be true or false.");
+		update.autonomousMode = params.autonomousMode;
+	}
+	if (params.guardedCommands !== undefined) {
+		const rules = params.guardedCommands;
+		if (typeof rules !== "object" || rules === null || Array.isArray(rules)) {
+			throw new GentlePiApiError("invalid_params", "guardedCommands must map rules to an action.");
+		}
+		update.guardedCommands = {};
+		for (const [key, action] of Object.entries(rules)) {
+			if (!isCommandRuleKey(key)) throw new GentlePiApiError("invalid_params", `Unknown command rule: ${key}.`);
+			if (action !== null && !isCommandRuleAction(action)) throw new GentlePiApiError("invalid_params", `${key} must be allow, confirm, block, or null.`);
+			update.guardedCommands[key] = action;
+		}
+	}
+	if (params.customCommands !== undefined) {
+		if (!Array.isArray(params.customCommands)) throw new GentlePiApiError("invalid_params", "customCommands must be a list.");
+		update.customCommands = params.customCommands.map((entry: unknown) => {
+			const rule = typeof entry === "object" && entry !== null ? entry as Record<string, unknown> : {};
+			const pattern = typeof rule.pattern === "string" ? normalizeCommandPattern(rule.pattern) : "";
+			if (!isCommandPattern(pattern)) throw new GentlePiApiError("invalid_params", "Each custom command must start with the command it covers, not *.");
+			if (!isCommandRuleAction(rule.action)) throw new GentlePiApiError("invalid_params", `${pattern} must be allow, confirm, or block.`);
+			return { pattern, action: rule.action };
+		});
+	}
+	return update;
+}
+
 function readState(cwd: string | undefined) {
 	const store = readProfilesFileResult(profilesPath());
 	const file = store.status === "valid" ? store.file : emptyProfilesFile();
@@ -113,6 +187,7 @@ function readState(cwd: string | undefined) {
 		// The agents a profile can route, including the orchestrator key.
 		agents: cwd === undefined ? null : ["orchestrator", ...modelAssignmentNames(cwd)],
 		project,
+		commandRules: readCommandRules(cwd),
 	};
 }
 
@@ -208,6 +283,21 @@ const methods = {
 		if (params.mode === null) {
 			if (existsSync(path)) rmSync(path);
 		} else writeJson(path, { mode: personaParam(params.mode) });
+		return { path };
+	},
+	/**
+	 * Changes the global command rules: autonomous mode, built-in rule actions
+	 * (null restores a rule's default), or the full list of custom commands.
+	 * Fields it does not name stay as they are.
+	 */
+	"commandRules.set": async (params: Params) => {
+		const path = commandRulesPath();
+		try {
+			writeCommandRules(path, commandRulesUpdate(params));
+		} catch (error) {
+			if (error instanceof CommandRulesFileError) throw new GentlePiApiError("invalid_store", error.message);
+			throw error;
+		}
 		return { path };
 	},
 } satisfies Record<string, (params: Params) => Promise<unknown>>;
