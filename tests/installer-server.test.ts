@@ -306,7 +306,7 @@ test("/api/plan names the found and required version of another older tool", asy
 	}
 });
 
-test("/api/plan explains a Gentle Shell installed outside pnpm", async () => {
+test("/api/plan explains a Gentle Shell that neither pnpm nor npm manages", async () => {
 	const { host, port, login } = await start({ collect: async () => collected({
 		pi: { available: true, version: "1.0.4", usable: true },
 		shell: { available: null, outsidePnpm: true }, gentleAi: { available: null }, setup: { available: null },
@@ -315,9 +315,38 @@ test("/api/plan explains a Gentle Shell installed outside pnpm", async () => {
 		const view = await plan(port, await login());
 		assert.deepEqual(view.blockers.map((blocker: { code: string; tool: string }) => [blocker.code, blocker.tool]), [["unknown-tool", "shell"]]);
 		assert.equal(view.blockers[0].guidance,
-			"Gentle Shell is already installed, but not with pnpm: the `gentle-shell` command on your PATH comes from another installation, " +
-			"so this installer cannot check or update it. Nothing was replaced. Keep using that installation, or remove it " +
-			"(for example with `npm uninstall -g gentle-pi`), then select Check again.");
+			"Gentle Shell is already installed, but neither pnpm nor npm manages it (a linked source checkout, for example), " +
+			"so this installer cannot update it. Nothing was replaced. Update it the way you installed it, then select Check again.");
+	} finally {
+		await host.close("test");
+	}
+});
+
+test("/api/plan explains a Pi whose version cannot be read", async () => {
+	const { host, port, login } = await start({ collect: async () => collected({ pi: { available: null, outsidePnpm: true } }) });
+	try {
+		const view = await plan(port, await login());
+		assert.equal(view.blockers.find((item: { tool: string }) => item.tool === "pi").guidance,
+			"Pi is already installed, but `pi --version` did not report a version this installer can check. Make sure `pi --version` works in a terminal, then select Check again.");
+	} finally {
+		await host.close("test");
+	}
+});
+
+test("/api/plan describes updating an existing Gentle Shell on either channel", async () => {
+	const shell = { available: true, version: "3.9.0", usable: true, global: true, owner: "npm" };
+	const { host, port, login } = await start({ collect: async (channel) => collectedFor(channel, { pi: { available: true, version: "1.0.4", usable: true },
+		shell, go: { available: true, version: "1.26.0", usable: true }, gentleAi: { available: null }, setup: { available: null } }) });
+	try {
+		const cookie = await login();
+		const release = await plan(port, cookie);
+		assert.deepEqual(release.actions.map((action: { id: string; description: string }) => [action.id, action.description]), [
+			["update-shell-release", "Update Gentle Shell to the latest release with the package manager that installed it (pnpm or npm)."],
+			["setup-shell", release.actions[1].description],
+			["verify-readiness", "Verify that the installed stack is ready."]]);
+		const main = JSON.parse((await send(port, { path: "/api/plan?channel=main", headers: { cookie, ...API } })).body);
+		assert.equal(main.actions[0].description,
+			"Update Gentle Shell and Gentle AI to the latest commits of `main`, built on this computer, with the package manager that installed Gentle Shell.");
 	} finally {
 		await host.close("test");
 	}

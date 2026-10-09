@@ -30,6 +30,7 @@ import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { inferOddPhase } from "../lib/odd-phase-inference.ts";
 import { isInteractiveMode } from "../lib/rpc-host.ts";
 import { gentlePiConfigHome } from "../lib/agent-home.ts";
+import { isNanAdaptiveReasoningModel } from "../lib/nan-provider.ts";
 import { resolveAnimationPolicy, writeAnimationPolicy, type AnimationPolicy } from "../lib/animation-policy.ts";
 import { resolveVimPolicy, writeVimPolicy, type VimPolicy } from "../lib/vim-policy.ts";
 import { resolveHistoryCapture, writeHistoryCapturePolicy } from "../lib/history-capture-policy.ts";
@@ -310,6 +311,7 @@ export function buildShellBarModel(
 	const home = options.home ?? os.homedir();
 	const { usage, costTotal } = sessionStats(ctx);
 	const model = ctx.model;
+	const adaptiveReasoning = isNanAdaptiveReasoningModel(model);
 	const statuses = Array.from(footerData.getExtensionStatuses().entries())
 		.filter(([key]) => options.jobs === undefined || key !== JOBS_STATUS_KEY)
 		.sort(([a], [b]) => a.localeCompare(b))
@@ -321,7 +323,7 @@ export function buildShellBarModel(
 		dirty: options.dirty,
 		sessionName: ctx.sessionManager.getSessionName(),
 		modelId: model?.id ?? "no-model",
-		effort: model?.reasoning ? pi.getThinkingLevel() : undefined,
+		effort: model?.reasoning ? (adaptiveReasoning ? "auto" : pi.getThinkingLevel()) : undefined,
 		contextPercent: usage?.percent ?? null,
 		contextWindow: usage?.contextWindow ?? model?.contextWindow ?? 0,
 		costTotal,
@@ -1530,6 +1532,17 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	// overlapping refreshes of the SAME source (or of builtins) can otherwise
 	// let an older failure settle after a newer success and poison it.
 	const usageGenerations = new Map<string, number>();
+	// NaN accepts a thinking level for DeepSeek V4 Flash, Qwen 3.8 Flash, and MiMo
+	// but manages their depth itself, so the header reports `auto` and the shell says
+	// why once per model instead of repeating it on every level change.
+	const adaptiveReasoningNotices = new Set<string>();
+	const announceAdaptiveReasoning = (ctx: ExtensionContext, model: { provider: string; id: string; name?: string } | undefined) => {
+		if (!ctx.hasUI || !isNanAdaptiveReasoningModel(model)) return;
+		const key = `${model.provider}/${model.id}`;
+		if (adaptiveReasoningNotices.has(key)) return;
+		adaptiveReasoningNotices.add(key);
+		ctx.ui.notify(`${model.name || model.id} chooses its reasoning depth automatically; the selected thinking level is accepted but does not change it.`, "info");
+	};
 	// One spelling of the config home, so the pin resolver, the global profiles
 	// store and the profile reader cannot drift onto two different stores.
 	const usageConfigHome = gentlePiConfigHome(env);
@@ -1830,6 +1843,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	pi.on("session_start", async (_event, ctx) => {
 		closeCustomize?.();
 		runningJobs = undefined;
+		adaptiveReasoningNotices.clear();
+		// A restored or default session never emits model_select, so the startup model
+		// announces itself here when it manages its own depth.
+		announceAdaptiveReasoning(ctx, ctx.model);
 		if (review) {
 			review = undefined;
 			redrawReview();
@@ -2518,5 +2535,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	pi.on("agent_end", async (_event, ctx) => {
 		await refreshChanges(ctx);
 		void refreshUsage(ctx, false);
+	});
+	pi.on("model_select", (event, ctx) => {
+		announceAdaptiveReasoning(ctx, event.model);
+	});
+	pi.on("thinking_level_select", (_event, ctx) => {
+		announceAdaptiveReasoning(ctx, ctx.model);
 	});
 }

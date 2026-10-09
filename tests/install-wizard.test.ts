@@ -478,6 +478,26 @@ test("an already set-up computer points to gentle-shell upgrade, and to its main
 	assert.ok(guidance.blocked["unsupported-plan"].includes("Use `gentle-shell upgrade` or follow the README."));
 });
 
+test("expectedSteps mirrors the shell-only installation and the update of an existing Gentle Shell", () => {
+	assert.deepEqual(wizard.expectedSteps(["install-shell", "setup-shell", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-existing-shell", "install-global", "verify-global-list", "verify-shell-bin", "verify-gentle-ai", "shell-setup"]);
+	assert.deepEqual(wizard.expectedSteps(["install-pi", "update-shell-release", "setup-shell", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-installed-shell", "install-pi", "update-shell", "verify-updated-shell", "verify-gentle-ai", "shell-setup"]);
+	assert.deepEqual(wizard.expectedSteps(["update-shell-main", "setup-shell", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-installed-shell", "update-shell", "verify-updated-shell", "shell-setup"]);
+});
+
+test("an update plan is reviewed as an update, with an Update button", () => {
+	const document = new FakeDocument();
+	const model = wizard.planModel({ planId: "p", ready: false, channel: "release", blockers: [],
+		actions: [{ id: "update-shell-release", description: "Update." }, { id: "setup-shell", description: "Setup." }, { id: "verify-readiness", description: "Verify." }] });
+	assert.equal(model.kind, "update");
+	const view = wizard.renderPlan(document, model, { install: () => {}, reload: () => {}, close: () => {} });
+	assert.ok(headings(view)[0].textContent.includes("Update Gentle Shell"));
+	assert.ok(button(view, "Update Gentle Shell"));
+	assert.equal(button(view, "Install Gentle Shell"), undefined);
+});
+
 test("a main plan blocked by a missing Go still lets the user switch back to release", async () => {
 	const blocked = await serverPlanView({}, "main");
 	assert.ok(blocked.blockers.some((blocker: { code: string }) => blocker.code === "main-requires-go"));

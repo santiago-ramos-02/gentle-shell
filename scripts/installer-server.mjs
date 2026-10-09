@@ -79,6 +79,8 @@ export const actionDescriptions = Object.freeze({
 	"build-gentle-ai-main": "Build Gentle AI from the latest commit of its `main` branch with Go, verified by Go's checksum database, and use it instead of the pinned release binary.",
 	"install-shell-main": "Install Gentle Shell from the latest commit of its `main` branch with pnpm, replacing the release package.",
 	"record-channel": "Remember the `main` channel, so `gentle-shell upgrade` keeps following `main`.",
+	"update-shell-release": "Update Gentle Shell to the latest release with the package manager that installed it (pnpm or npm).",
+	"update-shell-main": "Update Gentle Shell and Gentle AI to the latest commits of `main`, built on this computer, with the package manager that installed Gentle Shell.",
 });
 
 const tryAgain = "Fix the cause, then run the installer again.";
@@ -118,6 +120,9 @@ export const guidance = Object.freeze({
 		"build-gentle-ai-main": `Gentle AI could not be built from its latest \`main\` commit. Check your network connection and that \`go\` runs in a terminal. ${tryAgain}`,
 		"install-shell-main": `Gentle Shell could not be installed from its latest \`main\` commit. Check your network connection. ${tryAgain}`,
 		"record-channel": "Gentle Shell is installed from `main`, but the channel could not be saved under `~/.pi/gentle-ai`. Check that folder's permissions, then run the installer again.",
+		"install-pi": `Installing Pi with pnpm failed. Your existing Gentle Shell was not changed. Check your network connection. ${tryAgain}`,
+		"update-shell": "Updating Gentle Shell failed. Run `gentle-shell upgrade` in a terminal to see the details.",
+		"verify-updated-shell": "Gentle Shell did not report the expected version after the update. Run `gentle-shell --version`, then `gentle-shell upgrade` in a terminal.",
 	}),
 	blockers: Object.freeze({
 		"unsupported-target": "This operating system or CPU is not supported by the wizard. Follow the README for a manual installation.",
@@ -183,10 +188,10 @@ const minimumTools = Object.freeze({
 	shell: { label: "Gentle Shell", where: " globally with pnpm",
 		remedy: (required) => `Update it with \`pnpm add -g gentle-pi@${required}\`, or remove it with \`pnpm remove -g gentle-pi\`` },
 });
-// A Pi or Shell command found on PATH that pnpm does not manage.
-const outsidePnpmTools = Object.freeze({
-	pi: { label: "Pi", command: "pi", pkg: "@earendil-works/pi-coding-agent" },
-	shell: { label: "Gentle Shell", command: "gentle-shell", pkg: "gentle-pi" },
+// A Pi whose version cannot be read, or a Gentle Shell neither pnpm nor npm manages.
+const unmanaged = Object.freeze({
+	pi: "Pi is already installed, but `pi --version` did not report a version this installer can check. Make sure `pi --version` works in a terminal, then select Check again.",
+	shell: "Gentle Shell is already installed, but neither pnpm nor npm manages it (a linked source checkout, for example), so this installer cannot update it. Nothing was replaced. Update it the way you installed it, then select Check again.",
 });
 const STABLE = /^v?(\d{1,6})\.(\d{1,6})\.(\d{1,6})$/;
 function older(found, required) {
@@ -202,11 +207,8 @@ function older(found, required) {
  * anything else keeps the fixed guidance. */
 function blockerGuidance(blocker, inventory, plan) {
 	const fixed = guidance.blockers[blocker.code] ?? guidance.fallback;
-	if (blocker.code === "unknown-tool" && Object.hasOwn(outsidePnpmTools, blocker.tool) && inventory?.[blocker.tool]?.outsidePnpm === true) {
-		const { label, command, pkg } = outsidePnpmTools[blocker.tool];
-		return `${label} is already installed, but not with pnpm: the \`${command}\` command on your PATH comes from another installation, ` +
-			"so this installer cannot check or update it. Nothing was replaced. Keep using that installation, or remove it " +
-			`(for example with \`npm uninstall -g ${pkg}\`), then select Check again.`;
+	if (blocker.code === "unknown-tool" && Object.hasOwn(unmanaged, blocker.tool) && inventory?.[blocker.tool]?.outsidePnpm === true) {
+		return unmanaged[blocker.tool];
 	}
 	const tool = Object.hasOwn(minimumTools, blocker.tool) ? minimumTools[blocker.tool] : null;
 	if (blocker.code !== "incompatible-tool" || tool === null) return fixed;

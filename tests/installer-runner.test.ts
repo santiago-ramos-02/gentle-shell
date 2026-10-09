@@ -7,6 +7,7 @@ import { gentleAiBinaryPath } from "../runtime/gentle-ai-binary.mjs";
 import { persistencePins, planPreflight, requirements } from "../scripts/installer-preflight.mjs";
 import {
 	PI_INSTALL_VERSION,
+	PI_PACKAGE as PI_PACKAGE_NAME,
 	blockedReasons,
 	failedSteps,
 	packageNativeGentleAi,
@@ -250,7 +251,7 @@ test("preflight blockers and unsupported T4 plans are blocked before any command
 	const cases = [
 		plan("linux", { node: tool("20.0.0") }),
 		plan("linux", { node: absent }),
-		plan("linux", { pi: tool("1.2.0") }),
+		// (Pi present with Shell missing is the shell-only installation, covered below.)
 		plan("linux", { pi: tool("1.2.0"), shell: { ...tool("4.0.0"), global: true } }),
 	];
 	for (const fixed of cases) {
@@ -1165,6 +1166,108 @@ test("a partial set of main steps is an unsupported plan", async () => {
 	const result = await runStandardInstall({ plan: partial, consent: true }, h.adapters);
 	assert.deepEqual([result.outcome, result.reason], ["blocked", "unsupported-plan"]);
 	assert.deepEqual(h.calls, []);
+});
+
+// --- Existing installations: install only Gentle Shell, or update it ----------------------------
+function existingPlan(change: object, channel = "release") {
+	return planPreflight({ platform: "linux", arch: "x64", node: tool("24.18.0"), pnpm: { ...tool("11.1.1"), compatible: true },
+		pi: tool("1.2.0"), shell: absent, gentleAi: absent, go: tool("1.26.0"),
+		globalBin: { available: true, path: BIN, writable: true, onPath: true }, setup: false, ...change }, { channel });
+}
+const SHELL_ONLY_ADD = `add -g gentle-pi@${requirements.shell} --allow-build=gentle-pi`;
+const NPM_SHELL_ROOT = "/usr/local/lib/node_modules/gentle-pi";
+
+test("with a compatible Pi already installed, only Gentle Shell is added and Pi is left as it is", async () => {
+	const h = harness({ results: { [LIST]: [{ code: 0, stdout: JSON.stringify([{ path: `${PNPM_HOME}/global/v11`, dependencies: {
+		"@earendil-works/pi-coding-agent": { version: "1.2.0" } } }]) }, { code: 0, stdout: listing("1.2.0") }], [SHELL_ONLY_ADD]: { code: 0 } } });
+	const result = await runStandardInstall({ plan: existingPlan({}), consent: true }, h.adapters);
+	assert.equal(result.outcome, "ready");
+	assert.deepEqual(h.pnpmCalls(), ["bin -g", LIST, SHELL_ONLY_ADD, LIST]);
+	assert.deepEqual(result.completed, ["check-npm", "check-global-bin", "check-existing-shell", "install-global",
+		"verify-global-list", "verify-shell-bin", "verify-gentle-ai", "shell-setup"]);
+	assert.equal(h.calls.some((call) => call.args.includes(`${PI_PACKAGE_NAME}@${PI_INSTALL_VERSION}`)), false);
+});
+
+test("adding only Gentle Shell still refuses a gentle-pi that pnpm already lists", async () => {
+	const h = harness({ results: { [LIST]: { code: 0, stdout: listing("1.2.0") } } });
+	const result = await runStandardInstall({ plan: existingPlan({}), consent: true }, h.adapters);
+	assert.deepEqual([result.outcome, result.reason], ["blocked", "existing-stack"]);
+	assert.equal(h.calls.some((call) => call.args[1] === "add"), false);
+});
+
+function updateHarness({ located = [{ root: NPM_SHELL_ROOT, version: "3.9.0", owner: "npm" }, { root: NPM_SHELL_ROOT, version: requirements.shell, owner: "npm" }] as Array<object | null>,
+	upgrade = async () => true as boolean, results = {} as Record<string, Result> } = {}) {
+	const h = harness({ results: { [`${NPM_SHELL_ROOT}/bin/gentle-shell.mjs setup`]: { code: 0 }, ...results } });
+	const upgrades: object[] = [];
+	let locates = 0;
+	const adapters = { ...h.adapters,
+		locateShell: async () => located[Math.min(locates++, located.length - 1)],
+		upgradeShell: async (request: object) => {
+			upgrades.push(request);
+			return upgrade();
+		} };
+	return { ...h, adapters, upgrades };
+}
+
+test("an older Gentle Shell is updated to the latest release with its owner's logic, verified, then set up", async () => {
+	const h = updateHarness();
+	const result = await runStandardInstall({ plan: existingPlan({ shell: { available: true, version: "3.9.0", usable: true, global: true, owner: "npm" },
+		gentleAi: { available: null }, setup: { available: null } }), consent: true }, h.adapters);
+	assert.equal(result.outcome, "ready");
+	assert.deepEqual(result.completed, ["check-npm", "check-global-bin", "check-installed-shell", "update-shell", "verify-updated-shell",
+		"verify-gentle-ai", "shell-setup"]);
+	assert.deepEqual(h.upgrades, [{ channel: "release", packageRoot: NPM_SHELL_ROOT, currentVersion: "3.9.0" }]);
+	assert.deepEqual(h.integrityCalls, [{ packageRoot: NPM_SHELL_ROOT, platform: "linux", env: h.adapters.env, home: HOME }]);
+	assert.deepEqual(h.calls.at(-1)?.args, [`${NPM_SHELL_ROOT}/bin/gentle-shell.mjs`, "setup"]);
+	assert.equal(h.calls.some((call) => call.args[1] === "add"), false);
+});
+
+test("updating to main requires a main version afterwards and skips the pinned binary check", async () => {
+	const mainVersion = `${requirements.shell}-main.6e7e3a18f794`;
+	const plan = existingPlan({ shell: { available: true, version: requirements.shell, usable: true, global: true, owner: "npm" },
+		gentleAi: { available: null }, setup: { available: null } }, "main");
+	const h = updateHarness({ located: [{ root: NPM_SHELL_ROOT, version: requirements.shell, owner: "npm" }, { root: NPM_SHELL_ROOT, version: mainVersion, owner: "npm" }] });
+	const result = await runStandardInstall({ plan, consent: true }, h.adapters);
+	assert.equal(result.outcome, "ready");
+	assert.deepEqual(h.upgrades, [{ channel: "main", packageRoot: NPM_SHELL_ROOT, currentVersion: requirements.shell }]);
+	assert.equal(result.completed.includes("verify-gentle-ai"), false);
+	const stale = updateHarness({ located: [{ root: NPM_SHELL_ROOT, version: requirements.shell, owner: "npm" }] });
+	const failed = await runStandardInstall({ plan, consent: true }, stale.adapters);
+	assert.deepEqual([failed.outcome, failed.failedStep], ["failed", "verify-updated-shell"]);
+});
+
+test("a missing Pi is installed before the existing Gentle Shell is updated", async () => {
+	const h = updateHarness();
+	const plan = existingPlan({ pi: absent, shell: { available: true, version: "3.9.0", usable: true, global: true, owner: "npm" },
+		gentleAi: { available: null }, setup: { available: null } });
+	const result = await runStandardInstall({ plan, consent: true }, h.adapters);
+	assert.equal(result.outcome, "ready");
+	assert.deepEqual(result.completed.slice(3, 5), ["install-pi", "update-shell"]);
+	assert.ok(h.pnpmCalls().includes(`add -g ${PI_PACKAGE_NAME}@${PI_INSTALL_VERSION}`));
+});
+
+test("a failed Pi installation stops before the existing Gentle Shell is touched", async () => {
+	const h = updateHarness({ results: { add: { code: 1 } } });
+	const plan = existingPlan({ pi: absent, shell: { available: true, version: "3.9.0", usable: true, global: true, owner: "npm" },
+		gentleAi: { available: null }, setup: { available: null } });
+	const result = await runStandardInstall({ plan, consent: true }, h.adapters);
+	assert.deepEqual([result.outcome, result.failedStep], ["failed", "install-pi"]);
+	assert.deepEqual(h.upgrades, []);
+});
+
+test("an update stops before changing anything when the installed Gentle Shell or its owner cannot be confirmed", async () => {
+	const plan = existingPlan({ shell: { available: true, version: "3.9.0", usable: true, global: true, owner: "npm" },
+		gentleAi: { available: null }, setup: { available: null } });
+	for (const located of [[null], [{ root: "/home/u/work/gentle-pi", version: "3.9.0", owner: null }]]) {
+		const h = updateHarness({ located });
+		const result = await runStandardInstall({ plan, consent: true }, h.adapters);
+		assert.deepEqual([result.outcome, result.reason], ["blocked", "existing-stack-unverified"]);
+		assert.deepEqual(h.upgrades, []);
+	}
+	const h = updateHarness({ upgrade: async () => { throw new Error("npm ERR! EACCES /usr/local"); } });
+	const result = await runStandardInstall({ plan, consent: true }, h.adapters);
+	assert.deepEqual([result.outcome, result.failedStep], ["failed", "update-shell"]);
+	assert.equal(JSON.stringify(result).includes("EACCES"), false);
 });
 
 test("exported blocked reasons and failed steps match what the scenarios observed", () => {

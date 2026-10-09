@@ -32,6 +32,11 @@ export const stepLabels = Object.freeze({
 	"build-gentle-ai-main": "Build Gentle AI from main",
 	"install-shell-main": "Install Gentle Shell from main",
 	"record-channel": "Save the main channel",
+	"check-existing-shell": "Check for an existing Gentle Shell",
+	"check-installed-shell": "Find the installed Gentle Shell",
+	"install-pi": "Install Pi",
+	"update-shell": "Update Gentle Shell",
+	"verify-updated-shell": "Verify the updated Gentle Shell",
 });
 export function stepLabel(id) {
 	return typeof id === "string" && Object.hasOwn(stepLabels, id) ? stepLabels[id] : String(id);
@@ -89,6 +94,12 @@ function withMain(ids, steps) {
 
 export function expectedSteps(actionIds) {
 	const ids = new Set(list(actionIds));
+	// An existing Gentle Shell is updated in place, then set up again.
+	const update = ["update-shell-release", "update-shell-main"].find((id) => ids.has(id));
+	if (update) {
+		return ["check-npm", "check-global-bin", "check-installed-shell", ...(ids.has("install-pi") ? ["install-pi"] : []),
+			"update-shell", "verify-updated-shell", ...(update === "update-shell-release" ? ["verify-gentle-ai"] : []), "shell-setup"];
+	}
 	const addNpm = ids.has("persist-package-managers") || ids.has("persist-npm");
 	const addPnpm = ids.has("persist-package-managers") || ids.has("persist-pnpm");
 	if (recoveryPlan(actionIds)) {
@@ -98,7 +109,9 @@ export function expectedSteps(actionIds) {
 		return withMain(ids, ids.has("setup-global-bin") ? [...steps, "persist-path"] : steps);
 	}
 	// An npm that is about to be installed is checked after it is added.
-	const steps = [...(addNpm ? [] : ["check-npm"]), "check-global-bin", "check-existing-stack"];
+	// With Pi already installed, only Gentle Shell is added, so only it must be absent.
+	const shellOnly = ids.has("install-shell") && !ids.has("install-pi");
+	const steps = [...(addNpm ? [] : ["check-npm"]), "check-global-bin", shellOnly ? "check-existing-shell" : "check-existing-stack"];
 	if (ids.has("persist-node")) {
 		steps.push("persist-node", "persist-package-managers", "verify-persistent-runtime", "check-npm", "configure-npm-prefix");
 	} else if (addNpm || addPnpm) {
@@ -131,6 +144,7 @@ export function planModel(view) {
 	let kind = "install";
 	if (blockers.length > 0) kind = "blocked";
 	else if (actions.every((action) => action.id === "verify-readiness")) kind = "nothing";
+	else if (actions.some((action) => action.id.startsWith("update-shell-"))) kind = "update";
 	else if (recoveryPlan(actions.map((action) => action.id))) kind = "recovery";
 	const profile = view?.profileChange ?? {};
 	const persistence = view?.persistence ?? {};
@@ -397,8 +411,9 @@ export function renderPlan(doc, model, handlers) {
 		el(doc, "div", { class: "actions" }, close));
 	}
 	const recovery = model.kind === "recovery";
+	const updating = model.kind === "update";
 	const checkbox = el(doc, "input", { type: "checkbox", id: "consent", class: "consent-input", "aria-describedby": "consent-hint" });
-	const install = actionButton(doc, recovery ? "Complete setup" : "Install Gentle Shell", "primary", (button) =>
+	const install = actionButton(doc, recovery ? "Complete setup" : updating ? "Update Gentle Shell" : "Install Gentle Shell", "primary", (button) =>
 		handlers.install({ consent: checkbox.checked === true, checkbox, button }));
 	checkbox.addEventListener("change", () => {
 		if (checkbox.checked) checkbox.removeAttribute("aria-invalid");
@@ -407,6 +422,9 @@ export function renderPlan(doc, model, handlers) {
 	const heading = recovery
 		? { title: "Finish setting up Gentle Shell",
 			lead: "Gentle Shell is already installed; this completes setup. Nothing is reinstalled, and nothing changes until you confirm." }
+		: updating
+		? { title: "Update Gentle Shell",
+			lead: "Gentle Shell is already installed. This updates it with the package manager that installed it; your settings and sessions stay. Nothing changes until you confirm." }
 		: { title: "Review the installation plan",
 			lead: "Nothing changes until you confirm. This is exactly what the installer will do on this computer." };
 	return panel(doc, { stage: "review", eyebrow: "Step 2 of 4 · Review", ...heading },
@@ -415,14 +433,16 @@ export function renderPlan(doc, model, handlers) {
 		el(doc, "h2", { id: "changes-title", class: "section-title" }, "What changes on this computer"),
 		el(doc, "div", { class: "grid" }, model.disclosures.map((item) => disclosureCard(doc, item)))),
 	el(doc, "section", { class: "block", "aria-labelledby": "steps-title" },
-		el(doc, "h2", { id: "steps-title", class: "section-title" }, recovery ? "Setup steps" : "Installation steps"),
+		el(doc, "h2", { id: "steps-title", class: "section-title" }, recovery ? "Setup steps" : updating ? "Update steps" : "Installation steps"),
 		el(doc, "ol", { class: "plan-steps" }, model.actions.map((action) => el(doc, "li", {},
 			el(doc, "span", { class: "plan-step-text" }, rich(doc, action.description)))))),
 	el(doc, "div", { class: "consent" },
 		checkbox,
 		el(doc, "div", {},
 			el(doc, "label", { for: "consent", class: "consent-label" }, "I reviewed this plan and agree to these changes on this computer."),
-			el(doc, "p", { id: "consent-hint", class: "hint" }, "The installer runs only the steps listed above. Existing installations are not replaced."))),
+			el(doc, "p", { id: "consent-hint", class: "hint" }, updating
+				? "The installer runs only the steps listed above and updates only Gentle Shell (and Pi, if it is missing)."
+				: "The installer runs only the steps listed above. Existing installations are not replaced."))),
 	el(doc, "div", { class: "actions" }, install, close));
 }
 

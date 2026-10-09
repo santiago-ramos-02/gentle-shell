@@ -284,6 +284,63 @@ test("buildShellBarModel shortens the home directory and hides effort for non-re
 	assert.equal(built.branch, null);
 });
 
+test("buildShellBarModel reports auto effort for NaN models that manage their own depth", () => {
+	const { pi } = fakePi();
+	const { ctx } = fakeContext();
+	const model = ctx.model as unknown as { id: string; provider: string };
+	model.provider = "nan";
+	model.id = "deepseek-v4-flash";
+	const footerData = {
+		getGitBranch: () => null,
+		getExtensionStatuses: () => new Map(),
+		getAvailableProviderCount: () => 1,
+		onBranchChange: () => () => {},
+	};
+	assert.equal(buildShellBarModel(pi, ctx, footerData, { home: "/home/alan" }).effort, "auto");
+	// A NaN model that honors the level keeps reporting the selected one.
+	model.id = "glm5.3";
+	assert.equal(buildShellBarModel(pi, ctx, footerData, { home: "/home/alan" }).effort, "medium");
+});
+
+test("a self-managing NaN model announces its automatic depth once per session", async () => {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	const adaptive = { id: "qwen3.8-flash", provider: "nan", name: "Qwen 3.8 Flash", reasoning: true };
+	const budget = { id: "glm5.3", provider: "nan", name: "GLM 5.3", reasoning: true };
+	(ctx as unknown as { model: unknown }).model = adaptive;
+	const emit = async (event: string, payload: unknown) => {
+		for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+	};
+	await emit("thinking_level_select", { type: "thinking_level_select", level: "high", previousLevel: "medium" });
+	assert.deepEqual(ui.notices.filter((notice) => notice.includes("automatically")), [
+		"Qwen 3.8 Flash chooses its reasoning depth automatically; the selected thinking level is accepted but does not change it.",
+	]);
+	// Re-selecting the same model or level never repeats the notice.
+	await emit("model_select", { type: "model_select", model: adaptive, previousModel: budget, source: "set" });
+	assert.equal(ui.notices.filter((notice) => notice.includes("automatically")).length, 1);
+	// A model that applies the level never announces.
+	(ctx as unknown as { model: unknown }).model = budget;
+	await emit("model_select", { type: "model_select", model: budget, previousModel: adaptive, source: "set" });
+	assert.equal(ui.notices.filter((notice) => notice.includes("automatically")).length, 1);
+});
+
+test("a session that starts on a self-managing NaN model announces it once", async () => {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	const adaptive = { id: "mimo-v2.6-flash", provider: "nan", name: "MiMo V2.6 Flash", reasoning: true };
+	(ctx as unknown as { model: unknown }).model = adaptive;
+	for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+	assert.deepEqual(ui.notices.filter((notice) => notice.includes("automatically")), [
+		"MiMo V2.6 Flash chooses its reasoning depth automatically; the selected thinking level is accepted but does not change it.",
+	]);
+	// A session that starts on a model which honors the level stays silent.
+	(ctx as unknown as { model: unknown }).model = { id: "gemma4", provider: "nan", name: "Gemma 4", reasoning: true };
+	for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+	assert.equal(ui.notices.filter((notice) => notice.includes("automatically")).length, 1);
+});
+
 test("gentleShell installs the footer on session_start when a UI exists", () => {
 	const { pi, handlers } = fakePi();
 	gentleShell(pi, {});

@@ -10,6 +10,7 @@ import {
 	MainChannelError,
 	buildMainGentleAi,
 	channelStatePath,
+	installOwner,
 	mainChannelAdapter,
 	mainVersion,
 	packMainShell,
@@ -170,4 +171,14 @@ test("the runner adapter resolves commits and records the channel through the gi
 		await adapter.writeChannel(s.ctx, { channel: "main", shellCommit: SHELL_SHA, gentleAiCommit: AI_SHA });
 		assert.deepEqual(await readChannel(s.ctx, fsPromises), { channel: "main", shellCommit: SHELL_SHA, gentleAiCommit: AI_SHA });
 	} finally { s.cleanup(); }
+});
+
+test("the owner of an installation is pnpm under PNPM_HOME, npm only inside npm's global root, otherwise unknown", () => {
+	const roots = { pnpmHome: "/u/Library/pnpm", npmRoot: "/u/.local/lib/node_modules" };
+	assert.equal(installOwner({ ...roots, packageRoot: "/u/Library/pnpm/global/v11/x/node_modules/gentle-pi" }), "pnpm");
+	assert.equal(installOwner({ ...roots, packageRoot: "/u/.local/lib/node_modules/gentle-pi" }), "npm");
+	for (const packageRoot of ["/u/work/gentle-pi", "/u/.local/lib/node_modules", "/u/.local/lib/node_modules/other/gentle-pi"]) {
+		assert.equal(installOwner({ ...roots, packageRoot }), null, packageRoot);
+	}
+	assert.equal(installOwner({ pnpmHome: null, npmRoot: null, packageRoot: "/u/.local/lib/node_modules/gentle-pi" }), null);
 });

@@ -129,6 +129,57 @@ test("a Shell installed outside pnpm is the only blocker, without derived Gentle
 	assert.equal(plan.ready, false);
 });
 
+const unchecked = { available: null };
+const owned = (version: string, owner = "pnpm", usable = true) => ({ available: true, version, usable, global: true, owner });
+const updateIds = (plan: { actions: Array<{ id: string }> }) => plan.actions.map((action) => action.id);
+
+test("an older Gentle Shell that pnpm or npm owns is updated to the latest release, then set up", () => {
+	for (const shell of [owned("3.9.0"), owned("3.9.0", "npm"), owned("3.4.0", "pnpm", false), owned(`${requirements.shell}-main.6e7e3a18f794`, "npm")]) {
+		const plan = planPreflight({ ...installed(), shell, gentleAi: unchecked, setup: unchecked });
+		assert.deepEqual(plan.blockers, [], JSON.stringify(shell));
+		assert.equal(plan.tools.shell.status, "needs-update");
+		assert.deepEqual(updateIds(plan), ["update-shell-release", "setup-shell", "verify-readiness"]);
+		assert.deepEqual(plan.actions[0], { id: "update-shell-release", kind: "upgrade", target: "shell" });
+		assert.equal(plan.ready, false);
+	}
+});
+
+test("a current Gentle Shell installed by npm needs nothing on the release channel", () => {
+	const plan = planPreflight({ ...installed(), shell: owned(requirements.shell, "npm"), gentleAi: unchecked, setup: unchecked });
+	assert.deepEqual(plan.blockers, []);
+	assert.deepEqual(updateIds(plan), ["verify-readiness"]);
+	assert.equal(plan.ready, true);
+});
+
+test("a current pnpm-owned Gentle Shell plans exactly as before", () => {
+	const inventory = installed();
+	assert.deepEqual(planPreflight({ ...inventory, shell: { ...inventory.shell, owner: "pnpm" } }), planPreflight(inventory));
+});
+
+test("on the main channel an owned Gentle Shell is updated to the latest main, which needs Go", () => {
+	for (const shell of [owned(requirements.shell), owned("3.9.0", "npm"), owned(`${requirements.shell}-main.6e7e3a18f794`)]) {
+		const plan = planPreflight({ ...installed(), shell, go: tool("1.26.0"), gentleAi: unchecked, setup: unchecked }, { channel: "main" });
+		assert.deepEqual(plan.blockers, []);
+		assert.deepEqual(updateIds(plan), ["update-shell-main", "setup-shell", "verify-readiness"]);
+		assert.deepEqual(plan.actions[0], { id: "update-shell-main", kind: "upgrade", target: "shell" });
+	}
+	const noGo = planPreflight({ ...installed(), shell: owned("3.9.0"), go: absent }, { channel: "main" });
+	assert.deepEqual(noGo.blockers, [{ code: "main-requires-go", tool: "go" }]);
+});
+
+test("a missing Pi is installed before an existing Gentle Shell is updated", () => {
+	const plan = planPreflight({ ...installed(), pi: absent, shell: owned("3.9.0", "npm"), gentleAi: unchecked, setup: unchecked });
+	assert.deepEqual(updateIds(plan), ["install-pi", "update-shell-release", "setup-shell", "verify-readiness"]);
+});
+
+test("an existing compatible Pi from any installation is reused and only Gentle Shell is installed", () => {
+	for (const pi of [tool("1.2.0"), { ...tool("1.0.4"), external: true }]) {
+		const plan = planPreflight({ ...installed(), pi, shell: absent, gentleAi: absent, setup: false });
+		assert.equal(plan.tools.pi.status, "reusable");
+		assert.deepEqual(updateIds(plan), ["install-shell", "setup-shell", "verify-readiness"]);
+	}
+});
+
 test("an unknown Gentle AI still blocks when the Shell is reusable", () => {
 	const plan = planPreflight({ ...installed(), gentleAi: { available: null } });
 	assert.deepEqual(plan.blockers, [{ code: "unknown-tool", tool: "gentleAi" }]);

@@ -117,6 +117,8 @@ Delegate when a mechanism's own trigger fires, within the ODD workflow: understa
 
 Use the configured subagent runtime when available. Prefer the `subagent_*` tools (`subagent_run`, status/result helpers) when the Pi Subagents extension is installed, because they run the user's configured project/global subagent definitions and preserve history/background behavior.
 
+A child must be able to do the task it is given. Check the agent's declared `tools` in `subagent_list_agents` before launching: never give a read-only explorer shell, HTTP or MCP work, and never assume your own tools transfer to the child. With no qualified agent, report the capability gap; a fired trigger is never replaced by inline work.
+
 For bounded writes, follow the canonical Writer rule under Mandatory Delegation Triggers.
 
 <!-- gentle-pi:background-subagents -->

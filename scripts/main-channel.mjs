@@ -249,16 +249,40 @@ async function latestRelease(fetch) {
 	return version;
 }
 
-/** pnpm when this package lives under PNPM_HOME, otherwise npm. */
-async function ownerManager({ ctx, platform, packageRoot, fs, which }) {
+/**
+ * Which package manager owns an installed gentle-pi, from real (symlink-free) paths:
+ * pnpm when it lives under PNPM_HOME, npm only when it is `<npm root -g>/gentle-pi`
+ * itself, otherwise null — for example an `npm link` of a source checkout, which
+ * must never be reinstalled over.
+ */
+export function installOwner({ packageRoot, pnpmHome, npmRoot }) {
+	if (typeof packageRoot !== "string") return null;
+	if (typeof pnpmHome === "string" && inside(pnpmHome, packageRoot)) return "pnpm";
+	if (typeof npmRoot === "string" && relative(npmRoot, packageRoot) === "gentle-pi") return "npm";
+	return null;
+}
+
+async function npmGlobalRoot(npm, run, fs) {
+	if (!npm) return null;
+	const result = await run(npm, ["root", "-g"], { deadlineMs: deadlines.version });
+	const reported = succeeded(result) ? String(result.stdout ?? "").trim().split(/\r?\n/).at(-1) : "";
+	return isAbsolute(reported) ? fs.realpath(reported).catch(() => null) : null;
+}
+
+/** The package manager that owns this installation, or a typed refusal. */
+async function ownerManager({ ctx, platform, packageRoot, fs, which, run }) {
 	const bin = pnpmGlobalBin({ platform, env: { HOME: ctx.home, ...ctx.env } });
-	let pnpmOwned = false;
-	if (bin) {
-		const [home, root] = await Promise.all([fs.realpath(bin.pnpmHome).catch(() => null), fs.realpath(packageRoot).catch(() => null)]);
-		pnpmOwned = home !== null && root !== null && inside(home, root);
+	const npm = await which("npm");
+	const [pnpmHome, root, npmRoot] = await Promise.all([
+		bin ? fs.realpath(bin.pnpmHome).catch(() => null) : null,
+		fs.realpath(packageRoot).catch(() => null),
+		npmGlobalRoot(npm, run, fs),
+	]);
+	const name = installOwner({ packageRoot: root, pnpmHome, npmRoot });
+	if (!name) {
+		throw new MainChannelError("upgrade-owner-unknown", `neither pnpm nor npm owns ${root ?? packageRoot} (a linked source checkout, for example); update it the way you installed it`);
 	}
-	const name = pnpmOwned ? "pnpm" : "npm";
-	const command = await which(name);
+	const command = name === "npm" ? npm : await which("pnpm");
 	if (!command) throw new MainChannelError("upgrade-manager-missing", `${name}, which owns this Gentle Shell installation, is not on PATH`);
 	return { name, command };
 }
@@ -299,7 +323,7 @@ export async function runUpgrade({ args, ctx, platform, packageRoot, currentVers
 			out(`gentle-shell ${currentVersion} is already the latest release.`);
 			return 0;
 		}
-		await installGlobal(await ownerManager({ ctx, platform, packageRoot, fs, which }), `gentle-pi@${latest}`, run);
+		await installGlobal(await ownerManager({ ctx, platform, packageRoot, fs, which, run }), `gentle-pi@${latest}`, run);
 		await removeMainOverride(ctx, fs);
 		await writeChannel(ctx, { channel: "release" }, fs);
 		out(`Updated gentle-shell ${currentVersion} to ${latest} (release).`);
@@ -321,7 +345,7 @@ export async function runUpgrade({ args, ctx, platform, packageRoot, currentVers
 	}
 	if (!aiCurrent) await buildMainGentleAi({ commit: gentleAiCommit, ctx, platform, goPath, run, fs });
 	if (!shellCurrent) {
-		const manager = await ownerManager({ ctx, platform, packageRoot, fs, which });
+		const manager = await ownerManager({ ctx, platform, packageRoot, fs, which, run });
 		const tgz = await packMainShell({ commit: shellCommit, ctx, fetch, run, pnpm: { command: pnpmPath, prefix: [] }, fs });
 		await installGlobal(manager, tgz, run);
 	}

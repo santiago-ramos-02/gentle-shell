@@ -15,10 +15,14 @@ type Call = { command: string; argv: string[] };
 
 /** A sandboxed home with a pnpm- or npm-owned package root and fake network/processes. */
 function world({ owner = "pnpm", latest = "4.1.0", commits = { ai: AI_SHA, shell: SHELL_SHA }, tools = ["go", "pnpm", "npm"] } = {}) {
+	// owner "linked": `npm link` of a source checkout, so npm's global entry points outside npm's root.
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "upgrade-")));
 	const home = join(root, "home");
 	const pnpmHome = join(root, "pnpm");
-	const packageRoot = owner === "pnpm" ? join(pnpmHome, "global", "v11", "x", "node_modules", "gentle-pi") : join(root, "npm", "lib", "node_modules", "gentle-pi");
+	const npmRoot = join(root, "npm", "lib", "node_modules");
+	mkdirSync(npmRoot, { recursive: true });
+	const packageRoot = owner === "pnpm" ? join(pnpmHome, "global", "v11", "x", "node_modules", "gentle-pi")
+		: owner === "npm" ? join(npmRoot, "gentle-pi") : join(root, "checkout");
 	mkdirSync(packageRoot, { recursive: true });
 	mkdirSync(home);
 	const ctx = { env: { PNPM_HOME: pnpmHome }, home };
@@ -34,6 +38,7 @@ function world({ owner = "pnpm", latest = "4.1.0", commits = { ai: AI_SHA, shell
 		throw new Error(`unexpected fetch ${url}`);
 	};
 	const run = async (command: string, argv: string[], options: { env?: Record<string, string>; cwd?: string }) => {
+		if (command === "/usr/bin/npm" && argv.join(" ") === "root -g") return { code: 0, stdout: `${npmRoot}\n` };
 		calls.push({ command, argv });
 		if (argv[0] === "install" && argv[1]?.includes("gentle-ai/v4/cmd/gentle-ai@")) {
 			mkdirSync(options.env!.GOBIN, { recursive: true });
@@ -82,6 +87,14 @@ test("a release install updates to the latest release with the package manager t
 			assert.deepEqual(await readChannel(w.ctx, fsPromises), { channel: "release" });
 		} finally { w.cleanup(); }
 	}
+});
+
+test("a Gentle Shell that neither pnpm nor npm owns, such as an npm-linked checkout, is never reinstalled", async () => {
+	const w = world({ owner: "linked" });
+	try {
+		await assert.rejects(w.upgrade([]), (error: MainChannelError) => error.code === "upgrade-owner-unknown");
+		assert.deepEqual(w.installs(), []);
+	} finally { w.cleanup(); }
 });
 
 test("an unreachable registry fails without installing anything", async () => {

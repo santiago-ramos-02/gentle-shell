@@ -84,6 +84,7 @@ export async function collectInventory({ platform, arch, probes = {} }) {
 	return inventory;
 }
 
+const MAIN_BUILD = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-main\.[0-9a-f]{12}$/;
 function versionParts(version) {
 	if (typeof version !== "string" || !/^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) return null;
 	const parts = version.replace(/^v/, "").split(".").map(Number);
@@ -128,26 +129,41 @@ export function planPreflight(inventory, { channel = "release" } = {}) {
 	if (!supportedTarget) {
 		return { tools, blockers: [{ code: "unsupported-target", tool: "target" }], actions, ready: false };
 	}
+	// An installed Gentle Shell whose owner (pnpm or npm) is known is updated with
+	// that package manager instead of blocking: older, unusable or main-channel
+	// versions on release, and any version on main. A current pnpm-owned Shell
+	// keeps the pinned-stack checks below; a current npm-owned one needs nothing.
+	const shellSeen = inventory.shell;
+	const ownedShell = shellSeen?.available === true && (shellSeen.owner === "pnpm" || shellSeen.owner === "npm") &&
+		(versionParts(shellSeen.version) !== null || MAIN_BUILD.test(String(shellSeen.version)));
+	const current = ownedShell && shellSeen.usable === true && versionParts(shellSeen.version) !== null &&
+		compareVersions(versionParts(shellSeen.version), versionParts(requirements.shell)) >= 0;
+	const update = ownedShell && (main || !current) ? channel : null;
+	const npmCurrent = ownedShell && !update && shellSeen.owner === "npm";
 	function record(name, status, required) {
 		tools[name] = { status, ...(required ? { required } : {}) };
-		// Gentle AI and setup are only checked for the pinned Shell, so their
-		// unknown status adds nothing once that Shell already blocks.
-		const shellBlocks = tools.shell?.status === "incompatible" || tools.shell?.status === "unknown";
+		// Gentle AI and setup are only checked for the pinned pnpm Shell, so their
+		// unknown status adds nothing once that Shell blocks or is not the pinned one.
+		const shellBlocks = tools.shell?.status === "incompatible" || tools.shell?.status === "unknown" || update !== null || npmCurrent;
 		const derived = status === "unknown" && (name === "gentleAi" || name === "setup") && shellBlocks;
 		if (!derived && (status === "unknown" || status === "incompatible")) {
 			blockers.push({ code: `${status}-tool`, tool: name });
 		}
 	}
-	for (const name of ["node", "pi", "shell"]) {
-		record(name, classify(inventory[name], requirements[name], name === "shell" ? (o) => o.global : undefined), requirements[name]);
-	}
+	for (const name of ["node", "pi"]) record(name, classify(inventory[name], requirements[name]), requirements[name]);
+	if (update) record("shell", "needs-update", requirements.shell);
+	else if (npmCurrent) record("shell", "reusable", requirements.shell);
+	else record("shell", classify(inventory.shell, requirements.shell, (o) => o.global), requirements.shell);
 	// packageManager pins the acquisition choice, not a minimum supported pnpm.
 	// Existing versions require explicit engine/capability evidence from the probe.
 	record("pnpm", classify(inventory.pnpm, "0.0.0", (o) => o.compatible), requirements.pnpm);
 	record("gentleAi", classify(inventory.gentleAi, requirements.gentleAi, (o) => o.compatible, true), requirements.gentleAi);
 	const needsNative = tools.gentleAi.status === "unavailable";
 	// The main channel builds Gentle AI from source on every platform.
-	record("go", (platform === "win32" && needsNative) || main ? classify(inventory.go, requirements.go) : "not-required", requirements.go);
+	// gentle-pi's postinstall may build Gentle AI from source on Windows, so a
+	// Windows release update needs Go like an installation; main always does.
+	const windowsBuild = platform === "win32" && (update !== null || (needsNative && !npmCurrent));
+	record("go", windowsBuild || main ? classify(inventory.go, requirements.go) : "not-required", requirements.go);
 	if (main && tools.go.status !== "reusable") blockers.push({ code: "main-requires-go", tool: "go" });
 	const bin = inventory.globalBin;
 	const binKnown = bin?.available === true && typeof bin.path === "string" && bin.path.trim().length > 0 &&
@@ -166,6 +182,16 @@ export function planPreflight(inventory, { channel = "release" } = {}) {
 
 	function action(id, kind, target, version) {
 		actions.push({ id, kind, target, ...(version ? { version } : {}) });
+	}
+	// Existing Gentle Shell: update it (installing a missing Pi first), then set it up.
+	if (update || npmCurrent) {
+		if (update) {
+			if (tools.pi.status === "unavailable") action("install-pi", "install-global", "pi", requirements.pi);
+			action(`update-shell-${update}`, "upgrade", "shell");
+			action("setup-shell", "normal-setup", "shell");
+		}
+		action("verify-readiness", "verify", "stack");
+		return { tools, blockers, actions, ready: actions.length === 1 };
 	}
 	function acquire(name) {
 		if (tools[name].status !== "unavailable") return;
