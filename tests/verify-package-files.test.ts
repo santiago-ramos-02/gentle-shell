@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +15,15 @@ import {
 } from "../scripts/verify-package-files.mjs";
 import { INSTALLER_VERSION, RELEASE_BASE_URL, GENTLE_AI_WINDOWS_SOURCE_TAG } from "../scripts/gentle-ai-installer.mjs";
 import { GENTLE_AI_VERSION } from "../lib/gentle-ai-binary.ts";
+
+test("package resource CLI reconciles the STATUS diagnostic runtime with the generated inventory", () => {
+	const result = spawnSync(process.execPath, [join(process.cwd(), "scripts/verify-package-files.mjs")], {
+		cwd: process.cwd(), encoding: "utf8", env: { ...process.env, NODE_NO_WARNINGS: "1" },
+	});
+	assert.equal(result.status, 0, result.stderr || result.stdout);
+	assert.equal(result.stderr, "");
+	assert.match(result.stdout, /^gentle-pi package resource check passed \(/);
+});
 
 function makeFixtureRoot(): string {
 	return mkdtempSync(join(tmpdir(), "gentle-pi-verify-package-files-"));

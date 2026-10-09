@@ -867,7 +867,7 @@ test("findGentlePiDeclaration detects a bare npm:gentle-pi object source entry",
 });
 
 test("findGentlePiDeclaration recognises a relative path entry whose package.json name is gentle-pi", () => {
-	const resolvedDir = join("/agent", "..", "..", "work", "gentle-pi");
+	const resolvedDir = resolve("/agent", "..", "..", "work", "gentle-pi");
 	const result = findGentlePiDeclaration('{"packages":["../../work/gentle-pi"]}', {
 		agentDir: "/agent",
 		readPackageName: readPackageNameStub({ [resolvedDir]: "gentle-pi" }),
@@ -878,17 +878,17 @@ test("findGentlePiDeclaration recognises a relative path entry whose package.jso
 test("findGentlePiDeclaration recognises an absolute path entry whose package.json name is gentle-pi", () => {
 	const result = findGentlePiDeclaration('{"packages":["/checkouts/gentle-pi"]}', {
 		agentDir: "/agent",
-		readPackageName: readPackageNameStub({ "/checkouts/gentle-pi": "gentle-pi" }),
+		readPackageName: readPackageNameStub({ [resolve("/checkouts/gentle-pi")]: "gentle-pi" }),
 	});
-	assert.deepEqual(result, { kind: "path", dir: "/checkouts/gentle-pi" });
+	assert.deepEqual(result, { kind: "path", dir: resolve("/checkouts/gentle-pi") });
 });
 
 test("findGentlePiDeclaration recognises a path object source entry whose package.json name is gentle-pi", () => {
 	const result = findGentlePiDeclaration('{"packages":[{"source":"../gentle-pi","extensions":[]}]}', {
 		agentDir: "/agent",
-		readPackageName: readPackageNameStub({ [join("/agent", "..", "gentle-pi")]: "gentle-pi" }),
+		readPackageName: readPackageNameStub({ [resolve("/agent", "..", "gentle-pi")]: "gentle-pi" }),
 	});
-	assert.deepEqual(result, { kind: "path", dir: join("/agent", "..", "gentle-pi") });
+	assert.deepEqual(result, { kind: "path", dir: resolve("/agent", "..", "gentle-pi") });
 });
 
 test("findGentlePiDeclaration is undefined for a path entry whose package.json name is not gentle-pi", () => {
@@ -921,9 +921,9 @@ test("findGentlePiDeclaration is undefined when packages lists unrelated entries
 test("findGentlePiDeclaration returns the first matching declaration, path or npm, in list order", () => {
 	const result = findGentlePiDeclaration('{"packages":["../gentle-pi","npm:gentle-pi"]}', {
 		agentDir: "/agent",
-		readPackageName: readPackageNameStub({ [join("/agent", "..", "gentle-pi")]: "gentle-pi" }),
+		readPackageName: readPackageNameStub({ [resolve("/agent", "..", "gentle-pi")]: "gentle-pi" }),
 	});
-	assert.deepEqual(result, { kind: "path", dir: join("/agent", "..", "gentle-pi") });
+	assert.deepEqual(result, { kind: "path", dir: resolve("/agent", "..", "gentle-pi") });
 });
 
 // --- decideTakeOver -----------------------------------------------------------
@@ -1007,7 +1007,7 @@ test("otherPackageInjections resolves a path entry relative to agentDir", () => 
 		agentDir: "/agent",
 		skip: { kind: "npm" },
 	});
-	assert.deepEqual(result.paths, [join("/agent", "..", "..", "work", "pi-qwen-ambassador")]);
+	assert.deepEqual(result.paths, [resolve("/agent", "..", "..", "work", "pi-qwen-ambassador")]);
 });
 
 test("otherPackageInjections skips a git entry and warns", () => {
@@ -1033,7 +1033,7 @@ test("otherPackageInjections warns for an object entry with extensions or autolo
 });
 
 test("otherPackageInjections skips the entry matching a path declaration being taken over", () => {
-	const declaredDir = join("/agent", "..", "..", "work", "gentle-pi");
+	const declaredDir = resolve("/agent", "..", "..", "work", "gentle-pi");
 	const result = otherPackageInjections({
 		settingsText: '{"packages":["npm:some-other","../../work/gentle-pi"]}',
 		agentDir: "/agent",
@@ -1048,7 +1048,7 @@ test("otherPackageInjections tolerates undefined or malformed settings text", ()
 });
 
 test("otherPackageInjections skips every gentle-pi entry, not only the one matching the declaration kind", () => {
-	const declaredDir = join("/agent", "..", "..", "work", "gentle-pi");
+	const declaredDir = resolve("/agent", "..", "..", "work", "gentle-pi");
 	const result = otherPackageInjections({
 		// The declaration being taken over is the path entry, but settings
 		// also carries a second, unrelated npm:gentle-pi entry: both must be
@@ -1103,7 +1103,7 @@ test("otherPackageInjections keeps a declared package directory that isDirectory
 });
 
 test("otherPackageInjections excludes a settings path entry that resolves via realpath to the same physical directory as a realpath'd skip (R4-forced-root-symlink-double-injection)", () => {
-	const linkOtherDir = join("/agent", "link-other");
+	const linkOtherDir = resolve("/agent", "link-other");
 	const result = otherPackageInjections({
 		settingsText: '{"packages":["link-other","npm:some-other"]}',
 		agentDir: "/agent",
@@ -1122,7 +1122,7 @@ test("otherPackageInjections keeps comparing raw strings when no realpath resolv
 		agentDir: "/agent",
 		skip: { kind: "path", dir: "/real/other" },
 	});
-	assert.deepEqual(result.paths, [join("/agent", "link-other"), join("/agent", "npm", "node_modules", "some-other")]);
+	assert.deepEqual(result.paths, [resolve("/agent", "link-other"), join("/agent", "npm", "node_modules", "some-other")]);
 });
 
 test("otherPackageInjections defaults to including every declared package when isDirectory is not provided (existing callers keep pure string resolution)", () => {

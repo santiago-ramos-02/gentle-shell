@@ -5,11 +5,41 @@ foundation, the standard installation runner module (including runtime
 persistence), the secure local wizard host with its packaged entry and the
 interactive browser wizard UI are implemented. Windows native validation
 remains unavailable locally.
-**Preview:** run it from a checkout with `sh scripts/bootstrap.sh` (macOS,
-Linux) or `scripts\bootstrap.cmd` (Windows), as the [README](../README.md#path-c-browser-installer-preview)
-shows. There are no published bootstrap artifacts yet, and native macOS/Windows
-clean-machine runs are still unverified (T7); one Linux clean-container run
-passed (see [Clean-machine acceptance](#clean-machine-acceptance-t7)).
+**Preview:** download the unsigned double-click installer for your system
+from a release, or run it from a checkout with `sh scripts/bootstrap.sh`
+(macOS, Linux) or `scripts\bootstrap.cmd` (Windows), as the
+[README](../README.md#easiest-download-and-double-click-no-terminal-needed)
+shows. Native macOS/Windows clean-machine runs are still unverified (T7); one
+Linux clean-container run passed (see
+[Clean-machine acceptance](#clean-machine-acceptance-t7)).
+
+### Double-click downloads
+
+[`scripts/build-installer-bundles.mjs`](../scripts/build-installer-bundles.mjs)
+builds three archives with stable names, attached to every release by the
+`installers` job of `publish.yml` after the verified npm publication (same
+commit, `contents: write` only in that job), with
+`gentle-shell-installers-SHA256SUMS.txt`:
+
+| Asset | Launcher |
+| --- | --- |
+| `gentle-shell-installer-macos.zip` | `Gentle Shell Installer/Install Gentle Shell.command` |
+| `gentle-shell-installer-windows.zip` | `Gentle Shell Installer/Install Gentle Shell.cmd` (CRLF, ends with `pause`) |
+| `gentle-shell-installer-linux.tar.gz` | `gentle-shell-installer/install-gentle-shell.sh` |
+
+Each launcher runs `installer/scripts/bootstrap.sh` (or `bootstrap.cmd`) next to
+it; `installer/` holds `package.json`, every `installerPaths` file and every
+module they import (only `node:` built-ins otherwise), as real files because the
+bootstrap refuses symlinked bundle files. The downloads are **unsigned**:
+macOS Gatekeeper and Windows SmartScreen warn on first run, and the README
+explains how to continue. Signing and notarization are not done yet.
+
+The `installers` job uploads to the release with the tag the `publish` job
+verified (`needs.publish.outputs.tag`). It runs after npm publication, so its
+failure never affects npm, but it marks the run failed: recover with
+`gh run rerun <run id> --failed`, not a new `publish.yml` dispatch (that version
+is already on npm). Each launcher reports whether the bootstrap succeeded before
+it lets the window close.
 
 ## What is available
 
@@ -771,7 +801,12 @@ With that entry available, the fixed sequence is:
    than guess. The package is found from the resolved `pnpm` command; when that
    command is a regular cmd-shim file (as pnpm 11 writes when it installs
    itself), the search starts from its `# cmd-shim-target=` path. That path only
-   locates `package.json`; `pnpm --version` must still match it. Prerequisite
+   locates `package.json`; `pnpm --version` must still match it. A standalone
+   pnpm (a Mach-O or ELF executable, as mise, asdf and pnpm's own installer
+   provide) embeds its Node runtime and has no `package.json`: it skips the
+   package engine check but must still report an exact stable `--version` and
+   pass the same global `add`/`bin` capability checks. A script or shim without a
+   package still blocks. Prerequisite
    checks run from `/`, so a pnpm that switches to a project's `packageManager`
    pin reports its own version.
    Missing pnpm is acquired from a fixed registry tarball, SHA512-SRI verified,
