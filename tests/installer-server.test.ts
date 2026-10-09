@@ -9,7 +9,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { exitCodeFor, openBrowser, openerFor, redirectPage, runnerEnvironment, writeRedirect } from "../bin/gentle-shell-install.mjs";
 import { planPreflight, requirements } from "../scripts/installer-preflight.mjs";
-import { blockedReasons, failedSteps } from "../scripts/installer-runner.mjs";
+import { PI_INSTALL_VERSION, blockedReasons, failedSteps } from "../scripts/installer-runner.mjs";
 import { createInstallerServer, guidance } from "../scripts/installer-server.mjs";
 
 type Response = { status: number; headers: Record<string, string | string[] | undefined>; body: string };
@@ -295,14 +295,109 @@ test("/api/plan names the found and required version of an older Gentle Shell an
 	}
 });
 
-test("/api/plan names the found and required version of another older tool", async () => {
-	const { host, port, login } = await start({ collect: async () => collected({ pi: { available: true, version: "0.99.0", usable: true } }) });
+test("/api/plan installs the installer's Pi alongside an older Pi that neither pnpm nor npm manages, and says so before consent", async () => {
+	const { host, port, login, runs } = await start({ collect: async () => collected({ pi: { available: true, version: "0.99.0", usable: true, external: true } }) });
 	try {
 		const view = await plan(port, await login());
-		const blocker = view.blockers.find((item: { tool: string }) => item.tool === "pi");
-		assert.equal(blocker.guidance, "Pi 0.99.0 is installed, but this installer needs 0.99.1 or newer. Nothing was replaced. Update it, then select Check again.");
+		assert.deepEqual(view.blockers, []);
+		const install = view.actions.find((action: { id: string }) => action.id === "install-pi");
+		assert.equal(install.description, `Install Pi ${PI_INSTALL_VERSION} globally with pnpm for Gentle Shell. The Pi 0.99.0 already on this computer ` +
+			"was not installed with pnpm or npm, so it is left unchanged. Gentle Shell uses the installer's Pi; the `pi` command in a terminal may still run the older one.");
+		assert.deepEqual(runs, []);
 	} finally {
 		await host.close("test");
+	}
+});
+
+test("/api/plan shows an older Pi's update with its found and target versions and package manager, before consent", async () => {
+	for (const owner of ["pnpm", "npm"]) {
+		const { host, port, login, runs } = await start({ collect: async () => collected({ pi: { available: true, version: "0.87.1", usable: true, owner } }) });
+		try {
+			const view = await plan(port, await login());
+			assert.deepEqual(view.blockers, []);
+			const update = view.actions.find((action: { id: string }) => action.id === "update-pi");
+			assert.equal(update.description, `Update Pi 0.87.1 to ${PI_INSTALL_VERSION} with ${owner}, the package manager that installed it. ` +
+				`Gentle Shell needs Pi ${requirements.pi} or newer.`);
+			assert.ok(view.actions.findIndex((action: { id: string }) => action.id === "update-pi") <
+				view.actions.findIndex((action: { id: string }) => action.id === "install-shell"));
+			assert.deepEqual(runs, []);
+		} finally {
+			await host.close("test");
+		}
+	}
+});
+
+test("/api/plan says, before consent, that an older Node and an incompatible pnpm stay unchanged next to the pinned copies", async () => {
+	const { host, port, login, runs } = await start({ collect: async () => collected({
+		node: { available: true, version: "24.21.0", usable: true, persistent: false, npm: false, found: "22.18.0" },
+		pnpm: { available: true, version: "11.1.1", usable: true, compatible: true, persistent: false, found: "10.27.0" },
+	}) });
+	try {
+		const view = await plan(port, await login());
+		assert.deepEqual(view.blockers, []);
+		assert.deepEqual(view.persistence.tools, ["node", "npm", "pnpm"]);
+		const text = view.persistence.description;
+		assert.ok(text.includes(`Node.js 22.18.0 on this computer is older than ${requirements.node}, so the installer uses its pinned Node.js 24.21.0 ` +
+			"and installs it under $PNPM_HOME. Your Node.js 22.18.0 is left unchanged."), text);
+		assert.ok(text.includes(`pnpm 10.27.0 on this computer is not a pnpm ${requirements.pnpm.split(".")[0]} release this installer can use, ` +
+			`so the installer uses its pinned pnpm ${requirements.pnpm} and installs it under $PNPM_HOME. Your pnpm 10.27.0 is left unchanged.`), text);
+		// No PATH precedence is promised: a version manager may put its own copy first again.
+		assert.ok(text.includes("A version manager such as `mise activate` may still put your own versions first on PATH in new terminals."), text);
+		assert.deepEqual(runs, []);
+	} finally {
+		await host.close("test");
+	}
+	// Without a found version the description is unchanged.
+	const plain = await start();
+	try {
+		assert.doesNotMatch((await plan(plain.port, await plain.login())).persistence.description, /left unchanged|version manager/);
+	} finally {
+		await plain.host.close("test");
+	}
+});
+
+test("/api/plan says before consent which Go is downloaded, only to build, with the Go found and the system unchanged", async () => {
+	for (const [go, found] of [[{ available: true, version: "1.24.0", usable: true }, "Go 1.24.0 on this computer is older than 1.25.10"],
+		[{ available: false }, "Go is missing on this computer"]] as const) {
+		const { host, port, login } = await start({ collect: async () => collectedFor("main", { ...mainReady, go }) });
+		try {
+			const view = await plan(port, await login());
+			assert.deepEqual(view.blockers, []);
+			const acquire = view.actions.find((action: { id: string }) => action.id === "acquire-go");
+			assert.equal(acquire.description, `${found}, so the installer downloads Go 1.25.14 from go.dev, verifies its pinned SHA-256 checksum ` +
+				"and uses it only to build Gentle AI. It is kept in the installer's own folder (~/.pi/gentle-ai/tools/go); your Go, PATH and shell profile are not changed.");
+			assert.equal(view.actions.find((action: { id: string }) => action.id === "verify-go").description,
+				"Check that the downloaded Go runs and reports the pinned version.");
+		} finally {
+			await host.close("test");
+		}
+	}
+});
+
+test("/api/plan explains a pnpm in $PNPM_HOME/bin that the installer will not replace, with how to update it", async () => {
+	const inGlobalBin = (pnpm: object) => ({ pnpm: { ...pnpm, inGlobalBin: true } });
+	const cases = [
+		[inGlobalBin({ available: true, version: "11.0.5", usable: true, compatible: false, persistent: true }), "incompatible-tool",
+			`pnpm 11.0.5 is installed in the pnpm global bin directory, where this installer would put its own pnpm, but this installer needs pnpm ${requirements.pnpm} or a newer 11.x. ` +
+			`Nothing was replaced. Update it with \`pnpm self-update ${requirements.pnpm}\`, then select Check again.`],
+		[inGlobalBin({ available: true, version: "12.0.0", usable: true, compatible: false, persistent: true }), "incompatible-tool",
+			`pnpm 12.0.0 is installed in the pnpm global bin directory, where this installer would put its own pnpm, but this installer only runs pnpm 11 (${requirements.pnpm} or a newer 11.x). ` +
+			"Nothing was replaced, and this installer never downgrades pnpm. To use it, make a pnpm 11 release your global pnpm the way you prefer, then select Check again."],
+		[inGlobalBin({ available: null }), "unknown-tool",
+			"A pnpm is installed in the pnpm global bin directory, where this installer would put its own pnpm, but its version could not be checked. " +
+			`Nothing was replaced. If \`pnpm --version\` reports a version older than ${requirements.pnpm}, update it with \`pnpm self-update ${requirements.pnpm}\`, then select Check again.`],
+	] as const;
+	for (const [change, code, text] of cases) {
+		const { host, port, login } = await start({ collect: async () => collected({ ...change, node: { available: true, version: "24.18.0", usable: true, persistent: true, npm: true } }) });
+		try {
+			const view = await plan(port, await login());
+			assert.deepEqual(view.actions, []);
+			const blocker = view.blockers.find((item: { tool: string }) => item.tool === "pnpm");
+			assert.equal(blocker.code, code);
+			assert.equal(blocker.guidance, text);
+		} finally {
+			await host.close("test");
+		}
 	}
 });
 
@@ -428,13 +523,14 @@ test("installing a main plan re-checks the computer on the main channel", async 
 	}
 });
 
-test("/api/plan explains that the main channel needs Go", async () => {
-	const { host, port, login } = await start({ collect: async (channel) => collectedFor(channel, { pi: { available: false }, shell: { available: false } }) });
+test("/api/plan explains that the main channel cannot use a Go it cannot check", async () => {
+	const { host, port, login } = await start({ collect: async (channel) => collectedFor(channel, { pi: { available: false }, shell: { available: false }, go: { available: null } }) });
 	try {
 		const cookie = await login();
 		const view = JSON.parse((await send(port, { path: "/api/plan?channel=main", headers: { cookie, ...API } })).body);
 		const blocker = view.blockers.find((item: { code: string }) => item.code === "main-requires-go");
-		assert.equal(blocker.guidance, `The \`main\` channel builds Gentle AI from source and needs Go ${requirements.go} or newer on your PATH. Install Go, or choose the release channel, then select Check again.`);
+		assert.equal(blocker.guidance, "The `main` channel builds Gentle AI with Go, but `go version` did not report a version this installer can check. " +
+			"Make sure `go version` works in a terminal, or choose the release channel, then select Check again.");
 		assert.deepEqual(view.actions, []);
 	} finally {
 		await host.close("test");
@@ -827,11 +923,16 @@ test("entry helpers: fixed per-platform opener, exit codes and runner environmen
 	const files = new Set([`${TOOLS}/pnpm/bin/pnpm`, "/usr/bin/pnpm"]);
 	const fs = { isFile: async (path: string) => files.has(path) };
 	const wizardEnv = { HOME: "/home/u", PATH: `${TOOLS}/node/bin:${TOOLS}/pnpm/bin:/opt/bin:/bin` };
-	// A bootstrap-only pnpm stays reachable only as the last PATH entry; other tool dirs are dropped.
+	// The bootstrap's pnpm comes first; other tool dirs are dropped.
 	assert.deepEqual(await runnerEnvironment({ platform: "linux", env: wizardEnv, fs }),
-		{ HOME: "/home/u", PATH: `/opt/bin:/bin:${TOOLS}/pnpm/bin` });
+		{ HOME: "/home/u", PATH: `${TOOLS}/pnpm/bin:/opt/bin:/bin` });
+	// The bootstrap acquired its pnpm because the user's is incompatible: the runner never runs the user's.
 	files.add("/opt/bin/pnpm");
-	assert.deepEqual(await runnerEnvironment({ platform: "linux", env: wizardEnv, fs }), { HOME: "/home/u", PATH: "/opt/bin:/bin" });
+	assert.deepEqual(await runnerEnvironment({ platform: "linux", env: wizardEnv, fs }),
+		{ HOME: "/home/u", PATH: `${TOOLS}/pnpm/bin:/opt/bin:/bin` });
+	// The user's own pnpm, reused by the bootstrap, stays the one on PATH.
+	const reused = { HOME: "/home/u", PATH: `${TOOLS}/node/bin:/opt/bin:/bin` };
+	assert.deepEqual(await runnerEnvironment({ platform: "linux", env: reused, fs }), { HOME: "/home/u", PATH: "/opt/bin:/bin" });
 	const windowsEnv = { USERPROFILE: "C:\\Users\\u", Path: `C:\\Users\\u\\AppData\\Local\\.gentle-shell-bootstrap-tools.1\\node;C:\\Windows`,
 		GENTLE_INSTALL_PNPM_NODE: "C:\\t\\node.exe", GENTLE_INSTALL_PNPM_ENTRY: "C:\\t\\pnpm.mjs" };
 	assert.deepEqual(await runnerEnvironment({ platform: "win32", env: windowsEnv, fs }),
