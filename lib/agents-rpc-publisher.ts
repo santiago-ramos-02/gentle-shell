@@ -22,6 +22,9 @@ const TOOL_ARGS_LIMIT = 500;
 const TOOL_OUTPUT_LIMIT = 500;
 /** Text/thinking/note thread item text can be arbitrarily large (a whole streamed reply); bound it too. */
 const TEXT_ITEM_LIMIT = 2000;
+/** A finished task's final reply is its answer, published once, so a host can show it whole.
+ * Still bounded, so one runaway reply stays well under the payload limit. */
+const FINAL_REPLY_LIMIT = 32_000;
 /** Summary fields that can carry a long, freeform diagnostic or step name. */
 const SUMMARY_FIELD_LIMIT = 500;
 /** Thread items kept per task in one push, most recent last. */
@@ -100,7 +103,7 @@ function safeStringify(value: unknown): string {
 	}
 }
 
-function projectThreadItem(item: ThreadItem): RpcThreadItem {
+function projectThreadItem(item: ThreadItem, textLimit: number = TEXT_ITEM_LIMIT): RpcThreadItem {
 	if (item.kind === THREAD_ITEM.TOOL) {
 		return {
 			kind: item.kind,
@@ -111,7 +114,7 @@ function projectThreadItem(item: ThreadItem): RpcThreadItem {
 			output: truncate(item.output, TOOL_OUTPUT_LIMIT),
 		};
 	}
-	return { kind: item.kind, text: truncate(item.text, TEXT_ITEM_LIMIT) };
+	return { kind: item.kind, text: truncate(item.text, textLimit) };
 }
 
 function projectTaskSummary(task: TaskRecord): RpcTaskSummary {
@@ -171,7 +174,9 @@ export function projectRpcActivity(store: TaskStore, opts: ProjectRpcActivityOpt
 		tasks: tasks.map((task) => {
 			const thread = store.thread(task.id);
 			const kept = maxThreadItems >= thread.items.length ? thread.items : thread.items.slice(thread.items.length - maxThreadItems);
-			return { summary: projectTaskSummary(task), thread: { version: thread.version, dropped: thread.dropped, total: thread.dropped + thread.items.length, items: kept.map(projectThreadItem) } };
+			const finalReply = isFinished(task.status) ? kept.findLastIndex((item) => item.kind === THREAD_ITEM.TEXT) : -1;
+			const items = kept.map((item, index) => projectThreadItem(item, index === finalReply ? FINAL_REPLY_LIMIT : TEXT_ITEM_LIMIT));
+			return { summary: projectTaskSummary(task), thread: { version: thread.version, dropped: thread.dropped, total: thread.dropped + thread.items.length, items } };
 		}),
 	};
 }

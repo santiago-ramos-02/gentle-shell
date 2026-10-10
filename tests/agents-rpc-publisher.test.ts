@@ -183,6 +183,33 @@ test("projectRpcActivity truncates a synthetic 1 MiB text item to 2000 character
 	assert.ok(item.text.endsWith("…"));
 });
 
+test("projectRpcActivity publishes a finished task's final reply in full, keeping earlier items at 2000 characters", () => {
+	const store = new TaskStore();
+	store.add(task("t1", "s1"));
+	store.apply("t1", { type: TASK_EVENT.TEXT, text: "a".repeat(3000) }, 1);
+	store.apply("t1", { type: TASK_EVENT.NOTE, text: "n" }, 2);
+	const report = `${"r".repeat(5000)}\n\`\`\`sh\ngit diff origin/main -- packages/x\n\`\`\``;
+	store.apply("t1", { type: TASK_EVENT.TEXT, text: report }, 3);
+
+	const running = projectRpcActivity(store).tasks[0]!.thread.items as { text: string }[];
+	assert.equal(running.at(-1)!.text.length, 2000, "a running task's reply is still a bounded preview");
+
+	store.update("t1", { status: TASK_STATUS.COMPLETED, endedAt: 2000 });
+	const finished = projectRpcActivity(store).tasks[0]!.thread.items as { text: string }[];
+	assert.equal(finished.at(-1)!.text, report);
+	assert.equal(finished[0]!.text.length, 2000, "only the final reply is published in full");
+});
+
+test("projectRpcActivity bounds a finished task's final reply to 32000 characters", () => {
+	const store = new TaskStore();
+	store.add(task("t1", "s1", { status: TASK_STATUS.COMPLETED, endedAt: 2000 }));
+	store.apply("t1", { type: TASK_EVENT.TEXT, text: "x".repeat(1024 * 1024) }, 1);
+
+	const item = projectRpcActivity(store).tasks[0]!.thread.items[0] as { text: string };
+	assert.equal(item.text.length, 32_000);
+	assert.ok(item.text.endsWith("…"));
+});
+
 test("projectRpcActivity truncates the summary error, label, and lastStep fields to 500 characters", () => {
 	const store = new TaskStore();
 	store.add(task("t1", "s1", { label: "l".repeat(600) }));
