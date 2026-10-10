@@ -1863,10 +1863,11 @@ function splitNativeConsentInvocation(invocation        )                    {
 			continue;
 		}
 		// Provider invocations are not shell commands. Keep every path backslash
-		// verbatim, including quoted UNC and drive-root paths. Outside quotes,
-		// only a backslash before whitespace joins a space-containing token.
+		// verbatim, including quoted UNC and drive-root paths. Outside quotes, a
+		// backslash escapes only whitespace or a quote, so a space-containing token
+		// and a POSIX-quoted apostrophe (`'it'\''s'`) split exactly.
 		const next = source[index + 1];
-		if (character === "\\" && quote === undefined && next !== undefined && /\s/.test(next)) {
+		if (character === "\\" && quote === undefined && next !== undefined && (/\s/.test(next) || next === "'" || next === '"')) {
 			escaping = true;
 			started = true;
 			continue;

@@ -1216,8 +1216,11 @@ async function maybeAutoProvisionHome(home, runtime, { homeHadContentBeforeBoots
 async function handleUpgradeCommand(commandArgs) {
 	const { MainChannelError, runUpgrade } = await import("../scripts/main-channel.mjs");
 	const { hostAdapters } = await import("../scripts/installer-probes.mjs");
-	const { run } = hostAdapters();
+	const { upgradeInvocation } = await import("../scripts/installer-runner.mjs");
+	const { run, fs: probeFs } = hostAdapters();
 	const which = async (name) => findOnPath(name) ?? null;
+	// Windows: npm and pnpm are .cmd shims; run what they run, never through cmd.exe.
+	const invocation = upgradeInvocation({ platform: process.platform, env: process.env, run, fs: probeFs });
 	try {
 		process.exitCode = await runUpgrade({
 			args: commandArgs,
@@ -1229,6 +1232,7 @@ async function handleUpgradeCommand(commandArgs) {
 				fetch: globalThis.fetch,
 				fs: await import("node:fs/promises"),
 				which,
+				...(invocation ? { invocation } : {}),
 				run: (command, argv, options = {}) => run(command, argv, { env: options.env ?? process.env, cwd: options.cwd, deadlineMs: options.deadlineMs ?? 20 * 60_000 }),
 			},
 			out: (line) => process.stdout.write(`${line}\n`),

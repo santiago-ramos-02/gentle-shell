@@ -169,10 +169,16 @@ function head(path, size) {
 // symlink. pnpm 11 names its target in a `# cmd-shim-target=` comment; older
 // shims only run the single `"$basedir/<target>" "$@"` next to the shim. The
 // target is a starting point for the evidence search, not proof: the command
-// itself still has to print the version that evidence names.
+// itself still has to print the version that evidence names. A shim is a
+// script read whole, up to 64 KiB; a larger one fails closed. Anything else,
+// such as a native pnpm, is not a shim.
+const SHIM_LIMIT = 64 * 1024;
 function shimTarget(command) {
 	if (!regular(command)) return null;
-	const text = head(command, 4096).toString("utf8");
+	const bytes = head(command, SHIM_LIMIT + 1);
+	if (bytes.subarray(0, 2).toString("latin1") !== "#!") return null;
+	if (bytes.length > SHIM_LIMIT) throw new Error("Existing pnpm compatibility is unknown: shim larger than 64 KiB");
+	const text = bytes.toString("utf8");
 	const match = /^# cmd-shim-target=(\/[^\r\n]+)$/m.exec(text);
 	if (match) return stat(match[1]) ? match[1] : null;
 	const targets = new Set([...text.matchAll(/"\$basedir\/([^"$`\\]+)"[ \t]+"\$@"/g)]
@@ -477,8 +483,9 @@ export function installedGo(root, platform, arch, adapters = {}) {
  * the exact go.dev archive, verified (size and SHA-256) before it is read,
  * extracted in process into a private staging directory (regular files and
  * directories under `go/` only; no links, traversal or duplicates), checked
- * against its VERSION and published without replacing anything as
- * `<root>/<version>/go`, marked last. Nothing outside `root` is written, and the
+ * against its VERSION, marked, and published without replacing anything as
+ * `<root>/<version>/go` by one rename of the staging directory, so the
+ * destination never exists unmarked. Nothing outside `root` is written, and the
  * user's own Go, PATH and profile are never touched. Adapters (artifact,
  * download, digest) are trusted local test code only.
  * Returns { goPath, version, acquired }.
@@ -490,9 +497,9 @@ export async function acquireGo({ root, platform, arch, adapters = {} }) {
 	const reused = installedGo(root, platform, arch, adapters);
 	if (reused) return { goPath: reused, version: descriptor.version, acquired: false };
 	let stage = null;
-	let claimed = false;
 	try {
-		if (stat(destination)) throw new Error("Conflicting Go destination");
+		// Never replaced: an unmarked folder may not be the installer's.
+		if (stat(destination)) throw new Error(`Conflicting Go destination: ${destination}`);
 		const bytes = await verifiedDownload("go", adapters, platform, arch);
 		mkdirSync(root, { recursive: true, mode: 0o700 });
 		if (!privateDirectory(root)) throw new Error("Unsafe Go destination");
@@ -511,14 +518,14 @@ export async function acquireGo({ root, platform, arch, adapters = {} }) {
 		const tree = join(stage, "go");
 		if (!regular(join(tree, "bin", executable)) || !regular(join(tree, "VERSION")) ||
 			readFileSync(join(tree, "VERSION"), "utf8").split("\n")[0] !== `go${descriptor.version}`) throw new Error("Go archive content rejected");
-		// mkdir is the atomic no-clobber claim (rename alone can replace an empty directory).
-		mkdirSync(destination, { mode: 0o700 });
-		claimed = true;
-		renameSync(tree, join(destination, "go"));
-		writeFileSync(join(destination, GO_MARKER), `${descriptor.url}\n`, { flag: "wx", mode: 0o600 });
+		// The staging directory becomes the destination whole: marked first, then
+		// one rename (an existing non-empty destination makes it fail).
+		writeFileSync(join(stage, GO_MARKER), `${descriptor.url}\n`, { flag: "wx", mode: 0o600 });
+		if (stat(destination)) throw new Error(`Conflicting Go destination: ${destination}`);
+		renameSync(stage, destination);
+		stage = null;
 		return { goPath: join(destination, "go", "bin", executable), version: descriptor.version, acquired: true };
 	} catch (cause) {
-		if (claimed) rmSync(destination, { recursive: true, force: true });
 		throw new Error("Go verified acquisition failed; nothing was published", { cause });
 	} finally {
 		if (stage) rmSync(stage, { recursive: true, force: true });

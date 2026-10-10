@@ -114,6 +114,7 @@ interface WindowsGoCall {
 	file: string;
 	arguments_: string[];
 	options: {
+		cwd?: string;
 		env?: NodeJS.ProcessEnv;
 		shell?: boolean;
 		timeout?: number;
@@ -190,6 +191,55 @@ test("Windows source install reports missing or too-old Go without publishing a 
 		);
 		assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v4.0.0", "gentle-ai.exe")), false);
 		assert.deepEqual((await readdir(packageRoot)).filter((entry) => entry.includes("install-")), []);
+	}
+});
+
+test("a failed Windows go install keeps the go command's error, with its stdout and stderr, as the cause", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-windows-cause-"));
+	try {
+		const installError = Object.assign(new Error("Command failed: go.exe install\ngo: verifying module: checksum mismatch"),
+			{ code: 1, stdout: "", stderr: "go: verifying module: checksum mismatch\n" });
+		const fixture = windowsGoFixture({ installError });
+		const goPath = join(packageRoot, "go.exe");
+		await writeFile(goPath, "trusted local Go executable");
+		fixture.setGoExecutable(goPath);
+		await assert.rejects(
+			() => installGentleAi({ packageRoot, platform: "win32", arch: "x64", execFile: fixture.run, resolveGoExecutable: async () => goPath }),
+			(error: unknown) => error instanceof Error && error.cause === installError && (error.cause as { stderr: string }).stderr.includes("checksum mismatch"),
+		);
+	} finally { await rm(packageRoot, { recursive: true, force: true }); }
+});
+
+// Run 38063142924: from a 179-character pnpm store package root, Go's asm.exe failed with
+// "The directory name is invalid." because its working directory, inside GOMODCACHE, exceeded MAX_PATH.
+test("Windows source install builds in a short private directory under the temp root, never inside the package, and removes it", async () => {
+	for (const installError of [undefined, Object.assign(new Error("go install failed"), { code: 1, stderr: "go: failed\n" })]) {
+		const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-windows-short-build-"));
+		const temporaryDirectory = await mkdtemp(join(tmpdir(), "gentle-pi-installer-temp-"));
+		try {
+			const fixture = windowsGoFixture({ installError });
+			const goPath = join(packageRoot, "go.exe");
+			await writeFile(goPath, "trusted local Go executable");
+			fixture.setGoExecutable(goPath);
+			const install = installGentleAi({ packageRoot, platform: "win32", arch: "x64", execFile: fixture.run, resolveGoExecutable: async () => goPath, temporaryDirectory });
+			if (installError) await assert.rejects(install, (error: unknown) => error instanceof Error && "code" in error && error.code === "GENTLE_AI_GO_INSTALL_FAILED");
+			else assert.equal((await install).installed, true);
+			const goInstall = fixture.calls.find((call) => call.arguments_[0] === "install");
+			assert.ok(goInstall);
+			const buildDirectory = goInstall.options.cwd ?? "";
+			assert.match(buildDirectory.slice(temporaryDirectory.length), /^[\\/]gai-[^\\/]+$/, "a fresh gai- directory directly under the temp root");
+			const env = goInstall.options.env ?? {};
+			for (const key of ["GOBIN", "GOPATH", "GOMODCACHE", "GOCACHE", "TEMP", "TMP"]) {
+				assert.ok(env[key]?.startsWith(buildDirectory), `${key} is under the build directory`);
+				assert.equal(env[key]?.startsWith(packageRoot), false, `${key} is outside the package`);
+			}
+			for (const call of fixture.calls.filter((entry) => entry.file === goPath)) assert.ok(call.options.cwd?.startsWith(buildDirectory), call.arguments_.join(" "));
+			assert.deepEqual(await readdir(temporaryDirectory), [], "the build directory is removed");
+			if (!installError) assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v4.0.0", "gentle-ai.exe")), true, "the verified binary is published into the package");
+		} finally {
+			await rm(packageRoot, { recursive: true, force: true });
+			await rm(temporaryDirectory, { recursive: true, force: true });
+		}
 	}
 });
 

@@ -12,6 +12,7 @@ const LOG_LIMIT = 200;
 /** Human labels for every step the runner logs. Unknown ids are shown as-is. */
 export const stepLabels = Object.freeze({
 	gate: "Safety checks",
+	"prepare-pnpm-home": "Create the private pnpm folder",
 	"check-npm": "Check npm",
 	"check-global-bin": "Check the pnpm global bin directory",
 	"check-existing-stack": "Check for an existing installation",
@@ -57,6 +58,7 @@ const toolLabels = Object.freeze({
 	gentleAi: "Gentle AI",
 	go: "Go",
 	globalBin: "pnpm global bin directory",
+	pnpmHome: "pnpm home folder",
 	setup: "Gentle Shell setup",
 	target: "This computer",
 });
@@ -128,16 +130,18 @@ export function expectedSteps(actionIds) {
 	// An npm that is about to be installed is checked after it is added.
 	// With Pi already installed, only Gentle Shell is added, so only it must be absent.
 	const shellOnly = ids.has("install-shell") && !ids.has("install-pi");
-	const steps = [...(addNpm ? [] : ["check-npm"]), "check-global-bin", shellOnly ? "check-existing-shell" : "check-existing-stack", ...piCheck];
+	// The pinned Go comes right after the checks, before anything is persisted.
+	const steps = [...(addNpm ? [] : ["check-npm"]), "check-global-bin", shellOnly ? "check-existing-shell" : "check-existing-stack", ...piCheck, ...go];
 	if (ids.has("persist-node")) {
-		steps.push("persist-node", "persist-package-managers", "verify-persistent-runtime", "check-npm", "configure-npm-prefix");
+		// Only npm is added next to a persistent pnpm, which is never downgraded.
+		steps.push("persist-node", ids.has("persist-npm") ? "persist-npm" : "persist-package-managers", "verify-persistent-runtime", "check-npm", "configure-npm-prefix");
 	} else if (addNpm || addPnpm) {
 		const add = ["persist-package-managers", "persist-npm", "persist-pnpm"].find((id) => ids.has(id));
 		steps.push(add);
 		if (addNpm) steps.push("check-npm");
 		if (addPnpm) steps.push("verify-persistent-pnpm");
 	}
-	steps.push(...go, ...piSteps, "install-global", "verify-global-list", "verify-shell-bin", "verify-gentle-ai", "shell-setup");
+	steps.push(...piSteps, "install-global", "verify-global-list", "verify-shell-bin", "verify-gentle-ai", "shell-setup");
 	if (ids.has("setup-global-bin")) steps.push("persist-path");
 	return withMain(ids, steps);
 }
@@ -179,6 +183,8 @@ export function planModel(view) {
 		kind,
 		actions,
 		blockers,
+		// S6: reused tools in folders another account can change; a notice, never a blocker.
+		notice: typeof view?.sharedFolders?.description === "string" ? text(view.sharedFolders.description) : null,
 		disclosures: [
 			{
 				id: "profile",
@@ -234,7 +240,9 @@ export function progressModel(steps, entries, { running = false, outcome = null 
 	};
 }
 
-const detailCommands = new Map([["shell-setup", "gentle-shell setup"], ["persist-path", "pnpm setup"]]);
+const detailCommands = new Map([["shell-setup", "gentle-shell setup"], ["persist-path", "pnpm setup"], ["acquire-go", "the Go download"],
+	["install-global", "pnpm add -g"], ["install-shell-main", "the Gentle Shell main install"], ["build-gentle-ai-main", "the Gentle AI main build"],
+	["update-shell", "the Gentle Shell update"]]);
 
 /** Final screen model for every runner outcome. Guidance always comes from the host. */
 export function outcomeModel(outcome) {
@@ -260,7 +268,7 @@ export function outcomeModel(outcome) {
 			next: ["Follow the guidance above.", "Run the installer again from your terminal."] };
 	}
 	const id = text(outcome?.failedStep);
-	// The host sends a detail only for these fixed setup commands; bound it again here.
+	// The host sends a detail only for these fixed steps; bound it again here.
 	const detailCommand = detailCommands.get(id) ?? null;
 	const detail = detailCommand ? Array.from(text(outcome?.detail)).slice(0, 300).join("") : "";
 	return { ...base, outcome: "failed", tone: "error", badge: "Failed", title: "Installation failed",
@@ -467,6 +475,9 @@ export function renderPlan(doc, model, handlers) {
 	el(doc, "section", { class: "block", "aria-labelledby": "changes-title" },
 		el(doc, "h2", { id: "changes-title", class: "section-title" }, "What changes on this computer"),
 		el(doc, "div", { class: "grid" }, model.disclosures.map((item) => disclosureCard(doc, item)))),
+	model.notice ? el(doc, "section", { class: "alert alert-warning", "aria-labelledby": "notice-title" },
+		el(doc, "h2", { id: "notice-title", class: "alert-title" }, el(doc, "span", { "aria-hidden": "true" }, "! "), "Tools in folders other accounts can change"),
+		el(doc, "p", {}, rich(doc, model.notice))) : null,
 	el(doc, "section", { class: "block", "aria-labelledby": "steps-title" },
 		el(doc, "h2", { id: "steps-title", class: "section-title" }, recovery ? "Setup steps" : updating || updatingPi ? "Update steps" : "Installation steps"),
 		el(doc, "ol", { class: "plan-steps" }, model.actions.map((action) => el(doc, "li", {},
