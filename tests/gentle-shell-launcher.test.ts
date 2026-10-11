@@ -163,6 +163,29 @@ test("parseLauncherArgs recognises the upgrade subcommand as argv[0] and capture
 	assert.equal(parsed.piSubcommand, undefined);
 });
 
+test("parseLauncherArgs recognises the self-uninstall subcommand as argv[0] and captures its arguments", () => {
+	const parsed = parseLauncherArgs(["self-uninstall", "--dry-run", "--include-shared"]);
+	assert.equal(parsed.command, "self-uninstall");
+	assert.deepEqual(parsed.commandArgs, ["--dry-run", "--include-shared"]);
+	assert.deepEqual(parsed.passthrough, []);
+	assert.equal(parsed.piSubcommand, undefined);
+	assert.equal(parsed.error, undefined);
+});
+
+test("parseLauncherArgs keeps uninstall as pi's own alias for remove", () => {
+	const parsed = parseLauncherArgs(["uninstall", "npm:x"]);
+	assert.equal(parsed.command, undefined);
+	assert.equal(parsed.piSubcommand, "uninstall");
+	assert.deepEqual(parsed.passthrough, ["uninstall", "npm:x"]);
+});
+
+test("help text documents gentle-shell self-uninstall and its flags", () => {
+	const text = helpText();
+	assert.ok(text.includes("       gentle-shell self-uninstall [--dry-run] [--yes] [--include-shared]"));
+	assert.ok(text.includes("  self-uninstall   Remove Gentle Shell: its own data, the isolated home and the gentle-pi"));
+	assert.match(text, /'gentle-shell uninstall <source>' is pi's own alias for 'remove'/);
+});
+
 test("help text documents gentle-shell upgrade and its channels", () => {
 	const text = helpText();
 	assert.ok(text.includes("       gentle-shell upgrade [--channel release|main]"));

@@ -96,6 +96,7 @@ export const requiredPaths = [
 	"runtime/gentle-ai-binary.mjs",
 	"runtime/gentle-shell-launcher.mjs",
 	"runtime/gentle-shell-resume-hint.mjs",
+	"runtime/gentle-shell-uninstall.mjs",
 	"runtime/native-review-cli.mjs",
 	"runtime/status-timing-diagnostics.mjs",
 	"runtime/review-integration-v2.mjs",

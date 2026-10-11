@@ -301,8 +301,14 @@ async function npmGlobalRoot(npm, run, fs) {
 	return isAbsolute(reported) ? fs.realpath(reported).catch(() => null) : null;
 }
 
-/** The package manager that owns this installation, as { name, command, prefix }, or a typed refusal. */
-async function ownerManager({ ctx, platform, packageRoot, adapters }) {
+const OWNER_ADVICE = Object.freeze({ upgrade: "update it the way you installed it", uninstall: "remove it the way you installed it" });
+
+/**
+ * The package manager that owns this installation, as { name, command, prefix },
+ * or a typed refusal whose code names the `command` that asked (`upgrade` or
+ * `uninstall`). adapters: { fs, run, which, invocation? }, as runUpgrade takes them.
+ */
+export async function ownerManager({ ctx, platform, packageRoot, adapters, command: purpose = "upgrade" }) {
 	const { fs, run } = adapters;
 	const bin = pnpmGlobalBin({ platform, env: { HOME: ctx.home, ...ctx.env } });
 	const npm = await invocationOf("npm", adapters, platform);
@@ -313,10 +319,12 @@ async function ownerManager({ ctx, platform, packageRoot, adapters }) {
 	]);
 	const name = installOwner({ packageRoot: root, pnpmHome, npmRoot, platform });
 	if (!name) {
-		throw new MainChannelError("upgrade-owner-unknown", `neither pnpm nor npm owns ${root ?? packageRoot} (a linked source checkout, for example); update it the way you installed it`);
+		throw new MainChannelError(`${purpose}-owner-unknown`, `neither pnpm nor npm owns ${root ?? packageRoot} (a linked source checkout, for example); ${OWNER_ADVICE[purpose]}`);
 	}
 	const manager = name === "npm" ? npm : await invocationOf("pnpm", adapters, platform);
-	if (!manager) throw new MainChannelError("upgrade-manager-missing", `${name}, which owns this Gentle Shell installation, is not on PATH as a command this upgrade can run`);
+	if (!manager) {
+		throw new MainChannelError(`${purpose}-manager-missing`, `${name}, which owns this Gentle Shell installation, is not on PATH as a command this ${purpose} can run`);
+	}
 	return { name, ...manager };
 }
 

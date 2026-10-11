@@ -4,7 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { CHANNEL_SCHEMA, MainChannelError, readChannel, runUpgrade, writeChannel } from "../scripts/main-channel.mjs";
+import { CHANNEL_SCHEMA, MainChannelError, ownerManager, readChannel, runUpgrade, writeChannel } from "../scripts/main-channel.mjs";
 
 const AI_SHA = "1f9d5e6423e37f7d2316859045f379ba9b5d8c3a";
 const SHELL_SHA = "6e7e3a18f794223396527a54c7c36d19c7d236c6";
@@ -71,7 +71,9 @@ function world({ owner = "pnpm", latest = "4.1.0", commits = { ai: AI_SHA, shell
 		adapters: { fetch, run, fs, which, ...(invocation ? { invocation } : {}) }, out: (line: string) => lines.push(line) });
 	const installs = () => calls.filter((call) => call.argv.some((arg) => ["add", "install"].includes(arg)) && !call.argv.some((arg) => arg.includes("cmd/gentle-ai@")))
 		.map((call) => `${call.command} ${call.argv.join(" ")}`);
-	return { root, home, ctx, calls, roots, lines, fetches, upgrade, installs, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+	const manager = (command?: string) => ownerManager({ ctx, platform, packageRoot, adapters: { fs, run, which, ...(invocation ? { invocation } : {}) },
+		...(command === undefined ? {} : { command }) });
+	return { root, home, ctx, calls, roots, lines, fetches, upgrade, installs, manager, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test("a release install that is already the latest release changes nothing", async () => {
@@ -111,6 +113,39 @@ test("a Gentle Shell that neither pnpm nor npm owns, such as an npm-linked check
 		await assert.rejects(w.upgrade([]), (error: MainChannelError) => error.code === "upgrade-owner-unknown");
 		assert.deepEqual(w.installs(), []);
 	} finally { w.cleanup(); }
+});
+
+test("self-uninstall resolves the owning package manager with its own refusals", async () => {
+	for (const [owner, expected] of [["pnpm", { name: "pnpm", command: "/usr/bin/pnpm", prefix: [] }], ["npm", { name: "npm", command: "/usr/bin/npm", prefix: [] }]] as const) {
+		const w = world({ owner });
+		try {
+			assert.deepEqual(await w.manager("uninstall"), expected);
+		} finally { w.cleanup(); }
+	}
+	const linked = world({ owner: "linked" });
+	try {
+		await assert.rejects(linked.manager("uninstall"), (error: MainChannelError) =>
+			error.code === "uninstall-owner-unknown" && /remove it the way you installed it/.test(error.message));
+	} finally { linked.cleanup(); }
+	const missing = world({ tools: ["npm"] });
+	try {
+		await assert.rejects(missing.manager("uninstall"), (error: MainChannelError) => error.code === "uninstall-manager-missing");
+	} finally { missing.cleanup(); }
+});
+
+test("upgrade keeps its owner refusals unchanged", async () => {
+	const linked = world({ owner: "linked" });
+	try {
+		await assert.rejects(linked.manager(), (error: MainChannelError) =>
+			error.code === "upgrade-owner-unknown" && /update it the way you installed it/.test(error.message));
+	} finally { linked.cleanup(); }
+	const missing = world({ tools: ["npm"] });
+	try {
+		await assert.rejects(missing.manager(), (error: MainChannelError) =>
+			error.code === "upgrade-manager-missing" && /which owns this Gentle Shell installation, is not on PATH/.test(error.message));
+		await assert.rejects(missing.upgrade([]), (error: MainChannelError) => error.code === "upgrade-manager-missing");
+		assert.deepEqual(missing.installs(), []);
+	} finally { missing.cleanup(); }
 });
 
 test("an unreachable registry fails without installing anything", async () => {
@@ -248,6 +283,25 @@ test("Windows: a package manager that resolves only to a .cmd, or not at all, is
 			await assert.rejects(main.upgrade(["--channel", "main"]), (error: MainChannelError) => error.code === "main-requires-tools");
 			assert.deepEqual(main.calls, []);
 		} finally { main.cleanup(); }
+	}
+});
+
+test("Windows: self-uninstall resolves npm and pnpm through the host's invocation, never a .cmd", async () => {
+	for (const [owner, expected] of [["pnpm", { name: "pnpm", command: NODE_EXE, prefix: [PNPM_ENTRY] }], ["npm", { name: "npm", command: NODE_EXE, prefix: [NPM_CLI] }]] as const) {
+		const w = windowsWorld({ owner });
+		try {
+			assert.deepEqual(await w.manager("uninstall"), expected);
+			assert.deepEqual(w.roots.map((call) => `${call.command} ${call.argv.join(" ")}`), [`${NODE_EXE} ${NPM_CLI} root -g`]);
+		} finally { w.cleanup(); }
+	}
+	for (const invocation of [undefined, async () => null]) {
+		for (const owner of ["pnpm", "npm"]) {
+			const w = windowsWorld({ owner, invocation });
+			try {
+				await assert.rejects(w.manager("uninstall"), (error: MainChannelError) => error.code === (owner === "npm" ? "uninstall-owner-unknown" : "uninstall-manager-missing"));
+				assert.deepEqual([w.calls, w.roots], [[], []]);
+			} finally { w.cleanup(); }
+		}
 	}
 });
 

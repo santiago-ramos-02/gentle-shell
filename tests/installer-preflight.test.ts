@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { artifactFor } from "../scripts/installer-downloads.mjs";
 import test from "node:test";
 import { PI_INSTALL_VERSION, collectInventory, goAcquisition, planPreflight, pnpmGlobalBin, requirements } from "../scripts/installer-preflight.mjs";
 
@@ -25,6 +29,25 @@ test("requirements follow repository metadata and native installer pin", () => {
 	assert.equal(requirements.pnpm, pkg.packageManager.split("@")[1]);
 	assert.equal(requirements.shell, pkg.version);
 	assert.equal(requirements.go, "1.25.10");
+});
+
+test("preflight imports a packed manifest without packageManager using the verified pnpm pin", () => {
+	const root = mkdtempSync(fileURLToPath(new URL("./.preflight-packed-", import.meta.url)));
+	try {
+		const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+		delete pkg.packageManager;
+		writeFileSync(join(root, "package.json"), JSON.stringify(pkg));
+		cpSync(new URL("../scripts", import.meta.url), join(root, "scripts"), { recursive: true });
+		const entry = pathToFileURL(join(root, "scripts/installer-preflight.mjs")).href;
+		const result = spawnSync(process.execPath, ["--input-type=module", "-e",
+			`const { requirements } = await import(${JSON.stringify(entry)}); console.log(JSON.stringify(requirements));`], { encoding: "utf8" });
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(result.stderr, "");
+		assert.equal(result.stdout, `${JSON.stringify({ ...requirements, pnpm: artifactFor("pnpm").version })}\n`);
+		assert.equal(readFileSync(join(root, "package.json"), "utf8"), JSON.stringify(pkg));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 for (const platform of ["linux", "darwin", "win32"]) {
@@ -559,6 +582,25 @@ test("a user's pnpm in $PNPM_HOME/bin is never persisted over: an older or newer
 		}
 	}
 	assert.deepEqual(planPreflight(runtimeStack(node, { available: null, inGlobalBin: true })).blockers, [{ code: "unknown-tool", tool: "pnpm" }]);
+});
+
+test("a user's pnpm in $PNPM_HOME/bin that could not be checked is left as it is: the bootstrap's pnpm runs, nothing is persisted over it", () => {
+	const node = { ...tool("24.18.0"), persistent: true, npm: true };
+	const unchecked = { ...tool("11.1.1"), compatible: true, persistent: true, inGlobalBin: true, unchecked: true };
+	const rest = ["install-pi", "install-shell", "setup-shell", "verify-readiness"];
+	for (const [n, persisted] of [[node, []], [pinnedNode("22.18.0"), ["persist-node", "persist-npm", "configure-npm-prefix"]]] as const) {
+		const plan = planPreflight(runtimeStack(n, unchecked));
+		assert.deepEqual(plan.blockers, []);
+		assert.deepEqual(plan.tools.pnpm, { status: "reusable", required: requirements.pnpm, unchecked: true });
+		assert.deepEqual(plan.actions.map((action: { id: string }) => action.id), [...persisted, ...rest]);
+	}
+	// Only that case is recorded: a checked compatible pnpm there, or an untrusted one (S7), is not.
+	for (const pnpm of [{ ...unchecked, unchecked: undefined }, { ...unchecked, unchecked: undefined, untrusted: true }]) {
+		assert.deepEqual(planPreflight(runtimeStack(node, pnpm)).tools.pnpm, { status: "reusable", required: requirements.pnpm });
+	}
+	// One whose version was read and is incompatible still blocks.
+	assert.deepEqual(planPreflight(runtimeStack(node, { ...tool("11.0.5"), compatible: false, persistent: true, inGlobalBin: true })).blockers,
+		[{ code: "incompatible-tool", tool: "pnpm" }]);
 });
 
 test("an older Go is left as it is: the pinned Go is acquired alongside, and a set-up stack downloads nothing", () => {
