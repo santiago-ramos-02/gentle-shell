@@ -14,6 +14,7 @@ import {
 	resolveGentleAiReleaseAsset,
 } from "../scripts/gentle-ai-installer.mjs";
 import { fileURLToPath } from "node:url";
+import { findForkGentleAiBinary } from "./t3-fork-gentle-ai.ts";
 
 export const GENTLE_AI_BINARY_MISSING_CODE = "package-local-binary-missing";
 export const GENTLE_AI_INSTALL_RECOVERY_COMMAND = "node scripts/install-gentle-ai.mjs";
@@ -280,6 +281,9 @@ export function resolveGentleAiBinary(
 	// pinned resolution below is byte-identical to the pre-override behavior.
 	const override = resolveGentleAiDevBinaryOverride(environment, platform);
 	if (override !== undefined) return override.path;
+	// T3 fork: the fork gentle-ai T3 Code names wins over the pinned copy (lib/t3-fork-gentle-ai.ts).
+	const fork = findForkGentleAiBinary(environment.env);
+	if (fork !== undefined) return fork;
 	const binaryPath = gentleAiBinaryPath(packageRoot, platform);
 	const versionDirectory = dirname(binaryPath);
 	const manifestPath = join(versionDirectory, "integrity.json");

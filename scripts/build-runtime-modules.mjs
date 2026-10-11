@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const sources = [
+	"t3-fork-gentle-ai",
 	"gentle-ai-binary",
 	"review-relay-contract",
 	"review-integration-v2",
