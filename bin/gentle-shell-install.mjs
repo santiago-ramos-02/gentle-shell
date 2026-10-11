@@ -9,10 +9,10 @@ import { createProbes, hostAdapters, userEnvironment } from "../scripts/installe
 import { acquireGo } from "../scripts/installer-downloads.mjs";
 import { childEnvironment, goFirstEnvironment, lookPath, packageNativeGentleAi, pnpmInvocation, runStandardInstall, upgradeInvocation } from "../scripts/installer-runner.mjs";
 import { createInstallerServer } from "../scripts/installer-server.mjs";
-import { configHome, mainChannelAdapter, runUpgrade } from "../scripts/main-channel.mjs";
+import { configHome, mainChannelAdapter, ownerManager, removeGlobalShell, runUpgrade } from "../scripts/main-channel.mjs";
 import { ensureWindowsPnpmHome, windowsWizardEnvironment } from "../scripts/installer-windows.mjs";
 import { pathEntryPlan, prefixLayout, prefixRoot } from "../scripts/bundled-install.mjs";
-import { DISTRIBUTION_RELEASES, bundledGate, bundledPlan, fetchDistribution, runBundledInstall, windowsPathRegistry } from "../scripts/bundled-wizard.mjs";
+import { DISTRIBUTION_RELEASES, bundledGate, bundledPlan, fetchDistribution, migrationGate, runBundledInstall, windowsPathRegistry } from "../scripts/bundled-wizard.mjs";
 
 // Browser installation wizard entry, started by the bootstrap with no argv.
 // Thin wiring only: real probes and adapters, the standard or bundled runner
@@ -135,7 +135,9 @@ export function upgradeEnvironment({ platform, env, pnpmHome, goPath }) {
 /** The wizard host's collectPlan and runInstall. Every plan starts from a fresh
  * preflight. A new release installation whose release publishes the
  * distribution assets gets the bundled plan (bundledGate) and the bundled
- * runner; everything else gets planPreflight and the standard runner, unchanged.
+ * runner; so does an existing Gentle Shell that a global pnpm or npm owns
+ * (migrationGate, S4), whose plan ends by removing that old package with its
+ * own manager. Everything else gets planPreflight and the standard runner, unchanged.
  * `distributionBase`, `download` and `inventory` are trusted local overrides
  * for tests and local checks.
  */
@@ -157,25 +159,55 @@ export function wizardHandlers({ platform, arch, env, run, fs, distributionBase 
 			// Fresh probes every time: createProbes caches its global package listing.
 			const inventory = inventoryFor ? await inventoryFor(channel)
 				: await collectInventory({ platform, arch, probes: createProbes({ platform, env: wizardEnv, run, fs, pnpmHome }), pnpmHome });
-			// Only a new release installation asks whether its release publishes the assets.
-			const assets = channel === "release" && inventory.shell?.available === false
+			// Only a new release installation, or one a global pnpm or npm owns, asks whether its release publishes the assets.
+			const owned = inventory.shell?.available === true && ["pnpm", "npm"].includes(inventory.shell.owner);
+			const assets = channel === "release" && (inventory.shell?.available === false || owned)
 				? await fetchDistribution({ version: requirements.shell, base: distributionBase, ...(download ? { download } : {}) }) : null;
-			if (bundledGate({ channel, inventory, distribution: assets, version: requirements.shell })) {
+			const manager = migrationGate({ channel, inventory, distribution: assets, version: requirements.shell });
+			if (manager || bundledGate({ channel, inventory, distribution: assets, version: requirements.shell })) {
 				distribution = assets;
 				// The folder the claim will take (Windows may fall back to the profile), from read-only checks.
 				const layout = prefixLayout({ platform, env: user, home, root: prefixRoot({ platform, env: user }) });
-				return { inventory, plan: bundledPlan({ platform, distribution: assets, layout, path: pathEntryPlan(layout, { platform, env: user, home }) }) };
+				return { inventory, plan: bundledPlan({ platform, distribution: assets, layout, path: pathEntryPlan(layout, { platform, env: user, home }),
+					...(manager ? { migrate: { manager, removal: "plan" } } : {}) }) };
 			}
 			return { inventory, plan: planPreflight(inventory, { channel }) };
 		},
 		runInstall: async (request, log) => {
+			const { env: wizardEnv, pnpmHome } = wizard;
+			// npm and pnpm as `gentle-shell upgrade` runs them (a pinned Go first on PATH when given). On
+			// Windows they are the bootstrap's handoff and run without cmd.exe.
+			const managers = (runnerEnv, goPath) => {
+				const upgradeEnv = upgradeEnvironment({ platform, env: runnerEnv, pnpmHome, goPath });
+				const invocation = upgradeInvocation({ platform, env: upgradeEnv, run, fs, handoff: true });
+				return {
+					fetch: globalThis.fetch,
+					fs: fsPromises,
+					which: (name) => lookPath(name, upgradeEnv, platform, fs),
+					...(invocation ? { invocation } : {}),
+					// stderrTail: a failed main build or extraction keeps its bounded stderr as the error's cause.
+					run: (command, argv, options = {}) => run(command, argv, { env: options.env ?? upgradeEnv, cwd: options.cwd, deadlineMs: options.deadlineMs ?? 20 * 60_000,
+						...(options.stderrTail === undefined ? {} : { stderrTail: options.stderrTail }) }),
+				};
+			};
+			const runnerContext = async () => {
+				const runnerEnv = await runnerEnvironment({ platform, env: wizardEnv, fs });
+				return { runnerEnv, ctx: { env: runnerEnv, home: runnerEnv.HOME ?? env.HOME ?? env.USERPROFILE } };
+			};
 			if (request?.plan?.bundled !== undefined) {
 				return runBundledInstall(request, { platform, arch, env: user, home, distribution, log,
-					...(platform === "win32" ? { registry: windowsPathRegistry(env) } : {}) });
+					...(platform === "win32" ? { registry: windowsPathRegistry(env) } : {}),
+					// The consented owner, found again now: the old gentle-pi is removed only with the manager that still owns it.
+					removeGlobal: async (name) => {
+						const located = await createProbes({ platform, env: wizardEnv, run, fs, pnpmHome }).locateShell();
+						if (located?.owner !== name) return false;
+						const { runnerEnv, ctx } = await runnerContext();
+						const adapters = managers(runnerEnv, null);
+						const manager = await ownerManager({ ctx, platform, packageRoot: located.root, adapters });
+						return manager.name === name && removeGlobalShell(manager, adapters.run);
+					} });
 			}
-			const { env: wizardEnv, pnpmHome } = wizard;
-			const runnerEnv = await runnerEnvironment({ platform, env: wizardEnv, fs });
-			const ctx = { env: runnerEnv, home: runnerEnv.HOME ?? env.HOME ?? env.USERPROFILE };
+			const { runnerEnv, ctx } = await runnerContext();
 			return runStandardInstall(request, {
 			platform,
 			nodePath: process.execPath,
@@ -191,30 +223,17 @@ export function wizardHandlers({ platform, arch, env, run, fs, distributionBase 
 			// Only a plan that needs Go and found it missing or older: verified go.dev
 			// bytes under <config home>/tools/go, used by path or child PATH only.
 			acquireGo: () => acquireGo({ root: join(configHome(ctx), "tools", "go"), platform, arch }),
-			// A pinned Go goes first on the PATH of the upgrade's children only. On
-			// Windows npm and pnpm (the bootstrap's handoff) run without cmd.exe.
-			upgradeShell: async ({ channel, packageRoot, currentVersion, goPath }) => {
-				const upgradeEnv = upgradeEnvironment({ platform, env: runnerEnv, pnpmHome, goPath });
-				const invocation = upgradeInvocation({ platform, env: upgradeEnv, run, fs, handoff: true });
-				return (await runUpgrade({
-					args: ["--channel", channel],
-					ctx,
-					platform,
-					arch,
-					packageRoot,
-					currentVersion,
-					adapters: {
-						fetch: globalThis.fetch,
-						fs: fsPromises,
-						which: (name) => lookPath(name, upgradeEnv, platform, fs),
-						...(invocation ? { invocation } : {}),
-						// stderrTail: a failed main build or extraction keeps its bounded stderr as the error's cause.
-						run: (command, argv, options = {}) => run(command, argv, { env: options.env ?? upgradeEnv, cwd: options.cwd, deadlineMs: options.deadlineMs ?? 20 * 60_000,
-							...(options.stderrTail === undefined ? {} : { stderrTail: options.stderrTail }) }),
-					},
-					out: () => {},
-				})) === 0;
-			},
+			// A pinned Go goes first on the PATH of the upgrade's children only.
+			upgradeShell: async ({ channel, packageRoot, currentVersion, goPath }) => (await runUpgrade({
+				args: ["--channel", channel],
+				ctx,
+				platform,
+				arch,
+				packageRoot,
+				currentVersion,
+				adapters: managers(runnerEnv, goPath),
+				out: () => {},
+			})) === 0,
 			verifyGentleAi: packageNativeGentleAi,
 			// Only a main plan uses it: network access and writes under ~/.pi/gentle-ai.
 			mainChannel: mainChannelAdapter({ fs: fsPromises }),

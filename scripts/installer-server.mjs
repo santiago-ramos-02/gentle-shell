@@ -90,6 +90,7 @@ export const actionDescriptions = Object.freeze({
 	"bundled-activate": "Make this version the active one and write the `gentle-shell` launcher.",
 	"bundled-path": "Make new terminals find `gentle-shell`.",
 	"bundled-setup": "Run `gentle-shell setup` with the bundled launcher.",
+	"remove-global-shell": "Remove the old global gentle-pi with the package manager that installed it.",
 });
 
 const tryAgain = "Fix the cause, then run the installer again.";
@@ -147,6 +148,7 @@ export const guidance = Object.freeze({
 		"activate-version": `The installed version could not be made the active one. ${tryAgain}`,
 		"write-launcher": `The \`gentle-shell\` launcher could not be written in Gentle Shell's private folder. ${tryAgain}`,
 		"bundled-path": "Gentle Shell is installed, but the PATH change could not be made, or it is no longer the one the plan showed, so nothing was changed. Run the installer again to see the current PATH plan.",
+		"verify-launcher": `The new \`gentle-shell\` launcher did not report the expected Gentle Shell and Pi versions, so your old global Gentle Shell was kept. ${tryAgain}`,
 	}),
 	blockers: Object.freeze({
 		"unsupported-target": "This operating system or CPU is not supported by the wizard. Follow the README for a manual installation.",
@@ -162,6 +164,8 @@ export const guidance = Object.freeze({
 		"terminal-action-required": "Gentle Shell is installed. Open a new terminal so it picks up the updated PATH, then run `gentle-shell`.",
 		"add-path-line": "Gentle Shell is installed. Add the line below to your shell profile, open a new terminal, then run `gentle-shell`.",
 	}),
+	// A migration whose old global gentle-pi could not be removed: the install stays.
+	removeGlobalFailed: "The old global gentle-pi could not be removed, so a terminal may still find it first. Remove it with the command below.",
 	// A failed install, main-channel or update step whose detail shows GitHub's anonymous API limit.
 	githubRateLimit: "GitHub's limit for anonymous API requests was reached on this network, so the installation could not finish. Wait up to an hour, then run the installer again.",
 	// A failed shell-setup whose detail shows GitHub's anonymous API limit.
@@ -187,7 +191,10 @@ const goConflict = (detail) => detail.startsWith("Conflicting Go destination: ")
 // The main channel's typed error when GitHub refused the latest main commit with HTTP 403.
 const githubLimited = (detail) => rateLimited(detail) || (/\bmain-commit-unavailable\b/.test(detail) && /\bHTTP 403\b/.test(detail));
 // Fixed steps whose sanitized last error line may reach the browser.
-const detailSteps = Object.freeze({ "shell-setup": rateLimited, "install-version": () => false, "persist-path": unknownShell, "acquire-go": goConflict,
+// The bundled steps send a detail only for a migration (its error message); a new install's send none.
+const bundledDetail = Object.fromEntries(["claim-prefix", "copy-npm-settings", "install-runtime", "activate-version", "write-launcher", "verify-launcher", "bundled-path"]
+	.map((step) => [step, () => false]));
+const detailSteps = Object.freeze({ ...bundledDetail, "shell-setup": rateLimited, "install-version": () => false, "persist-path": unknownShell, "acquire-go": goConflict,
 	"install-global": githubLimited, "install-shell-main": githubLimited, "build-gentle-ai-main": githubLimited, "update-shell": githubLimited });
 const detailGuidance = Object.freeze({ "shell-setup": "setupRateLimit", "persist-path": "persistPathShell", "acquire-go": "goDestinationConflict",
 	"install-global": "githubRateLimit", "install-shell-main": "githubRateLimit", "build-gentle-ai-main": "githubRateLimit", "update-shell": "githubRateLimit" });
@@ -426,6 +433,8 @@ function bundledDescription(action, bundled) {
 		: bundled.path?.kind === "symlink" ? `Link ${file} to the \`gentle-shell\` launcher; that folder is already on your PATH.`
 		: `Add one line to ${file} so new terminals find \`gentle-shell\`.`;
 	case "bundled-setup": return "Run `gentle-shell setup` with the bundled launcher to set up Gentle Shell's own Pi home (~/.gentle-shell/agent).";
+	case "remove-global-shell": return `Once the new launcher reports Gentle Shell ${plainText(bundled.shell)} with Pi ${plainText(bundled.pi)}, remove the old global gentle-pi with ` +
+		`\`${plainText(bundled.migrate?.command)}\`. Your Pi and ~/.gentle-shell/agent are not changed.`;
 	default: return actionDescriptions[action.id] ?? "Prepare the installation.";
 	}
 }
@@ -542,6 +551,12 @@ function outcomeView(result) {
 			if (file === pathLine.file && line === pathLine.line && file && line) view.pathLine = { file, line };
 		}
 		if (["configured", "unchanged"].includes(result.npmPrefix)) view.npmPrefix = result.npmPrefix;
+		// Only the two fixed removal commands are ever shown.
+		const remove = plainObject(result.removeGlobal) && result.removeGlobal.status === "failed" ? result.removeGlobal.command : null;
+		if (["pnpm remove -g gentle-pi", "npm uninstall -g gentle-pi"].includes(remove)) {
+			view.removeCommand = remove;
+			view.guidance += ` ${guidance.removeGlobalFailed}`;
+		}
 	}
 	return view;
 }

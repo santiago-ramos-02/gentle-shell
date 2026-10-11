@@ -17,6 +17,7 @@ const sources = [
 	"telemetry-trigger",
 	"child-package-injection",
 	"gentle-shell-launcher",
+	"gentle-shell-bundled",
 	"gentle-shell-resume-hint",
 	"gentle-shell-uninstall",
 ];

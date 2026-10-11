@@ -1127,7 +1127,8 @@ test("expectedSteps mirrors runBundledInstall's step order, and every bundled st
 	const steps = ["claim-prefix", "copy-npm-settings", "install-runtime", "install-version", "activate-version", "write-launcher", "bundled-path", "shell-setup"];
 	assert.deepEqual(wizard.expectedSteps(bundledIds), steps);
 	assert.deepEqual(wizard.expectedSteps(bundledIds.filter((id) => id !== "bundled-path")), steps.filter((id) => id !== "bundled-path"));
-	assert.deepEqual([...bundledFailedSteps], steps);
+	// verify-launcher runs only for a migration (T3).
+	assert.deepEqual([...bundledFailedSteps], [...steps.slice(0, 6), "verify-launcher", ...steps.slice(6)]);
 	for (const id of steps) assert.notEqual(wizard.stepLabel(id), id, `label for ${id}`);
 	// The runner logs exactly that order.
 	const layout = prefixLayout({ platform: "linux", env: {}, home: "/home/u" });
@@ -1171,4 +1172,34 @@ test("outcomeModel gives the PATH line to add when the bundled install may not e
 	assert.ok(model.next.some((text: string) => /open a new terminal/i.test(text)));
 	assert.equal(wizard.outcomeModel({ outcome: "failed", failedStep: "install-version", completed: [], guidance: "g", detail: "ERR_PNPM_FETCH_401" }).detailCommand,
 		"pnpm install");
+});
+
+// T3: a migration checks the new launcher, then removes the old global gentle-pi last.
+test("expectedSteps mirrors a migration's steps, and a failed removal shows its exact command", async () => {
+	const ids = [...bundledIds, "remove-global-shell"];
+	const steps = ["claim-prefix", "copy-npm-settings", "install-runtime", "install-version", "activate-version", "write-launcher", "verify-launcher", "bundled-path",
+		"shell-setup", "remove-global-shell"];
+	assert.deepEqual(wizard.expectedSteps(ids), steps);
+	for (const id of ["verify-launcher", "remove-global-shell"]) assert.notEqual(wizard.stepLabel(id), id, `label for ${id}`);
+	const layout = prefixLayout({ platform: "linux", env: {}, home: "/home/u" });
+	const distribution = { status: "published", manifest: { shell: "4.1.0", pi: "1.0.2" }, lockfile: "lock" };
+	const path = { kind: "profile", path: "/home/u/.bashrc", line: "export PATH=x # gentle-shell bundled install", create: false };
+	const plan = bundledPlan({ platform: "linux", distribution, layout, path, migrate: { manager: "pnpm", removal: "plan" } });
+	assert.deepEqual(plan.actions.map((action: { id: string }) => action.id), ids);
+	const logged: string[] = [];
+	const operations = { claimPrefix: () => layout, userNpmrc: () => "", writeNpmrcAuth: () => {}, ensureRuntime: async () => ({ go: null }), installVersion: async () => ({}),
+		activateVersion: () => {}, ensureLauncher: () => {}, pathEntryPlan: () => path, applyPathEntry: () => {}, checkLauncher: async () => ({ ok: true }),
+		run: async () => ({ status: 0 }) };
+	await runBundledInstall({ plan, consent: true }, { platform: "linux", arch: "x64", env: {}, home: "/home/u", distribution, operations,
+		removeGlobal: async () => true, log: (entry: { step: string }) => logged.push(entry.step) });
+	assert.deepEqual(logged, steps);
+	const model = wizard.outcomeModel({ outcome: "ready", completed: [], guidance: "g", removeCommand: "pnpm remove -g gentle-pi" });
+	assert.ok(model.notes.some((note: string) => note.includes("`pnpm remove -g gentle-pi`")));
+	assert.deepEqual(wizard.outcomeModel({ outcome: "ready", completed: [], guidance: "g" }).notes, []);
+	// B3: a failed migration step shows the host's detail line.
+	for (const id of ["claim-prefix", "copy-npm-settings", "install-runtime", "activate-version", "write-launcher", "verify-launcher", "bundled-path"]) {
+		const failed = wizard.outcomeModel({ outcome: "failed", failedStep: id, completed: [], guidance: "g", detail: "Unsafe bundled prefix: ~/.gentle-shell" });
+		assert.equal(failed.detail, "Unsafe bundled prefix: ~/.gentle-shell", id);
+		assert.equal(typeof failed.detailCommand, "string", id);
+	}
 });

@@ -52,6 +52,8 @@ export const stepLabels = Object.freeze({
 	"activate-version": "Activate the installed version",
 	"write-launcher": "Write the gentle-shell launcher",
 	"bundled-path": "Add gentle-shell to PATH",
+	"verify-launcher": "Check the new gentle-shell launcher",
+	"remove-global-shell": "Remove the old global gentle-pi",
 });
 export function stepLabel(id) {
 	return typeof id === "string" && Object.hasOwn(stepLabels, id) ? stepLabels[id] : String(id);
@@ -110,10 +112,12 @@ function withMain(ids, steps) {
 
 export function expectedSteps(actionIds) {
 	const ids = new Set(list(actionIds));
-	// The bundled install (runBundledInstall): the PATH step only when the installer applies it.
+	// The bundled install (runBundledInstall): the PATH step only when the installer applies it; a
+	// migration checks the new launcher before the PATH step and removes the old global gentle-pi last.
 	if (ids.has("bundled-version")) {
+		const migration = ids.has("remove-global-shell");
 		return ["claim-prefix", "copy-npm-settings", "install-runtime", "install-version", "activate-version", "write-launcher",
-			...(ids.has("bundled-path") ? ["bundled-path"] : []), "shell-setup"];
+			...(migration ? ["verify-launcher"] : []), ...(ids.has("bundled-path") ? ["bundled-path"] : []), "shell-setup", ...(migration ? ["remove-global-shell"] : [])];
 	}
 	// An older Pi is found, updated and verified before any Gentle Shell step.
 	const piCheck = ids.has("update-pi") ? ["check-installed-pi"] : [];
@@ -255,7 +259,9 @@ export function progressModel(steps, entries, { running = false, outcome = null 
 
 const detailCommands = new Map([["shell-setup", "gentle-shell setup"], ["install-version", "pnpm install"], ["persist-path", "pnpm setup"], ["acquire-go", "the Go download"],
 	["install-global", "pnpm add -g"], ["install-shell-main", "the Gentle Shell main install"], ["build-gentle-ai-main", "the Gentle AI main build"],
-	["update-shell", "the Gentle Shell update"]]);
+	["update-shell", "the Gentle Shell update"], ["claim-prefix", "the bundled install"], ["copy-npm-settings", "the bundled install"],
+	["install-runtime", "the bundled install"], ["activate-version", "the bundled install"], ["write-launcher", "the bundled install"],
+	["verify-launcher", "gentle-shell --version"], ["bundled-path", "the bundled install"]]);
 
 /** Final screen model for every runner outcome. Guidance always comes from the host. */
 export function outcomeModel(outcome) {
@@ -264,6 +270,8 @@ export function outcomeModel(outcome) {
 	const notes = [];
 	if (outcome?.npmPrefix === "configured") notes.push("npm's user-level global prefix now points at PNPM_HOME.");
 	if (outcome?.npmPrefix === "unchanged") notes.push("npm's global prefix was already correct and was left unchanged.");
+	// A migration whose old global gentle-pi could not be removed (the host sends only the fixed commands).
+	if (typeof outcome?.removeCommand === "string") notes.push(`The old global gentle-pi could not be removed. Remove it with \`${text(outcome.removeCommand)}\`.`);
 	const base = { outcome: outcome?.outcome, guidance, completed, notes, reason: null, failedStep: null, command: null, detail: null, detailCommand: null };
 	if (outcome?.outcome === "ready") {
 		return { ...base, tone: "success", badge: "Installed", title: "Gentle Shell is ready",

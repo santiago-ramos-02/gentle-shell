@@ -1,0 +1,220 @@
+import { posix, win32 } from "node:path";
+
+// The launcher in a bundled install (S5, S8): pure decisions over an injected
+// filesystem. bin/gentle-shell.mjs wires them to the real one. A bundled install
+// is `<prefix>/versions/<id>/` with this gentle-pi in its node_modules, marked by
+// scripts/bundled-install.mjs, and `current` naming it; anything else keeps the
+// launcher's ordinary behavior unchanged.
+
+export interface BundledFs {
+	// The canonical path, or undefined when it does not exist.
+	realpath: (path: string) => string | undefined;
+	// A regular file's text, or undefined.
+	readText: (path: string) => string | undefined;
+	// A symbolic link's target, or undefined.
+	readLink: (path: string) => string | undefined;
+}
+
+export interface BundledInstall {
+	root: string;
+	id: string;
+	versionDir: string;
+}
+
+type Env = Record<string, string | undefined>;
+
+// The same rules scripts/bundled-install.mjs writes versions and markers with.
+const VERSION_ID = /^[0-9A-Za-z][0-9A-Za-z.-]*$/;
+const VERSION_MARKER = ".gentle-shell-version";
+const PI_PACKAGE = "@earendil-works/pi-coding-agent";
+const PI_BIN = "dist/bundle/cli.js";
+
+// `gentle-shell upgrade` sets this to the version it just installed while it
+// runs that version's `--version`: the check then runs in bundled mode, with
+// its exact Pi, before `current` names it. Never passed on to children.
+export const BUNDLED_VERIFY_ENV = "GENTLE_SHELL_VERIFY_VERSION";
+
+const pathFor = (platform: string) => (platform === "win32" ? win32 : posix);
+
+function inside(path: typeof posix, parent: string, child: string): boolean {
+	const rest = path.relative(parent, child);
+	return rest !== "" && !rest.startsWith("..") && !path.isAbsolute(rest);
+}
+
+function parseJson(text: string | undefined): any {
+	if (text === undefined) return undefined;
+	try {
+		return JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+}
+
+// The bundled install this package runs from: the nearest `versions/<id>`
+// ancestor of its real root whose marker names it, whose node_modules/gentle-pi
+// is this package, and which `current` names (a relative symlink on POSIX, a
+// pointer file on Windows) or `verifying` names (BUNDLED_VERIFY_ENV, for a
+// `--version` check only). Undefined otherwise.
+export function resolveBundledInstall(input: { packageRoot: string; platform: string; fs: BundledFs; verifying?: string }): BundledInstall | undefined {
+	const path = pathFor(input.platform);
+	const real = input.fs.realpath(input.packageRoot) ?? input.packageRoot;
+	for (let dir = path.dirname(real); path.dirname(dir) !== dir; dir = path.dirname(dir)) {
+		if (path.basename(path.dirname(dir)) !== "versions") continue;
+		const id = path.basename(dir);
+		const root = path.dirname(path.dirname(dir));
+		if (!VERSION_ID.test(id) || id.includes("..")) return undefined;
+		if (input.fs.readText(path.join(dir, VERSION_MARKER)) !== `${id}\n`) return undefined;
+		if (input.fs.realpath(path.join(dir, "node_modules", "gentle-pi")) !== real) return undefined;
+		const current = path.join(root, "current");
+		const active = input.platform === "win32" ? input.fs.readText(current) === `${id}\n` : input.fs.readLink(current) === `versions/${id}`;
+		return active || input.verifying === id ? { root, id, versionDir: dir } : undefined;
+	}
+	return undefined;
+}
+
+export type BundledPi = { ok: true; cli: string; version: string } | { ok: false; message: string };
+
+// The exact Pi of the version (S8): the Pi the version's package.json pins,
+// installed inside the version folder with Pi's own bin entry. Never another Pi.
+export function bundledPi(install: BundledInstall, input: { platform: string; fs: BundledFs }): BundledPi {
+	const path = pathFor(input.platform);
+	const pinned = parseJson(input.fs.readText(path.join(install.versionDir, "package.json")))?.dependencies?.[PI_PACKAGE];
+	const failure = (found?: string): BundledPi => ({
+		ok: false,
+		message: [
+			`gentle-shell: Gentle Shell ${install.id} needs its bundled Pi ${pinned ?? "(unknown pin)"} in ${install.versionDir}, ${found ? `but found Pi ${found}` : "but it is missing"}.`,
+			"Run 'gentle-shell upgrade' to install the latest release, or run the Gentle Shell installer again to repair this version.",
+		].join("\n"),
+	});
+	const dir = input.fs.realpath(path.join(install.versionDir, "node_modules", ...PI_PACKAGE.split("/")));
+	if (typeof pinned !== "string" || dir === undefined || !inside(path, input.fs.realpath(install.versionDir) ?? install.versionDir, dir)) return failure();
+	const metadata = parseJson(input.fs.readText(path.join(dir, "package.json")));
+	if (metadata?.name !== PI_PACKAGE || metadata.bin?.pi !== PI_BIN) return failure();
+	if (metadata.version !== pinned) return failure(String(metadata.version));
+	const cli = path.join(dir, ...PI_BIN.split("/"));
+	if (input.fs.realpath(cli) !== cli || input.fs.readText(cli) === undefined) return failure();
+	return { ok: true, cli, version: pinned };
+}
+
+// The environment of a bundled Pi and its subagents: the user's own, unchanged
+// (S9: Pi's tools run the user's commands in the user's projects, so its PATH,
+// NODE_OPTIONS and npm settings stay the user's; Pi itself runs on our node,
+// given explicitly, and its npm through the home's npmCommand setting), plus
+// only no Pi override, subagents on the same node and Pi (the subagent runner
+// splits GENTLE_PI_AGENTS_PI on whitespace, so a spaced path is left to its
+// default, the running node and cli.js), and no Pi update check, since Pi only
+// updates with Gentle Shell (S5).
+export function bundledChildEnv(base: Env, input: { node: string; cli: string }): Env {
+	const env: Env = { ...base, PI_SKIP_VERSION_CHECK: "1" };
+	delete env.GENTLE_SHELL_PI;
+	delete env[BUNDLED_VERIFY_ENV];
+	if (/\s/.test(`${input.node}${input.cli}`)) delete env.GENTLE_PI_AGENTS_PI;
+	else env.GENTLE_PI_AGENTS_PI = `${input.node} ${input.cli}`;
+	return env;
+}
+
+// `gentle-shell setup` in a bundled install: the child environment with `dirs`
+// (our node's folder, then the version's node_modules/.bin) ahead of the user's
+// PATH. Setup runs Gentle AI, which finds `pi` on PATH, and pnpm's `.bin/pi`
+// runs the first `node` on PATH, so both must be ours there.
+export function bundledSetupEnv(env: Env, input: { dirs: string[]; platform: string }): Env {
+	const key = Object.keys(env).find((name) => name.toUpperCase() === "PATH") ?? (input.platform === "win32" ? "Path" : "PATH");
+	const rest = (env[key] ?? "").split(pathFor(input.platform).delimiter).filter((entry) => entry.length > 0);
+	return { ...env, [key]: [...input.dirs, ...rest].join(pathFor(input.platform).delimiter) };
+}
+
+export type BundledNpmCommandEdit = { status: "unchanged" } | { status: "malformed" } | { status: "write"; text: string };
+
+// The agent home's settings.json with `npmCommand` set to the bundled npm
+// (scripts/bundled-install.mjs bundledNpmCommand), every other key kept in
+// order and the file's indentation and final newline kept. A file that already
+// holds exactly that command is left as it is; one that is not a JSON object
+// is never rewritten.
+export function withBundledNpmCommand(settingsText: string | undefined, command: string[]): BundledNpmCommandEdit {
+	const settings = settingsText === undefined ? {} : parseJson(settingsText);
+	if (typeof settings !== "object" || settings === null || Array.isArray(settings)) return { status: "malformed" };
+	const current = settings.npmCommand;
+	if (Array.isArray(current) && current.length === command.length && current.every((part, index) => part === command[index])) return { status: "unchanged" };
+	const indent = settingsText?.match(/\{\r?\n([ \t]+)/)?.[1] ?? "  ";
+	const serialized = JSON.stringify({ ...settings, npmCommand: command }, null, indent);
+	return { status: "write", text: settingsText === undefined || settingsText.endsWith("\n") ? `${serialized}\n` : serialized };
+}
+
+export interface BundledUpdatePlan {
+	// Pi's own update was asked for: redirect it to `gentle-shell upgrade`.
+	self: boolean;
+	// What Pi still runs, if anything: the extension part of `--all`, or the
+	// whole command when it never updates Pi itself.
+	piArgs?: string[];
+}
+
+// `gentle-shell update [target]` in a bundled install, read the way Pi's
+// package-manager-cli.js reads it: the target is Pi itself for a bare
+// `update`, `--self`, or a `self`/`pi` positional, and "all" for `--all`,
+// `--self --extensions` or `self`/`pi` with `--extensions`. Only Pi's own part
+// is redirected; "all" still sends `update --extensions` (with the other
+// flags) to Pi. Packages, models, help, and forms Pi refuses (conflicting or
+// unknown options) reach Pi unchanged.
+export function bundledUpdatePlan(passthrough: string[]): BundledUpdatePlan {
+	const passThrough = { self: false, piArgs: passthrough };
+	const flags: string[] = [];
+	const positional: string[] = [];
+	let self = false;
+	let extensions = false;
+	let all = false;
+	for (const token of passthrough.slice(1)) {
+		if (token === "--self") self = true;
+		else if (token === "--extensions") extensions = true;
+		else if (token === "--all") all = true;
+		else if (["--approve", "-a", "--no-approve", "-na", "--force"].includes(token)) flags.push(token);
+		else if (token.startsWith("-")) return passThrough;
+		else positional.push(token);
+	}
+	if (positional.length > 1 || (all && (self || extensions || positional.length > 0))) return passThrough;
+	if (positional.length === 1) {
+		if ((positional[0] !== "self" && positional[0] !== "pi") || self) return passThrough;
+		self = true;
+	}
+	if (all || (self && extensions)) return { self: true, piArgs: ["update", "--extensions", ...flags] };
+	if (extensions) return passThrough;
+	return { self: true };
+}
+
+// What `gentle-shell update` does after the redirected upgrade (`upgradeCode`
+// is undefined when it did not run): with nothing left for Pi it exits with the
+// upgrade's code; otherwise Pi still runs, so `update --all` updates the
+// extensions even when the upgrade could not complete.
+export function bundledUpdateNext(plan: BundledUpdatePlan, upgradeCode: number | undefined): { exitCode: number } | { piArgs: string[]; note?: string } {
+	if (plan.piArgs === undefined) return { exitCode: upgradeCode ?? 0 };
+	if (plan.self && upgradeCode !== undefined && upgradeCode !== 0) {
+		return { piArgs: plan.piArgs, note: "gentle-shell: the Gentle Shell upgrade did not complete; updating the extensions anyway." };
+	}
+	return { piArgs: plan.piArgs };
+}
+
+export function bundledUpdateNotice(input: { piVersion: string; interactive: boolean }): string[] {
+	return [
+		`Pi ships pinned with Gentle Shell (Pi ${input.piVersion}): a newer Pi arrives with a Gentle Shell release.`,
+		input.interactive
+			? "Running 'gentle-shell upgrade'..."
+			: "Run 'gentle-shell upgrade' to install the latest Gentle Shell release and its Pi.",
+	];
+}
+
+export type BundledUpgradeAction = { action: "upgrade" } | { action: "rollback" } | { error: string; usage: boolean };
+
+export const BUNDLED_UPGRADE_USAGE = "usage: gentle-shell upgrade [--channel release] | gentle-shell upgrade --rollback";
+
+// `gentle-shell upgrade` arguments in a bundled install, which follows the
+// release channel only (the main channel builds from source).
+export function parseBundledUpgradeArgs(args: string[]): BundledUpgradeAction {
+	if (args.length === 0) return { action: "upgrade" };
+	if (args.length === 1 && args[0] === "--rollback") return { action: "rollback" };
+	const channel = args.length === 1 && args[0].startsWith("--channel=") ? args[0].slice("--channel=".length)
+		: args.length === 2 && args[0] === "--channel" ? args[1] : undefined;
+	if (channel === "release") return { action: "upgrade" };
+	if (channel === "main") {
+		return { error: "this bundled installation follows the release channel only; the main channel needs a pnpm or npm installation of Gentle Shell", usage: false };
+	}
+	return { error: BUNDLED_UPGRADE_USAGE, usage: true };
+}

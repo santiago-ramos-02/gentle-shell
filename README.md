@@ -323,9 +323,12 @@ gentle-shell upgrade
 # Switch channel
 gentle-shell upgrade --channel main
 gentle-shell upgrade --channel release
+
+# Bundled install: back to the previous version
+gentle-shell upgrade --rollback
 ```
 
-`gentle-shell upgrade` uses the package manager that owns your installation. On the main channel it rebuilds Gentle AI and Gentle Shell from the latest `main` commits (only what changed) and needs pnpm and Go (a Go older than the minimum is replaced, for the build only, by the pinned Go the installer left in its own folder); switching back to release restores the pinned Gentle AI binary. With pnpm 11, the updated Gentle Shell may run a newer Pi that pnpm puts next to it (always at least the minimum); your own Pi is never changed. `gentle-shell update` is a different command: it is Pi's own package update. More: **[upgrade reference](docs/readme-reference.md#upgrade-subcommand-and-channels)**.
+`gentle-shell upgrade` uses the package manager that owns your installation. On the main channel it rebuilds Gentle AI and Gentle Shell from the latest `main` commits (only what changed) and needs pnpm and Go (a Go older than the minimum is replaced, for the build only, by the pinned Go the installer left in its own folder); switching back to release restores the pinned Gentle AI binary. With pnpm 11, the updated Gentle Shell may run a newer Pi that pnpm puts next to it (always at least the minimum); your own Pi is never changed. A bundled install (the web installer's own Node, pnpm and Pi) follows the release channel only: it installs the new version beside the current one, verifies it, then switches, keeping the previous version for `--rollback`. On release, once the latest release publishes the bundled distribution, `upgrade` moves a global pnpm or npm installation to the bundled one and asks once before removing the old global `gentle-pi`. `gentle-shell update` is a different command: it is Pi's own package update. In a bundled install Pi ships pinned with Gentle Shell, so updating Pi itself runs `gentle-shell upgrade` instead. More: **[upgrade reference](docs/readme-reference.md#upgrade-subcommand-and-channels)**.
 
 ### Remove it
 

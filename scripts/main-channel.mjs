@@ -249,7 +249,8 @@ function inside(parent, child) {
 	return path !== "" && !path.startsWith("..") && !isAbsolute(path);
 }
 
-async function latestRelease(fetch) {
+/** The latest stable gentle-pi release on the npm registry. */
+export async function latestRelease(fetch) {
 	let version = null;
 	try {
 		const response = await fetch("https://registry.npmjs.org/gentle-pi/latest", { headers: { Accept: "application/json" } });
@@ -335,6 +336,20 @@ async function installGlobal(manager, spec, run) {
 	}
 }
 
+const REMOVE_GLOBAL = Object.freeze({ pnpm: Object.freeze(["remove", "-g", "gentle-pi"]), npm: Object.freeze(["uninstall", "-g", "gentle-pi"]) });
+
+/** The command that removes the global gentle-pi with `name` (pnpm or npm), as a user types it. */
+export function removeGlobalCommand(name) {
+	return `${name} ${REMOVE_GLOBAL[name].join(" ")}`;
+}
+
+/** Removes the global gentle-pi with the manager ownerManager resolved (its
+ * verified invocation); true when it succeeded. Nothing else is removed.
+ */
+export async function removeGlobalShell(manager, run) {
+	return succeeded(await run(manager.command, [...manager.prefix, ...REMOVE_GLOBAL[manager.name]], { deadlineMs: INSTALL_DEADLINE }));
+}
+
 /** Removes the dev-binary override only when it points at a main build this module made. */
 async function removeMainOverride(ctx, fs) {
 	try {
@@ -368,8 +383,12 @@ async function mainGo({ userGo, pinnedGo, run }) {
  * release goes to the latest npm release, main to the latest `main` commits of
  * Gentle Shell and Gentle AI, rebuilding only what moved. Returns the exit code;
  * failures throw MainChannelError (`upgrade-usage` is a usage error).
- * adapters: { fetch, run, fs, which, invocation? }; npm and pnpm run as
- * invocationOf resolves them (Windows hosts pass `invocation`).
+ * adapters: { fetch, run, fs, which, invocation?, migrate? }; npm and pnpm run as
+ * invocationOf resolves them (Windows hosts pass `invocation`). On release,
+ * `migrate({ latest, owner })` (S4) may move this installation to the bundled
+ * one first: null (no migration, or one that failed and left this package
+ * untouched) keeps the path below for this run, otherwise { code, installed }.
+ * `owner` is called only when a migration can happen.
  */
 export async function runUpgrade({ args, ctx, platform, arch = process.arch, packageRoot, currentVersion, adapters, out }) {
 	const { fetch, run, fs, which } = adapters;
@@ -378,6 +397,15 @@ export async function runUpgrade({ args, ctx, platform, arch = process.arch, pac
 	const channel = requested ?? state.channel;
 	if (channel === "release") {
 		const latest = await latestRelease(fetch);
+		const migrated = adapters.migrate ? await adapters.migrate({ latest, owner: () => ownerManager({ ctx, platform, packageRoot, adapters }) }) : null;
+		if (migrated) {
+			// The old package may stay: it follows the release channel, without a main override.
+			if (migrated.installed) {
+				await removeMainOverride(ctx, fs);
+				await writeChannel(ctx, { channel: "release" }, fs);
+			}
+			return migrated.code;
+		}
 		if (state.channel === "release" && !older(currentVersion, latest)) {
 			out(`gentle-shell ${currentVersion} is already the latest release.`);
 			return 0;

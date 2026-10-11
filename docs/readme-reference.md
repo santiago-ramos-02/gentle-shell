@@ -296,6 +296,7 @@ gentle-shell [options] [-- pi-args...]
 gentle-shell home [link|isolated|<path>]
 gentle-shell [home selectors] setup [--dry-run]
 gentle-shell upgrade [--channel release|main]
+gentle-shell upgrade --rollback
 gentle-shell self-uninstall [--dry-run] [--yes] [--include-shared]
 ```
 
@@ -458,8 +459,34 @@ package.
   JavaScript entry, or a native `pnpm.exe`). A package manager that resolves only
   to an unrecognized shim counts as missing. macOS and Linux are unchanged.
 
+- **Bundled install** (the web installer's own Node, pnpm and Pi): `upgrade`
+  follows the release channel only and refuses `--channel main`. It installs the
+  latest release beside the active version, checks that the new launcher reports
+  exactly that release's Gentle Shell and Pi, and only then switches `current`,
+  keeping two versions. An already current release changes nothing, and a failure
+  leaves `current` untouched. `--rollback` switches back to the previous kept
+  version. Details: [Bundled install](bundled-install.md#gentle-shell-upgrade-in-a-bundled-install).
+- **Migration to the bundled install**: on release, when the latest release
+  publishes the bundled distribution, a global pnpm or npm installation moves to
+  the bundled one. `upgrade` explains the move, installs the bundled prefix and
+  checks its launcher. Then it asks once whether to remove the old global
+  `gentle-pi` with its own manager (default No; without a terminal it only prints
+  the command). If the move fails, it names the step and why, leaves the global
+  package as it is, and updates it the usual way for that run. Your Pi and
+  `~/.gentle-shell/agent` are not touched. An `npm link`
+  is named and keeps the path above. Details:
+  [Migration](bundled-install.md#migration-from-a-global-install).
+
 `gentle-shell update` is different: it is Pi's own `update`, forwarded to the
-resolved home. The browser installation wizard offers the same main channel; see
+resolved home. In a bundled install Pi ships pinned with Gentle Shell, so
+every `update` form that updates Pi itself explains that and runs
+`gentle-shell upgrade` (in a terminal) or names it. Those forms are no target,
+`--self`, `self` or `pi`, `--all`, and `self` or `pi` with `--extensions`. The
+extension part of an "all" form, and every package update, still reaches Pi.
+In a bundled install Pi and the agent's commands keep your own environment;
+Pi installs packages with Gentle Shell's npm through the `npmCommand` setting
+of its own home. Details: [Bundled install](bundled-install.md#launcher-in-a-bundled-install).
+The browser installation wizard offers the same main channel; see
 [Installation wizard](install-wizard.md#main-channel).
 
 ### `self-uninstall` subcommand

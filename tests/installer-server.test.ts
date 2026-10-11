@@ -1419,6 +1419,20 @@ test("/api/plan describes the bundled install: its own pinned runtimes, the user
 	} finally {
 		await host.close("test");
 	}
+	// T3: a migration's plan names the old package's removal with its own manager, last.
+	const migrating = bundledCollected({ kind: "none" });
+	migrating.plan = bundledPlan({ platform: "linux", distribution: bundledDistribution, layout: prefixLayout({ platform: "linux", env: {}, home: "/home/u" }),
+		path: { kind: "none" }, migrate: { manager: "npm", removal: "plan" } }) as never;
+	const server = await start({ collect: async () => migrating });
+	try {
+		const view = await plan(server.port, await server.login());
+		assert.equal(view.actions.at(-1).id, "remove-global-shell");
+		assert.match(view.actions.at(-1).description, /`npm uninstall -g gentle-pi`/);
+		assert.match(view.actions.at(-1).description, /reports Gentle Shell 4\.1\.0 with Pi 1\.0\.2/);
+		assert.match(view.actions.at(-1).description, /Your Pi and ~\/\.gentle-shell\/agent are not changed/);
+	} finally {
+		await server.host.close("test");
+	}
 	const cases: [Record<string, unknown>, RegExp, boolean, string?][] = [
 		[{ kind: "none" }, /already finds/, false],
 		[{ kind: "symlink", path: "/home/u/.local/bin/gentle-shell", target: "/home/u/.gentle-shell/bin/gentle-shell" }, /\/home\/u\/\.local\/bin\/gentle-shell/, true],
@@ -1455,6 +1469,21 @@ test("bundled outcomes: every bundled step has guidance, pnpm's error line is sh
 			}],
 		[{ outcome: "terminal-action-required", action: "add-path-line", pathLine: { file: "/home/u/.zshrc\u001b[2J", line: 7 }, completed: [] },
 			(view) => { assert.equal("pathLine" in view, false); }],
+		// T3: a failed removal keeps the install and names the exact command; anything else is not shown.
+		[{ outcome: "terminal-action-required", action: "open-new-terminal", completed: [], removeGlobal: { status: "failed", command: "npm uninstall -g gentle-pi" } },
+			(view) => {
+				assert.equal(view.removeCommand, "npm uninstall -g gentle-pi");
+				assert.match(String(view.guidance), /old global gentle-pi could not be removed/);
+			}],
+		[{ outcome: "ready", completed: [], removeGlobal: { status: "failed", command: "rm -rf ~" } }, (view) => { assert.equal("removeCommand" in view, false); }],
+		[{ outcome: "ready", completed: [], removeGlobal: { status: "removed", command: "pnpm remove -g gentle-pi" } },
+			(view) => { assert.equal("removeCommand" in view, false); assert.equal(view.guidance, guidance.outcomes.ready); }],
+		[{ outcome: "failed", failedStep: "verify-launcher", completed: [], detail: "Error: no Pi" },
+			(view) => { assert.equal(view.detail, "Error: no Pi"); assert.match(String(view.guidance), /old global Gentle Shell was kept/); }],
+		// B3: a migration's failed bundled step shows its detail; a new install's sends none, so nothing changes there.
+		[{ outcome: "failed", failedStep: "claim-prefix", completed: [], detail: "Unsafe bundled prefix: ~/.gentle-shell" },
+			(view) => { assert.equal(view.detail, "Unsafe bundled prefix: ~/.gentle-shell"); assert.equal(view.guidance, guidance.failed["claim-prefix"]); }],
+		[{ outcome: "failed", failedStep: "claim-prefix", completed: [] }, (view) => { assert.equal("detail" in view, false); }],
 	];
 	for (const [result, check] of cases) {
 		const { host, port, login } = await start({ runInstall: async () => result as never });
@@ -1495,9 +1524,16 @@ test("wizardHandlers plans the bundled install only when the gate says so, and r
 		urls.length = 0;
 		assert.deepEqual((await handlers(false).collectPlan("release")).plan, planPreflight(cleanInventory));
 		assert.deepEqual((await handlers(true).collectPlan("main")).plan, planPreflight(cleanInventory, { channel: "main" }));
+		// T3: an existing Gentle Shell that pnpm or npm owns moves to the bundled install and its old package is removed last.
 		const existing = { ...cleanInventory, shell: { available: true, version: requirements.shell, usable: true, global: true, owner: "pnpm" } };
-		assert.deepEqual((await handlers(true, existing).collectPlan("release")).plan, planPreflight(existing));
-		assert.equal(urls.length, 1, "only the release check of a new installation asks for the assets");
+		const migration = (await handlers(true, existing).collectPlan("release")).plan;
+		assert.deepEqual(migration.bundled.migrate, { manager: "pnpm", command: "pnpm remove -g gentle-pi", removal: "plan" });
+		assert.equal(migration.actions.at(-1).id, "remove-global-shell");
+		// An npm link (no owner) or a release without the assets: the standard plan, unchanged.
+		const linked = { ...existing, shell: { available: true, version: requirements.shell, usable: true, global: true } };
+		assert.deepEqual((await handlers(true, linked).collectPlan("release")).plan, planPreflight(linked));
+		assert.deepEqual((await handlers(false, existing).collectPlan("release")).plan, planPreflight(existing));
+		assert.equal(urls.length, 4, "only the release check of a new or migrating installation asks for the assets");
 		// The bundled plan goes to the bundled runner, which needs consent like the standard one.
 		const routed = handlers(true);
 		const { plan: consented } = await routed.collectPlan("release");

@@ -281,8 +281,10 @@ bundled plan is used only when all of these hold:
 
 - The channel is `release`.
 - The target is macOS, Linux or Windows on x64 or arm64.
-- Preflight found no Gentle Shell (`shell.available === false`). An existing or
-  unknown one keeps the current path.
+- Preflight found no Gentle Shell (`shell.available === false`). An existing
+  one that a global pnpm or npm owns migrates instead (`migrationGate`, see
+  [Migration from a global install](bundled-install.md#migration-from-a-global-install)).
+  Any other existing or unknown one keeps the current path.
 - This package's own release, `v<package version>`, publishes both
   [distribution assets](bundled-install.md#release-distribution-assets), and
   `readDistribution` accepts them.
@@ -300,8 +302,8 @@ The assets are fetched from
 | 404 for either asset (v4.0.0 has none) | Standard, unchanged |
 | Network failure, or assets that do not read | Standard, unchanged |
 
-The main channel and existing installations keep the standard runner for now.
-Upgrade and migration are T2 and T3.
+The main channel, and existing installations that neither pnpm nor npm owns,
+keep the standard runner.
 
 ### Plan and steps
 
@@ -331,6 +333,8 @@ It then runs and logs these steps, in this order:
 | `bundled-path` | `applyPathEntry`, only for a link, a profile line or the HKCU user Path. The change is planned again first; one that differs from the consented plan is not applied. |
 | `shell-setup` | `gentle-shell setup` in `setupEnvironment`: the launcher on POSIX, and our Node with the same entry on Windows. |
 
+A migration plan adds `verify-launcher` (the launcher's `--version` must print
+both exact versions) before `bundled-path`, and ends with `remove-global-shell`.
 The wizard's progress list (`expectedSteps`) follows the same order.
 
 | PATH change | Outcome |
