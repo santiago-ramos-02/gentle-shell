@@ -25,6 +25,7 @@ const sources = [
 	"profiles-orchestrator",
 	"agent-assets",
 	"agent-home",
+	"gentle-shell-bundled",
 	"session-worktree-registry",
 	"command-rules",
 	"destructive-command-guard",

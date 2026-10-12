@@ -29,6 +29,11 @@ export const THINKING_LEVELS = [
 export const SAFE_MODEL_ID_PATTERN = /^[A-Za-z0-9._~:@/+%-]+$/;
 const SAFE_AGENT_NAME_PATTERN = /^[A-Za-z0-9._:@/+%-]+$/;
 
+/** Shared agent-name policy; the same test normalizeModelConfig applies per key. */
+export function isSafeAgentName(name        )          {
+	return SAFE_AGENT_NAME_PATTERN.test(name);
+}
+
 function isRecord(value         )                                   {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -79,7 +84,7 @@ export function normalizeModelConfig(value         )                            
 	if (!isRecord(value)) return undefined;
 	const cleaned                   = {};
 	for (const [name, entryValue] of Object.entries(value)) {
-		if (!SAFE_AGENT_NAME_PATTERN.test(name)) continue;
+		if (!isSafeAgentName(name)) continue;
 		const entry = normalizeRoutingEntry(entryValue);
 		if (entry) cleaned[name] = entry;
 	}
