@@ -5,12 +5,13 @@
 // Shared by the web installer and `gentle-shell upgrade`; every effect outside
 // plain path arithmetic goes through an injectable adapter for tests.
 import { createHash, randomBytes } from "node:crypto";
-import { accessSync, chmodSync, closeSync, constants, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync,
+import { accessSync, chmodSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync,
 	rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { posix, win32 } from "node:path";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { crc32, gunzipSync, inflateRawSync } from "node:zlib";
-import { acquireGo, artifactFor, verifiedDownload } from "./installer-downloads.mjs";
+import { acquireGo, artifactFor, engramPinVersion, verifiedDownload } from "./installer-downloads.mjs";
 import { ensureWindowsPrivateFolder, readWindowsPnpmArchive, verifyWindowsStorage } from "./installer-windows.mjs";
 
 // The acquisition pins already verified for the installer; never a second copy.
@@ -67,13 +68,20 @@ export function prefixLayout({ platform, env = {}, home, root }) {
 		nodeDir, node: windows ? path.join(nodeDir, "node.exe") : path.join(nodeDir, "bin", "node"),
 		// The npm bundled in the same Node archive, for Pi's own package installs.
 		npmCli: path.join(nodeDir, ...(windows ? [] : ["lib"]), "node_modules", "npm", "bin", "npm-cli.js"),
+		// The entry Pi's npmCommand runs that npm through (ensureNpmShim).
+		npmShim: path.join(nodeDir, "gentle-shell", "npm"),
 		npmHome, npmPrefix: path.join(npmHome, "prefix"), npmCache: path.join(npmHome, "cache"), npmGlobalConfig: path.join(npmHome, "npmrc"),
 		pnpmDir, pnpm: path.join(pnpmDir, "package", "bin", "pnpm.mjs"),
 		// acquireGo publishes `<goRoot>/<version>/go`.
 		goRoot: path.join(runtime, "go"),
+		// The pinned Engram (ensureEngram), given to Gentle AI and gentle-engram (S9).
+		engramDir: path.join(runtime, `engram-${engramPinVersion}`),
+		engram: path.join(runtime, `engram-${engramPinVersion}`, windows ? "engram.exe" : "engram"),
 		pnpmHome, store: path.join(pnpmHome, "store"), cache: path.join(pnpmHome, "cache"), state: path.join(pnpmHome, "state"),
 		config: path.join(pnpmHome, "config"), npmrc: path.join(pnpmHome, "config", "npmrc"), tmp: path.join(base, "tmp"),
 		versions: path.join(base, "versions"), history: path.join(base, "versions.history"),
+		// The applied PATH entry (writePathReceipt), which self-uninstall reverts exactly.
+		pathReceipt: path.join(base, "path-entry.json"),
 		current: path.join(base, "current"), currentKind: windows ? "pointer" : "symlink",
 		bin, launcher: path.join(bin, windows ? "gentle-shell.cmd" : "gentle-shell"),
 	});
@@ -83,6 +91,21 @@ export function prefixLayout({ platform, env = {}, home, root }) {
 function privateDirectory(path) {
 	const info = stat(path);
 	if (!info?.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid() || (info.mode & 0o022)) throw new Error(`Unsafe bundled prefix: ${path}`);
+}
+/** POSIX: removes group and other write access from a real directory of this
+ * user, through a descriptor opened without following links; anything else is
+ * left for privateDirectory to refuse.
+ */
+function tightenOwnDirectory(path) {
+	let fd;
+	try { fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); }
+	catch { return; }
+	try {
+		const info = fstatSync(fd);
+		if (info.isDirectory() && info.uid === process.getuid() && (info.mode & 0o022)) fchmodSync(fd, info.mode & 0o7755);
+	} finally {
+		closeSync(fd);
+	}
 }
 function ensureDirectory(path, platform) {
 	try { mkdirSync(path, { mode: 0o700 }); }
@@ -100,8 +123,9 @@ function prepareFolders(layout) {
 }
 
 /** Claims the prefix and returns its layout. POSIX: `~/.gentle-shell` is created
- * 0700, or kept when it is a real directory of this user that no one else can
- * write (the agent home lives there). Windows: each candidate's nearest existing
+ * 0700, or kept when it is a real directory of this user (the agent home lives
+ * there); group or other write access, which umask 002 leaves, is removed
+ * (go-w). A link, a non-folder or another owner's folder is refused. Windows: each candidate's nearest existing
  * folder is walked like the bootstrap's tools (owner, ACL, reparse); only an
  * untrusted owner or ACL on %LOCALAPPDATA% moves to the profile candidate. The
  * chosen folder is claimed with the bootstrap's protected DACL and marked
@@ -116,6 +140,7 @@ export function claimPrefix({ platform, env = {}, home, root, adapters = {} }) {
 		if (realpathSync(home) !== posix.resolve(home)) throw new Error(`Unsafe bundled prefix: ${home}`);
 		const info = lstatSync(home);
 		if (!info.isDirectory() || info.uid !== process.getuid() || (info.mode & 0o022)) throw new Error(`Unsafe bundled prefix: ${home}`);
+		if (stat(layout.root)?.isDirectory()) tightenOwnDirectory(layout.root);
 		ensureDirectory(layout.root, platform);
 		(adapters.prepare ?? prepareFolders)(layout);
 		return layout;
@@ -208,14 +233,14 @@ export function nodeRuntimeFiles(bytes, descriptor) {
 	if (metadata?.name !== "npm" || !SEMVER.test(metadata.version ?? "") || !files.some((entry) => entry.name === `${npm}bin/npm-cli.js`)) fail();
 	return Object.assign(files, { npm: metadata.version });
 }
-function tarMember(bytes, wanted) {
+function tarMember(bytes, wanted, message = "Node archive rejected") {
 	let found = null;
-	for (const member of tarMembers(bytes, "Node archive rejected")) {
+	for (const member of tarMembers(bytes, message)) {
 		if (member.name !== wanted) continue;
-		if ((member.type !== "0" && member.type !== "\0") || found) throw new Error("Node archive rejected");
+		if ((member.type !== "0" && member.type !== "\0") || found) throw new Error(message);
 		found = Buffer.from(member.data);
 	}
-	if (!found?.length) throw new Error("Node archive rejected");
+	if (!found?.length) throw new Error(message);
 	return found;
 }
 /** Every member of a `.tar.gz`: { name, type, mode, data }. Headers are
@@ -255,8 +280,8 @@ function* tarMembers(bytes, message) {
 		yield { name, type, mode: number(block, 100, 8), data };
 	}
 }
-function zipMember(bytes, wanted) {
-	const fail = () => { throw new Error("Node archive rejected"); };
+function zipMember(bytes, wanted, message = "Node archive rejected") {
+	const fail = () => { throw new Error(message); };
 	let found = null;
 	for (const entry of zipEntries(bytes, fail)) {
 		if (entry.name !== wanted) continue;
@@ -303,6 +328,16 @@ function* zipEntries(bytes, fail) {
 	}
 }
 
+/** The one executable a verified Engram release archive must contain: the
+ * top-level `engram` of the POSIX `.tar.gz` or `engram.exe` of the Windows
+ * `.zip`, a regular file found exactly once. Its tools/ scripts and anything
+ * else are never written.
+ */
+export function engramExecutable(bytes, descriptor) {
+	const message = "Engram archive rejected";
+	return String(descriptor?.url ?? "").endsWith(".zip") ? zipMember(bytes, "engram.exe", message) : tarMember(bytes, "engram", message);
+}
+
 /** Runs a command without a shell; resolves { status, stdout, stderr }. */
 export function runCommand(command, args, { cwd, env, timeout = 15000 }) {
 	return new Promise((resolve) => {
@@ -316,6 +351,22 @@ export function runCommand(command, args, { cwd, env, timeout = 15000 }) {
 }
 const ownedRuntime = (directory, url, entry) => read(pathFor(process.platform).join(directory, RUNTIME_MARKER)) === `${url}\n` && regular(entry);
 
+// Windows publication can lose a race with the node.exe just run from the
+// staging folder or a real-time scanner still holding it (EPERM, EBUSY,
+// EACCES). Only those codes, and only on Windows, are retried after each
+// delay; a lock that never clears surfaces the original error.
+const WINDOWS_RENAME_RETRY_DELAYS_MS = [200, 400, 800, 1600];
+export async function renameWithWindowsRetry(from, to, { platform = process.platform, rename = renameSync, delays = WINDOWS_RENAME_RETRY_DELAYS_MS } = {}) {
+	if (platform !== "win32") return rename(from, to);
+	for (let attempt = 0; ; attempt += 1) {
+		try { return rename(from, to); }
+		catch (error) {
+			if (attempt >= delays.length || !["EPERM", "EBUSY", "EACCES"].includes(error?.code)) throw error;
+			await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+		}
+	}
+}
+
 /** Publishes one verified runtime as `directory`: an existing one marked with the
  * same pinned URL is reused, an unmarked one is never replaced. `fill` writes and
  * checks the staging folder; one rename publishes it. Renaming is safe here,
@@ -327,14 +378,15 @@ async function publishRuntime(layout, name, directory, entry, { platform, arch, 
 	const descriptor = (adapters.artifact ?? artifactFor)(name, platform, arch);
 	if (ownedRuntime(directory, descriptor.url, entry)) return false;
 	if (stat(directory)) throw new Error(`Conflicting runtime destination: ${directory}`);
-	const bytes = await verifiedDownload(name, adapters, platform, arch);
+	// Before downloading: a prefix that is not there fails without a download.
 	ensureDirectory(layout.runtime, layout.platform);
+	const bytes = await verifiedDownload(name, adapters, platform, arch);
 	let stage = mkdtempSync(pathFor(process.platform).join(layout.runtime, ".stage-"));
 	try {
 		await fill(stage, bytes, descriptor);
 		writeFileSync(pathFor(process.platform).join(stage, RUNTIME_MARKER), `${descriptor.url}\n`, { flag: "wx", mode: 0o600 });
 		if (stat(directory)) throw new Error(`Conflicting runtime destination: ${directory}`);
-		renameSync(stage, directory);
+		await renameWithWindowsRetry(stage, directory);
 		stage = null;
 		return true;
 	} finally {
@@ -342,12 +394,30 @@ async function publishRuntime(layout, name, directory, entry, { platform, arch, 
 	}
 }
 
-/** Our pinned Node with its bundled npm, and pnpm, in runtime/ (and the pinned
- * Go only when `go`), each downloaded through verifiedDownload, checked by
- * running it from its staging folder, marked, then published. Returns the
- * paths and what was acquired.
+/** The pinned Engram in runtime/engram-<v>/ (S9): downloaded through
+ * verifiedDownload, only its executable written, `engram version` run from the
+ * staging folder, marked, then published. Gentle AI's setup uses it through
+ * GENTLE_AI_ENGRAM_BIN and gentle-engram through ENGRAM_BIN, so neither
+ * installs or finds another Engram. Returns whether it was acquired.
  */
-export async function ensureRuntime({ layout, platform, arch, go = false, env = {}, adapters = {} }) {
+export async function ensureEngram({ layout, platform, arch, env = {}, adapters = {} }) {
+	const run = adapters.run ?? runCommand;
+	const path = pathFor(process.platform);
+	const childEnv = pnpmEnvironment(layout, { platform: layout.platform, env });
+	return publishRuntime(layout, "engram", layout.engramDir, layout.engram, { platform, arch, adapters }, async (stage, bytes, descriptor) => {
+		const binary = path.join(stage, path.relative(layout.engramDir, layout.engram));
+		writeFileSync(binary, engramExecutable(bytes, descriptor), { flag: "wx", mode: 0o700 });
+		const result = await run(binary, ["version"], { cwd: layout.runtime, env: childEnv });
+		if (result.status !== 0 || String(result.stdout).trim() !== `engram ${descriptor.version}`) throw new Error("Bundled Engram verification failed");
+	});
+}
+
+/** Our pinned Node with its bundled npm, and pnpm, in runtime/ (and the pinned
+ * Go only when `go`, the pinned Engram only when `engram`), each downloaded
+ * through verifiedDownload, checked by running it from its staging folder,
+ * marked, then published. Returns the paths and what was acquired.
+ */
+export async function ensureRuntime({ layout, platform, arch, go = false, engram = false, env = {}, adapters = {} }) {
 	const run = adapters.run ?? runCommand;
 	const path = pathFor(process.platform);
 	const childEnv = pnpmEnvironment(layout, { platform: layout.platform, env });
@@ -366,6 +436,9 @@ export async function ensureRuntime({ layout, platform, arch, go = false, env = 
 		if (npm.status !== 0 || String(npm.stdout).trim() !== files.npm) throw new Error("Bundled npm verification failed");
 	});
 	if (node) acquired.push("node");
+	// Also for a runtime published before the entry existed; one from before npm
+	// was published (T1a) has no npm to run, and the launcher then gives Pi none.
+	if (regular(layout.npmCli)) ensureNpmShim(layout);
 	const pnpm = await publishRuntime(layout, "pnpm", layout.pnpmDir, layout.pnpm, { platform, arch, adapters }, async (stage, bytes, descriptor) => {
 		// The tarball's executable bits are kept (bin/pnpm.mjs, dist/node-gyp-bin), for the owner only.
 		const modes = new Map([...tarMembers(bytes, "pnpm archive rejected")].map((member) => [member.name, member.mode]));
@@ -386,6 +459,7 @@ export async function ensureRuntime({ layout, platform, arch, go = false, env = 
 		if (result.status !== 0 || String(result.stdout).trim() !== descriptor.version) throw new Error("Bundled pnpm verification failed");
 	});
 	if (pnpm) acquired.push("pnpm");
+	if (engram && await ensureEngram({ layout, platform, arch, env, adapters })) acquired.push("engram");
 	let goPath = null;
 	if (go) {
 		const result = await (adapters.acquireGo ?? acquireGo)({ root: layout.goRoot, platform, arch, adapters });
@@ -705,6 +779,188 @@ export function pruneVersions(layout, keep = 2) {
 	return removed;
 }
 
+const UNPUBLISHED = Object.freeze({
+	missing: (version) => `release v${version} does not publish the bundled distribution yet; try again later`,
+	unavailable: (version) => `the bundled distribution of release v${version} could not be downloaded`,
+	rejected: (version) => `the bundled distribution of release v${version} did not verify`,
+});
+const RELEASE_EXPORTS = Object.freeze(["prefixLayout", "ensureRuntime", "ensureLauncher"]);
+/** The variable that makes a version's launcher run in bundled mode for
+ * `--version` only, as if `current` named that version (lib/gentle-shell-bundled.ts).
+ */
+const VERIFY_ENV = "GENTLE_SHELL_VERIFY_VERSION";
+
+const NPM_SHIM_MARK = "gentle-shell bundled npm entry (generated; do not edit)";
+/** Writes runtime/node-<v>/gentle-shell/npm, a CommonJS file that runs the npm
+ * bundled with that Node, and a package.json beside it that keeps it CommonJS
+ * under any package.json with "type": "module" above the prefix. Pi names the
+ * package manager from the basenames in npmCommand (getPackageManagerName in
+ * Pi's core/package-manager.js), so this entry is named exactly `npm`; on
+ * Windows it also avoids npm.cmd, which prefers an npm in the global prefix.
+ * Each file is replaced with one rename, only when its content differs; a link
+ * or anything but a regular file in its place stops it. Returns { written }.
+ */
+export function ensureNpmShim(layout) {
+	const path = pathFor(layout.platform);
+	if (!regular(layout.npmCli)) throw new Error(`Bundled npm missing: ${layout.npmCli}`);
+	const folder = path.dirname(layout.npmShim);
+	const cli = path.relative(folder, layout.npmCli).split(path.sep).map((part) => JSON.stringify(part)).join(", ");
+	const files = {
+		"package.json": '{ "type": "commonjs" }\n',
+		[path.basename(layout.npmShim)]: [`// ${NPM_SHIM_MARK}`, `require(require("node:path").join(__dirname, ${cli}));`, ""].join("\n"),
+	};
+	const info = stat(folder);
+	if (!info) mkdirSync(folder, { mode: 0o700 });
+	else if (!info.isDirectory()) throw new Error(`Conflicting npm entry: ${folder}`);
+	let written = false;
+	for (const [name, text] of Object.entries(files)) {
+		const target = path.join(folder, name);
+		const existing = stat(target);
+		if (existing && !existing.isFile()) throw new Error(`Conflicting npm entry: ${target}`);
+		if (existing && readFileSync(target, "utf8") === text) continue;
+		replaceAtomically(target, (temp) => writeFileSync(temp, text, { flag: "wx", mode: 0o600 }));
+		written = true;
+	}
+	return { written };
+}
+
+/** The command Pi runs for npm in a bundled install (its `npmCommand` setting):
+ * our npm on our Node, through the entry named npm (ensureNpmShim), so Pi treats
+ * it as npm; it reads only the prefix npmrc and global config, with its cache
+ * inside the prefix. npm ranks command-line flags above npm_config_* variables,
+ * so the user's environment cannot redirect these. No --prefix: on the command
+ * line it also sets npm's local prefix, and Pi installs a git extension's
+ * dependencies with `npm install` in the clone, without a --prefix of its own
+ * (its npm: installs pass one). No other part's basename is npm, pnpm or bun,
+ * which Pi would reject as ambiguous.
+ */
+export function bundledNpmCommand(layout) {
+	return [layout.node, layout.npmShim, `--userconfig=${layout.npmrc}`, `--globalconfig=${layout.npmGlobalConfig}`, `--cache=${layout.npmCache}`,
+		"--update-notifier=false"];
+}
+
+/** The module an installed version ships (its own pins and launcher), only from
+ * a regular file whose real path stays inside that version folder.
+ */
+async function releaseModule(file, versionPath) {
+	if (!regular(file) || !realpathSync(file).startsWith(`${realpathSync(versionPath)}${pathFor(process.platform).sep}`)) return null;
+	return import(pathToFileURL(file).href);
+}
+/** An installed version's own scripts/bundled-install.mjs and its layout of this
+ * prefix; it must export prefixLayout, ensureRuntime and ensureLauncher as
+ * functions. `active` names the version `current` stays at otherwise.
+ */
+async function loadRelease({ layout, id, home, platform, env, adapters, active }) {
+	const path = pathFor(process.platform);
+	const versionPath = versionDirectory(layout, id);
+	const file = path.join(versionPath, "node_modules", "gentle-pi", "scripts", "bundled-install.mjs");
+	const module = await (adapters.load ?? releaseModule)(file, versionPath);
+	if (!module || RELEASE_EXPORTS.some((name) => typeof module[name] !== "function")) {
+		throw new Error(`Gentle Shell ${id} has no usable scripts/bundled-install.mjs (${RELEASE_EXPORTS.join(", ")}); current stays at ${active}`);
+	}
+	return { module, next: module.prefixLayout({ platform, env, home, root: layout.root }) };
+}
+/** Switches `current` to `id` and writes that version's launcher; when the
+ * launcher cannot be written, `current` goes back to `active` (one rename each).
+ */
+function activateWithLauncher(layout, id, active, { module, next }) {
+	activateVersion(layout, id);
+	try {
+		module.ensureLauncher(next);
+	} catch (error) {
+		if (active) activateVersion(layout, active);
+		else unlinkSync(layout.current);
+		throw new Error(`the launcher for Gentle Shell ${id} could not be written (${error.message}); current stays at ${active}`);
+	}
+}
+
+/** `gentle-shell upgrade` in a bundled install (S5, S6, S8): the latest
+ * release's distribution assets (adapters.latest, adapters.distribution) are
+ * installed beside the active version with our runtime, then the new version's
+ * own module (loaded only from that version folder) installs its pinned runtime
+ * when the pins moved. Its launcher, run in bundled mode for that version, must
+ * print exactly the release's gentle-pi and Pi before `current` switches; the
+ * release's launcher is then written (a failure puts `current` back) and two
+ * versions are kept (a pruning failure is only a warning). An already current
+ * release changes nothing; any failure leaves `current` as it was and removes a
+ * version this call installed. Returns { id, changed, previous?, removed?, warning? }.
+ */
+export async function upgradeBundled({ layout, home, platform = layout.platform, arch = process.arch, env = {}, adapters, out = () => {} }) {
+	const path = pathFor(process.platform);
+	const latest = await adapters.latest();
+	const release = await adapters.distribution(latest);
+	if (release?.status !== "published") throw new Error((UNPUBLISHED[release?.status] ?? UNPUBLISHED.unavailable)(latest));
+	const { manifest, lockfile } = release;
+	const { shell, pi, id } = versionsOf(manifest);
+	const active = activeVersion(layout);
+	if (active === id) {
+		out(`Gentle Shell ${shell} with Pi ${pi} is already current.`);
+		return { id, changed: false };
+	}
+	const go = platform === "win32";
+	const runtime = await (adapters.ensureRuntime ?? ensureRuntime)({ layout, platform, arch, go, env });
+	const version = await installVersion({ layout, manifest, lockfile, platform, env, go: runtime.go, adapters: adapters.install ?? {} });
+	try {
+		const loaded = await loadRelease({ layout, id, home, platform, env, adapters, active });
+		// The release's own pins, its Engram included (an older module ignores `engram`).
+		await loaded.module.ensureRuntime({ layout: loaded.next, platform, arch, go, engram: true, env });
+		const check = await checkLauncher(loaded.next, { id, shell, pi, platform, env, run: adapters.run });
+		if (!check.ok) {
+			throw Object.assign(new Error(`Gentle Shell ${id} reported ${JSON.stringify(check.reported)}, not gentle-shell ${shell} with pi ${pi}; current stays at ${active}`),
+				{ stderr: check.stderr });
+		}
+		activateWithLauncher(layout, id, active, loaded);
+	} catch (error) {
+		if (version.installed && activeVersion(layout) !== id) rmSync(version.path, { recursive: true, force: true });
+		throw error;
+	}
+	out(`Upgraded to Gentle Shell ${shell} with Pi ${pi} (from ${active ?? "no active version"}). Run 'gentle-shell upgrade --rollback' to switch back.`);
+	try {
+		return { id, changed: true, previous: active, removed: (adapters.prune ?? pruneVersions)(layout, 2) };
+	} catch (error) {
+		const warning = `older versions were not removed (${error.message})`;
+		out(`warning: ${warning}`);
+		return { id, changed: true, previous: active, removed: [], warning };
+	}
+}
+
+/** Whether version `id` reports exactly `gentle-shell <shell>` and `pi <pi>` to
+ * `--version`: its entry run by our Node, or with `launcher` on POSIX the
+ * bin/gentle-shell launcher itself (it runs the version `current` names).
+ * The environment is the one our pnpm ran in, without any Pi or Gentle override
+ * that could point the launcher at another Pi or agent home.
+ * Returns { ok, reported, stderr }.
+ */
+export async function checkLauncher(layout, { id, shell, pi, platform = layout.platform, env = {}, run = runCommand, launcher = false }) {
+	// The environment our pnpm ran in, without any Pi or Gentle override that
+	// could point the launcher at another Pi or agent home, plus the one input
+	// that runs this version in bundled mode for its --version (exact Pi).
+	const launchEnv = { ...Object.fromEntries(Object.entries(pnpmEnvironment(layout, { platform, env })).filter(([key]) => !/^(?:gentle_|pi_)/i.test(key))),
+		[VERIFY_ENV]: id };
+	const entry = pathFor(platform).join(layout.versions, id, "node_modules", "gentle-pi", "bin", "gentle-shell.mjs");
+	const [command, args] = launcher && platform !== "win32" ? [layout.launcher, ["--version"]] : [layout.node, [entry, "--version"]];
+	const result = await (run ?? runCommand)(command, args, { cwd: layout.root, env: launchEnv, timeout: 120000 });
+	const reported = String(result.stdout ?? "").trim();
+	const [shellLine, piLine] = reported.split(/\r?\n/);
+	return { ok: result.status === 0 && shellLine === `gentle-shell ${shell}` && piLine === `pi ${pi}`, reported, stderr: String(result.stderr ?? "").slice(-4000) };
+}
+
+/** `gentle-shell upgrade --rollback`: `current` switches back to the most
+ * recently active other version still installed, with that version's own
+ * launcher and runtime pins (its own scripts/bundled-install.mjs, loaded like
+ * upgradeBundled loads it). Without a usable module nothing changes; when its
+ * launcher cannot be written `current` goes back. Returns { from, to }.
+ */
+export async function rollbackBundled({ layout, home, platform = layout.platform, arch = process.arch, env = {}, adapters = {} }) {
+	const active = activeVersion(layout);
+	const previous = readHistory(layout).find((id) => id !== active && installedVersion(layout, id));
+	if (!previous) throw new Error("No previous Gentle Shell version is kept to roll back to");
+	const loaded = await loadRelease({ layout, id: previous, home, platform, env, adapters, active });
+	await loaded.module.ensureRuntime({ layout: loaded.next, platform, arch, go: platform === "win32", engram: true, env });
+	activateWithLauncher(layout, previous, active, loaded);
+	return { from: active, to: previous };
+}
+
 /** The launcher text: our Node running the current gentle-pi's
  * bin/gentle-shell.mjs, passing every argument and the exit code. Without an
  * active version it says so and exits 1. The Windows one reads the pointer file
@@ -754,15 +1010,23 @@ export function ensureLauncher(layout) {
  * - fish: our own conf.d file; anything else: ~/.profile.
  */
 function profileFor(platform, env, home) {
+	const files = profileFiles(platform, env, home);
 	const shell = posix.basename(String(env.SHELL ?? ""));
-	if (shell === "zsh") return posix.join(posix.isAbsolute(env.ZDOTDIR ?? "") ? env.ZDOTDIR : home, ".zshrc");
-	if (shell === "bash" && platform === "darwin") {
-		const login = [".bash_profile", ".bash_login", ".profile"].map((name) => posix.join(home, name));
-		return login.find((path) => stat(path)) ?? login[0];
-	}
-	if (shell === "bash") return posix.join(home, ".bashrc");
-	if (shell === "fish") return posix.join(posix.isAbsolute(env.XDG_CONFIG_HOME ?? "") ? env.XDG_CONFIG_HOME : posix.join(home, ".config"), "fish", "conf.d", "gentle-shell.fish");
-	return posix.join(home, ".profile");
+	if (shell === "bash" && platform === "darwin") return files.bash.find((path) => stat(path)) ?? files.bash[0];
+	return (files[shell] ?? files.other)[0];
+}
+/** Every startup file profileFor can choose on `platform`, per shell, in its
+ * order of preference: the one source for planning a line and for trusting a
+ * receipt (readPathReceipt).
+ */
+function profileFiles(platform, env, home) {
+	const config = posix.isAbsolute(env.XDG_CONFIG_HOME ?? "") ? env.XDG_CONFIG_HOME : posix.join(home, ".config");
+	return {
+		zsh: [posix.join(posix.isAbsolute(env.ZDOTDIR ?? "") ? env.ZDOTDIR : home, ".zshrc")],
+		bash: platform === "darwin" ? [".bash_profile", ".bash_login", ".profile"].map((name) => posix.join(home, name)) : [posix.join(home, ".bashrc")],
+		fish: [posix.join(config, "fish", "conf.d", "gentle-shell.fish")],
+		other: [posix.join(home, ".profile")],
+	};
 }
 /** Whether the installer may edit `path`: "file" (a regular file this user can
  * write, in real folders) or "absent" (creatable inside real, writable folders);
@@ -797,6 +1061,10 @@ function profileState(path, home) {
 	if (!existing.isDirectory()) return "not-a-file";
 	if (!realFolder(folder)) return "symlink";
 	return writable(folder) ? "absent" : "not-writable";
+}
+/** The marked line that puts `bin` first on PATH, for fish and for sh-like shells. */
+function profileLines(bin) {
+	return { fish: `set -gx PATH '${bin}' $PATH ${PROFILE_MARK}`, sh: `export PATH="${bin}:$PATH" ${PROFILE_MARK}` };
 }
 /** Whether `path`, followed through links, already holds `line`. */
 function holdsLine(path, line) {
@@ -833,7 +1101,7 @@ export function pathEntryPlan(layout, { platform = layout.platform, env = {}, ho
 	const profile = profileFor(platform, env, home);
 	const fish = profile.endsWith(".fish");
 	if (fish ? /['\\\n]/.test(layout.bin) : /["\\$`\n]/.test(layout.bin)) throw new Error(`Unsafe bundled bin path for a shell profile: ${layout.bin}`);
-	const line = fish ? `set -gx PATH '${layout.bin}' $PATH ${PROFILE_MARK}` : `export PATH="${layout.bin}:$PATH" ${PROFILE_MARK}`;
+	const line = profileLines(layout.bin)[fish ? "fish" : "sh"];
 	if (holdsLine(profile, line)) return { kind: "none" };
 	const state = profileState(profile, home);
 	if (state === "file" || state === "absent") return { kind: "profile", path: profile, line, create: state === "absent" };
@@ -845,7 +1113,8 @@ export function pathEntryPlan(layout, { platform = layout.platform, env = {}, ho
  * exactly. Nothing existing is replaced and nothing is written for "none" or
  * "manual". A profile that changed since the plan (now a link, or created
  * meanwhile) throws. Windows needs an injected `registry` adapter
- * ({ add(entry), remove(entry) }).
+ * ({ add(entry), remove(entry) }); an add that reports "present" (the user Path
+ * already held the entry) applied nothing.
  */
 export function applyPathEntry(plan, { registry } = {}) {
 	if (plan.kind === "symlink") symlinkSync(plan.target, plan.path);
@@ -872,7 +1141,7 @@ export function applyPathEntry(plan, { registry } = {}) {
 		return { ...plan, applied: true, separator };
 	} else if (plan.kind === "registry") {
 		if (typeof registry?.add !== "function") throw new Error("The Windows PATH change needs a registry adapter");
-		registry.add(plan.entry);
+		if (registry.add(plan.entry) === "present") return { ...plan, applied: false };
 	} else return { ...plan, applied: false };
 	return { ...plan, applied: true };
 }
@@ -880,23 +1149,36 @@ export function applyPathEntry(plan, { registry } = {}) {
  * (with the newline added before it, so the file reads as before), or only our
  * registry entry is removed. A profile applyPathEntry created is deleted when
  * nothing else is left in it. A profile that is no longer a regular file is
- * left alone.
+ * left alone, and so is everything a receipt with `applied: false` names: it
+ * was there before. Returns { removed: true }, or { removed: false, note }
+ * saying what was kept and why (a line the user edited, a link replaced).
  */
 export function removePathEntry(plan, { registry } = {}) {
+	const removed = { removed: true };
+	if (plan.applied === false) return { removed: false, note: "it was there before the install" };
 	if (plan.kind === "symlink") {
-		if (stat(plan.path)?.isSymbolicLink() && readlinkSync(plan.path) === plan.target) unlinkSync(plan.path);
+		const info = stat(plan.path);
+		if (!info) return removed;
+		if (!info.isSymbolicLink() || readlinkSync(plan.path) !== plan.target) return { removed: false, note: `${plan.path} no longer links to ${plan.target}, so it was kept` };
+		unlinkSync(plan.path);
 	} else if (plan.kind === "profile") {
 		const info = stat(plan.path);
-		if (!info?.isFile() || !plan.line.endsWith(PROFILE_MARK)) return;
+		if (!info) return removed;
+		if (!info.isFile() || !plan.line.endsWith(PROFILE_MARK)) return { removed: false, note: `${plan.path} is no longer a regular file, so it was kept` };
 		const lines = readFileSync(plan.path, "utf8").split("\n");
 		const index = lines.indexOf(plan.line);
-		if (index < 0) return;
+		if (index < 0) {
+			// Edited by the user: nothing is rewritten; the marked lines left there are named.
+			// Without any, the user already took the line out.
+			const marked = lines.filter((line) => line.includes(PROFILE_MARK));
+			return marked.length > 0 ? { removed: false, note: `${plan.path} still holds ${marked.join(" and ")} (edited, so it was kept)` } : removed;
+		}
 		lines.splice(index, 1);
 		let text = lines.join("\n");
 		if (plan.separator && index === lines.length - 1 && text.endsWith("\n")) text = text.slice(0, -1);
 		if (plan.create && text === "") {
 			unlinkSync(plan.path);
-			return;
+			return removed;
 		}
 		const mode = info.mode & 0o777;
 		replaceAtomically(plan.path, (temp) => {
@@ -907,4 +1189,120 @@ export function removePathEntry(plan, { registry } = {}) {
 		if (typeof registry?.remove !== "function") throw new Error("The Windows PATH change needs a registry adapter");
 		registry.remove(plan.entry);
 	}
+	return removed;
+}
+
+// The PATH receipt (S7): the one PATH change applyPathEntry made, kept in the
+// prefix so `gentle-shell self-uninstall` reverts exactly that change.
+const RECEIPT_SCHEMA = 1;
+const RECEIPT_FIELDS = Object.freeze({ symlink: ["path", "target"], profile: ["path", "line", "create", "separator"], registry: ["key", "name", "entry"] });
+/** Writes an applied receipt to layout.pathReceipt (mode 0600, replaced with
+ * one rename) and returns true; a receipt that applied nothing writes nothing
+ * and returns false, so an earlier receipt stays.
+ */
+export function writePathReceipt(layout, receipt) {
+	if (receipt?.applied !== true) return false;
+	const fields = RECEIPT_FIELDS[receipt.kind];
+	if (!fields) throw new Error(`Unknown PATH entry kind: ${receipt.kind}`);
+	const text = `${JSON.stringify({ schema: RECEIPT_SCHEMA, kind: receipt.kind, ...Object.fromEntries(fields.map((field) => [field, receipt[field]])) }, null, "\t")}\n`;
+	replaceAtomically(layout.pathReceipt, (temp) => {
+		writeFileSync(temp, text, { flag: "wx", mode: 0o600 });
+		if (layout.platform !== "win32") chmodSync(temp, 0o600);
+	});
+	return true;
+}
+/** Whether a receipt names only what this prefix writes: our launcher linked as
+ * ~/.local/bin/gentle-shell, our exact marked line for bin/ in a startup file
+ * pathEntryPlan can choose for this user (profileFiles, with the same ZDOTDIR
+ * and XDG_CONFIG_HOME rules), or bin/ in the HKCU user Path.
+ */
+function ownPathEntry(layout, receipt, { env, home }) {
+	if (layout.platform === "win32") return receipt.kind === "registry" && receipt.key === "HKCU\\Environment" && receipt.name === "Path" && receipt.entry === layout.bin;
+	if (typeof home !== "string" || !posix.isAbsolute(home)) return false;
+	if (receipt.kind === "symlink") return receipt.path === posix.join(home, ".local", "bin", "gentle-shell") && receipt.target === layout.launcher;
+	if (receipt.kind !== "profile" || typeof receipt.create !== "boolean" || typeof receipt.separator !== "boolean") return false;
+	// Only a file pathEntryPlan can choose here, holding the line it writes there.
+	const lines = profileLines(layout.bin);
+	const files = profileFiles(layout.platform, env, home);
+	return Object.entries(files).some(([shell, paths]) => paths.includes(receipt.path) && receipt.line === lines[shell === "fish" ? "fish" : "sh"]);
+}
+/** The persisted receipt: { status: "recorded", receipt } (applied: true, as
+ * removePathEntry takes it), { status: "none" } without one, or
+ * { status: "invalid", reason } for anything that is not a regular file this
+ * prefix wrote (never acted on). `env` and `home` are the user's, as
+ * pathEntryPlan read them.
+ */
+export function readPathReceipt(layout, { env = {}, home } = {}) {
+	const info = stat(layout.pathReceipt);
+	if (!info) return { status: "none" };
+	const invalid = (reason) => ({ status: "invalid", reason: `${layout.pathReceipt} ${reason}` });
+	if (!info.isFile()) return invalid("is not a regular file");
+	if (info.size > 64 * 1024) return invalid("is too large");
+	let data;
+	try { data = JSON.parse(readFileSync(layout.pathReceipt, "utf8")); }
+	catch { return invalid("is not valid JSON"); }
+	if (data === null || typeof data !== "object" || Array.isArray(data) || data.schema !== RECEIPT_SCHEMA || !Object.hasOwn(RECEIPT_FIELDS, data.kind)) {
+		return invalid("has an unknown format");
+	}
+	const receipt = { kind: data.kind, ...Object.fromEntries(RECEIPT_FIELDS[data.kind].map((field) => [field, data[field]])), applied: true };
+	return ownPathEntry(layout, receipt, { env, home }) ? { status: "recorded", receipt } : invalid("does not describe this install's PATH entry");
+}
+/** What a recorded receipt changed, for the uninstall plan. */
+export function describePathReceipt(receipt) {
+	if (receipt.kind === "symlink") return `the link ${receipt.path} to ${receipt.target}`;
+	if (receipt.kind === "profile") return `the line ${receipt.line} in ${receipt.path}${receipt.create ? " (and that file, when nothing else is left in it)" : ""}`;
+	return `${receipt.entry} in your user Path (${receipt.key})`;
+}
+
+// Windows: once process GENTLE_SHELL_REMOVE_AFTER_PID exits, deletes each file
+// in GENTLE_SHELL_REMOVE_FILES (retrying while it is still in use), then
+// GENTLE_SHELL_REMOVE_LAST (the prefix marker) only when nothing is left at any
+// of those paths, so a failed removal can be retried with self-uninstall, then each
+// folder in GENTLE_SHELL_REMOVE_DIRECTORIES only when it is empty (never
+// recursively, so no link is followed). Every path is data, never script text.
+const deferredRemovalScript = `$ErrorActionPreference = 'SilentlyContinue'
+$waitFor = [int]$env:GENTLE_SHELL_REMOVE_AFTER_PID
+try { Wait-Process -Id $waitFor -Timeout 600 -ErrorAction Stop } catch {}
+Start-Sleep -Seconds 2
+$files = @($env:GENTLE_SHELL_REMOVE_FILES -split "\`n" | Where-Object { $_ -ne '' })
+foreach ($file in $files) {
+  for ($try = 0; $try -lt 60; $try++) {
+    try { if ([IO.File]::Exists($file)) { [IO.File]::Delete($file) }; break } catch { Start-Sleep -Milliseconds 500 }
+  }
+}
+$last = $env:GENTLE_SHELL_REMOVE_LAST
+if ($last -and @($files | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0) { try { [IO.File]::Delete($last) } catch {} }
+foreach ($folder in @($env:GENTLE_SHELL_REMOVE_DIRECTORIES -split "\`n" | Where-Object { $_ -ne '' })) {
+  try { [IO.Directory]::Delete($folder, $false) } catch {}
+}
+exit 0`;
+/** Windows self-uninstall: the running node.exe and the .cmd launcher cannot
+ * delete themselves, so one detached, hidden Windows PowerShell removes `files`,
+ * then `last` once nothing is left at those paths, then the empty
+ * `directories` (deepest first), after process `pid` exits.
+ * cmd.exe (detached) starts it with `start`, so it outlives the launcher; the
+ * script goes as -EncodedCommand (UTF-16LE base64). Absolute local
+ * paths only, passed in the environment; `spawn` is injectable for tests.
+ */
+export function scheduleWindowsRemoval({ pid, files, last, directories, env = {}, spawn: start = spawn }) {
+	const systemRoot = envValue(env, "SYSTEMROOT", "win32");
+	const safe = (path) => typeof path === "string" && win32.isAbsolute(path) && !path.startsWith("\\\\") && !/[\r\n]/.test(path);
+	// SystemRoot is part of cmd's command line (the PowerShell path): no cmd metacharacter.
+	const cmdSafe = (path) => safe(path) && !/[&|<>^%!"]/.test(path);
+	if (!Number.isInteger(pid) || pid <= 0 || !cmdSafe(systemRoot) || ![...files, ...directories, ...(last === undefined ? [] : [last])].every(safe)) {
+		throw new Error("Unsafe deferred removal request");
+	}
+	// A detached PowerShell never ran on the Windows runner, and a non-detached one
+	// sits in Node's job object and dies with the exiting launcher. A detached
+	// cmd.exe leaves that job and `start` gives PowerShell its own console, so it
+	// outlives the launcher. Only fixed tokens and base64 reach cmd's command line.
+	const powershell = win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+	const encoded = Buffer.from(deferredRemovalScript, "utf16le").toString("base64");
+	const child = start(win32.join(systemRoot, "System32", "cmd.exe"), ["/d", "/c", "start", "\"\"", "/min", powershell,
+		"-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded], {
+		cwd: systemRoot, detached: true, stdio: "ignore", windowsHide: true,
+		env: { ...env, GENTLE_SHELL_REMOVE_AFTER_PID: String(pid), GENTLE_SHELL_REMOVE_FILES: files.join("\n"), GENTLE_SHELL_REMOVE_DIRECTORIES: directories.join("\n"),
+			GENTLE_SHELL_REMOVE_LAST: last ?? "" },
+	});
+	child.unref();
 }

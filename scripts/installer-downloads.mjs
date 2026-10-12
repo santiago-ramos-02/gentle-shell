@@ -38,6 +38,25 @@ const go = Object.freeze({
 });
 /** The Go version acquireGo publishes. */
 export const goPinVersion = go.version;
+// Engram for the bundled install (GENTLE_AI_ENGRAM_BIN and the agent's memory):
+// the Gentleman-Programming/engram release gentle-ai 4.x installs (it takes the
+// latest core release). Each sha256 and size comes from the release's
+// checksums.txt and GitHub's asset digests; every archive was downloaded and
+// re-hashed before pinning. GitHub serves the assets from its asset hosts.
+const engram = Object.freeze({
+	version: "3.4.0",
+	redirectHosts: Object.freeze(["objects.githubusercontent.com", "release-assets.githubusercontent.com"]),
+	archives: Object.freeze({
+		"darwin-arm64": ["darwin_arm64.tar.gz", "d0aa59c9a83d17ae3fc7f5dd31fdab6a26fd8c00fc5e692195753cd0719294f7", 7470202],
+		"darwin-x64": ["darwin_amd64.tar.gz", "3c5bdc73d226af5629cf4f4a781e223142e37c1ebb443c4b596f2e284352e381", 7961674],
+		"linux-x64": ["linux_amd64.tar.gz", "715fda625556e46d65ddb4526bb7f88a3fee5339ca3c44ce44cc652f17fa57f1", 7821191],
+		"linux-arm64": ["linux_arm64.tar.gz", "3309e9c0bbb539d183fd5aa9f9a13cd7aa0e81ec2512b5bedefb8b2bdd35b3e5", 7176726],
+		"win32-x64": ["windows_amd64.zip", "3065736ec7ff8137eb3fc607275f542ea13bb743a5157318c8a8770f11ce3289", 8021225],
+		"win32-arm64": ["windows_arm64.zip", "7463872a85a5e5434cf958bdffc71dda1926bced30d3b6b38c80fec9bb98fbba", 7231641],
+	}),
+});
+/** The Engram version the bundled install publishes under runtime/. */
+export const engramPinVersion = engram.version;
 
 /** Fixed allowlist; callers cannot supply download URLs, checksums or commands. */
 export function artifactFor(name, platform, arch) {
@@ -49,6 +68,14 @@ export function artifactFor(name, platform, arch) {
 			throw new Error("Windows artifact metadata rejected");
 		}
 		return Object.freeze({ name, version: pin.version, platform, arch, url: target.url, integrity: `sha256-${target.sha256}`, maxBytes: pin.maxBytes });
+	}
+	if (name === "engram") {
+		const pin = Object.hasOwn(engram.archives, `${platform}-${arch}`) ? engram.archives[`${platform}-${arch}`] : null;
+		if (!pin) throw new Error("Unsupported acquisition target");
+		const [suffix, sha256, size] = pin;
+		return Object.freeze({ name, version: engram.version, platform, arch,
+			url: `https://github.com/Gentleman-Programming/engram/releases/download/v${engram.version}/engram_${engram.version}_${suffix}`,
+			integrity: `sha256-${sha256}`, size, maxBytes: size, redirectHosts: engram.redirectHosts });
 	}
 	if (name === "go") {
 		const pin = Object.hasOwn(go.archives, `${platform}-${arch}`) ? go.archives[`${platform}-${arch}`] : null;
@@ -288,8 +315,8 @@ export function removeOwnedTools(tools, home) {
 	}
 }
 
-/** The pnpm the installer runs: the pinned major (the runner's argv is verified
- * for it, as installer-probes checks) at the pinned version or newer.
+/** The pnpm the bootstraps run: the pinned major at the pinned version or newer.
+ * A user's pnpm of a newer major is left as it is and used by the plan (installer-probes).
  */
 export function pinnedPnpmCompatible(version) {
 	const actual = parts(version);

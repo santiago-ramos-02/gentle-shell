@@ -2364,3 +2364,47 @@ test("native Windows: the bundled pnpm keeps its store, cache and state in the p
 		assert.deepEqual(readdirSync(profile).filter((name) => /pnpm|npmrc/i.test(name)), []);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+// T6 (S6): a bundled self-uninstall runs on the prefix's own node.exe, which
+// cannot delete itself; the detached removal waits for that process to exit.
+test("native Windows: the deferred self-uninstall removal waits for the running node.exe, then removes it, the launcher, the marker only once both are gone, and only the folders left empty", { skip: nativeUnavailable }, async () => {
+	const f = nativeFixture();
+	try {
+		const root = join(f.root, "a^b,c (d) !e %f% $x' ;", "gentle-shell");
+		const nodeDir = join(root, "runtime", "node-24.21.0");
+		const node = join(nodeDir, "node.exe");
+		const launcher = join(root, "bin", "gentle-shell.cmd");
+		const marker = join(root, ".gentle-shell-bundle");
+		mkdirSync(nodeDir, { recursive: true });
+		mkdirSync(dirname(launcher));
+		copyFileSync(process.execPath, node);
+		writeFileSync(launcher, "@echo off\r\n");
+		writeFileSync(marker, "gentle-shell bundled install");
+		writeFileSync(join(root, "notes.txt"), "mine");
+		const running = spawn(node, ["-e", "setTimeout(() => {}, 5000)"], { stdio: "ignore", windowsHide: true });
+		await new Promise((resolve, reject) => { running.once("spawn", resolve); running.once("error", reject); });
+		bundled.scheduleWindowsRemoval({ pid: running.pid!, files: [node, launcher], last: marker, directories: [nodeDir, join(root, "runtime"), join(root, "bin"), root],
+			env: process.env as Record<string, string> });
+		await new Promise((resolve) => setTimeout(resolve, 1500));
+		assert.equal(existsSync(node), true, "nothing is removed while the process runs");
+		const deadline = Date.now() + 90000;
+		while ([node, launcher, marker, nodeDir, join(root, "bin")].some((path) => existsSync(path)) && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 500));
+		}
+		// The prefix still holds something that is not ours, so only it stays.
+		assert.deepEqual(readdirSync(root), ["notes.txt"]);
+		assert.equal(readFileSync(join(root, "notes.txt"), "utf8"), "mine");
+		// A4: when a listed path cannot be removed (here a folder in a file's place), the marker stays for a retry.
+		const stuck = join(f.root, "stuck", "gentle-shell");
+		const stuckMarker = join(stuck, ".gentle-shell-bundle");
+		mkdirSync(join(stuck, "bin", "gentle-shell.cmd"), { recursive: true });
+		writeFileSync(stuckMarker, "gentle-shell bundled install");
+		const done = spawn(process.execPath, ["-e", ""], { stdio: "ignore", windowsHide: true });
+		await new Promise((resolve) => done.once("exit", resolve));
+		bundled.scheduleWindowsRemoval({ pid: done.pid!, files: [join(stuck, "bin", "gentle-shell.cmd")], last: stuckMarker, directories: [join(stuck, "bin"), stuck],
+			env: process.env as Record<string, string> });
+		await new Promise((resolve) => setTimeout(resolve, 15000));
+		assert.equal(readFileSync(stuckMarker, "utf8"), "gentle-shell bundled install");
+		assert.equal(existsSync(join(stuck, "bin", "gentle-shell.cmd")), true);
+	} finally { f.cleanup(); }
+});

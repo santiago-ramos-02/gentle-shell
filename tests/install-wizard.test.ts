@@ -366,6 +366,19 @@ test("planModel discloses the PATH change and runtime persistence before consent
 		[[false, true], [false, true]]);
 });
 
+// A missing Git is noted on the review screen, never as a blocker: the plan stays installable.
+test("the review screen notes a missing Git and stays installable", async () => {
+	const model = wizard.planModel(await serverPlanView({ git: { available: false } }));
+	assert.match(model.gitNotice, /Git was not found on this computer/);
+	const node = wizard.renderPlan(new FakeDocument(), model, { install() {}, reload() {}, close() {} });
+	assert.match(node.textContent, /Git not found/);
+	assert.match(node.textContent, /sudo apt-get install -y git/);
+	assert.ok(button(node, "Install Gentle Shell"), "still installable");
+	const plain = wizard.planModel(await serverPlanView({ git: { available: true } }));
+	assert.equal(plain.gitNotice, null);
+	assert.doesNotMatch(wizard.renderPlan(new FakeDocument(), plain, { install() {}, reload() {}, close() {} }).textContent, /Git not found/);
+});
+
 // S6 notice: shown on the review screen before consent; it changes nothing else.
 test("the review screen shows the notice about reused tools in folders another account can change", async () => {
 	const weak = { check: "parent-acl-mask", at: "C:\\Users\\m\\AppData\\Roaming", sid: "S-1-5-21-1-2-3-1002", account: "PC\\other", rights: "0x001301BF" };
@@ -585,9 +598,9 @@ test("an update plan is reviewed as an update, with an Update button", () => {
 	assert.equal(button(view, "Install Gentle Shell"), undefined);
 });
 
-test("a main plan blocked by a Go it cannot check still lets the user switch back to release", async () => {
-	const blocked = await serverPlanView({ go: { available: null } }, "main");
-	assert.ok(blocked.blockers.some((blocker: { code: string }) => blocker.code === "main-requires-go"));
+test("a blocked main plan still lets the user switch back to release", async () => {
+	const blocked = await serverPlanView({ node: { available: null } }, "main");
+	assert.ok(blocked.blockers.some((blocker: { code: string }) => blocker.code === "unknown-tool"));
 	const ui = mount({ "GET /api/progress": () => idleProgress(), "GET /api/plan": () => [200, blocked] });
 	await ui.app.start();
 	await flush();
@@ -1127,7 +1140,8 @@ test("expectedSteps mirrors runBundledInstall's step order, and every bundled st
 	const steps = ["claim-prefix", "copy-npm-settings", "install-runtime", "install-version", "activate-version", "write-launcher", "bundled-path", "shell-setup"];
 	assert.deepEqual(wizard.expectedSteps(bundledIds), steps);
 	assert.deepEqual(wizard.expectedSteps(bundledIds.filter((id) => id !== "bundled-path")), steps.filter((id) => id !== "bundled-path"));
-	assert.deepEqual([...bundledFailedSteps], steps);
+	// verify-launcher runs only for a migration (T3).
+	assert.deepEqual([...bundledFailedSteps], [...steps.slice(0, 6), "verify-launcher", ...steps.slice(6)]);
 	for (const id of steps) assert.notEqual(wizard.stepLabel(id), id, `label for ${id}`);
 	// The runner logs exactly that order.
 	const layout = prefixLayout({ platform: "linux", env: {}, home: "/home/u" });
@@ -1158,6 +1172,11 @@ test("planModel and renderPlan present the bundled install as one self-contained
 	assert.match(node.textContent, /Install Gentle Shell as one self-contained product/);
 	assert.match(node.textContent, /your own Node\.js, npm, pnpm, Go and Pi are not used or changed/i);
 	assert.match(node.textContent, /Install Gentle Shell/);
+	// The default fresh-install path notes a missing Git too.
+	const withGit = wizard.renderPlan(new FakeDocument(), wizard.planModel({ ...view, gitNotice: { description: "Git was not found on this computer." } }),
+		{ install() {}, reload() {}, close() {} });
+	assert.match(withGit.textContent, /Git not found/);
+	assert.doesNotMatch(node.textContent, /Git not found/);
 });
 
 test("outcomeModel gives the PATH line to add when the bundled install may not edit the profile", () => {
@@ -1171,4 +1190,34 @@ test("outcomeModel gives the PATH line to add when the bundled install may not e
 	assert.ok(model.next.some((text: string) => /open a new terminal/i.test(text)));
 	assert.equal(wizard.outcomeModel({ outcome: "failed", failedStep: "install-version", completed: [], guidance: "g", detail: "ERR_PNPM_FETCH_401" }).detailCommand,
 		"pnpm install");
+});
+
+// T3: a migration checks the new launcher, then removes the old global gentle-pi last.
+test("expectedSteps mirrors a migration's steps, and a failed removal shows its exact command", async () => {
+	const ids = [...bundledIds, "remove-global-shell"];
+	const steps = ["claim-prefix", "copy-npm-settings", "install-runtime", "install-version", "activate-version", "write-launcher", "verify-launcher", "bundled-path",
+		"shell-setup", "remove-global-shell"];
+	assert.deepEqual(wizard.expectedSteps(ids), steps);
+	for (const id of ["verify-launcher", "remove-global-shell"]) assert.notEqual(wizard.stepLabel(id), id, `label for ${id}`);
+	const layout = prefixLayout({ platform: "linux", env: {}, home: "/home/u" });
+	const distribution = { status: "published", manifest: { shell: "4.1.0", pi: "1.0.2" }, lockfile: "lock" };
+	const path = { kind: "profile", path: "/home/u/.bashrc", line: "export PATH=x # gentle-shell bundled install", create: false };
+	const plan = bundledPlan({ platform: "linux", distribution, layout, path, migrate: { manager: "pnpm", removal: "plan" } });
+	assert.deepEqual(plan.actions.map((action: { id: string }) => action.id), ids);
+	const logged: string[] = [];
+	const operations = { claimPrefix: () => layout, userNpmrc: () => "", writeNpmrcAuth: () => {}, ensureRuntime: async () => ({ go: null }), installVersion: async () => ({}),
+		activateVersion: () => {}, ensureLauncher: () => {}, pathEntryPlan: () => path, applyPathEntry: () => {}, checkLauncher: async () => ({ ok: true }),
+		run: async () => ({ status: 0 }) };
+	await runBundledInstall({ plan, consent: true }, { platform: "linux", arch: "x64", env: {}, home: "/home/u", distribution, operations,
+		removeGlobal: async () => true, log: (entry: { step: string }) => logged.push(entry.step) });
+	assert.deepEqual(logged, steps);
+	const model = wizard.outcomeModel({ outcome: "ready", completed: [], guidance: "g", removeCommand: "pnpm remove -g gentle-pi" });
+	assert.ok(model.notes.some((note: string) => note.includes("`pnpm remove -g gentle-pi`")));
+	assert.deepEqual(wizard.outcomeModel({ outcome: "ready", completed: [], guidance: "g" }).notes, []);
+	// B3: a failed migration step shows the host's detail line.
+	for (const id of ["claim-prefix", "copy-npm-settings", "install-runtime", "activate-version", "write-launcher", "verify-launcher", "bundled-path"]) {
+		const failed = wizard.outcomeModel({ outcome: "failed", failedStep: id, completed: [], guidance: "g", detail: "Unsafe bundled prefix: ~/.gentle-shell" });
+		assert.equal(failed.detail, "Unsafe bundled prefix: ~/.gentle-shell", id);
+		assert.equal(typeof failed.detailCommand, "string", id);
+	}
 });

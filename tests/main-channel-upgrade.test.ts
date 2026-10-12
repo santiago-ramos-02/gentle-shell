@@ -4,7 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { CHANNEL_SCHEMA, MainChannelError, ownerManager, readChannel, runUpgrade, writeChannel } from "../scripts/main-channel.mjs";
+import { CHANNEL_SCHEMA, MainChannelError, ownerManager, readChannel, removeGlobalShell, runUpgrade, writeChannel } from "../scripts/main-channel.mjs";
 
 const AI_SHA = "1f9d5e6423e37f7d2316859045f379ba9b5d8c3a";
 const SHELL_SHA = "6e7e3a18f794223396527a54c7c36d19c7d236c6";
@@ -17,7 +17,8 @@ type Invocation = { command: string; prefix: string[] } | null;
 /** A sandboxed home with a pnpm- or npm-owned package root and fake network/processes.
  * `which` finds `<bin>/<name><suffix>`; `invocation`, when given, is the host's adapter. */
 function world({ owner = "pnpm", latest = "4.1.0", commits = { ai: AI_SHA, shell: SHELL_SHA }, tools = ["go", "pnpm", "npm"], platform = "darwin",
-	bin = "/usr/bin", suffix = "", invocation = undefined as ((name: string) => Promise<Invocation>) | undefined, fs = fsPromises as typeof fsPromises } = {}) {
+	bin = "/usr/bin", suffix = "", invocation = undefined as ((name: string) => Promise<Invocation>) | undefined, fs = fsPromises as typeof fsPromises,
+	migrate = undefined as ((input: { latest: string; owner: () => Promise<unknown> }) => Promise<unknown>) | undefined } = {}) {
 	// owner "linked": `npm link` of a source checkout, so npm's global entry points outside npm's root.
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "upgrade-")));
 	const home = join(root, "home");
@@ -68,7 +69,7 @@ function world({ owner = "pnpm", latest = "4.1.0", commits = { ai: AI_SHA, shell
 	};
 	const which = async (name: string) => (tools.includes(name) ? `${bin}/${name}${name === "go" ? "" : suffix}` : null);
 	const upgrade = (args: string[], currentVersion = "4.0.0") => runUpgrade({ args, ctx, platform, packageRoot, currentVersion,
-		adapters: { fetch, run, fs, which, ...(invocation ? { invocation } : {}) }, out: (line: string) => lines.push(line) });
+		adapters: { fetch, run, fs, which, ...(invocation ? { invocation } : {}), ...(migrate ? { migrate } : {}) }, out: (line: string) => lines.push(line) });
 	const installs = () => calls.filter((call) => call.argv.some((arg) => ["add", "install"].includes(arg)) && !call.argv.some((arg) => arg.includes("cmd/gentle-ai@")))
 		.map((call) => `${call.command} ${call.argv.join(" ")}`);
 	const manager = (command?: string) => ownerManager({ ctx, platform, packageRoot, adapters: { fs, run, which, ...(invocation ? { invocation } : {}) },
@@ -225,14 +226,13 @@ test("switching to release keeps a dev binary the user registered themselves", a
 	} finally { w.cleanup(); }
 });
 
-test("main needs Go and pnpm on PATH", async () => {
-	for (const tools of [["pnpm", "npm"], ["go", "npm"]]) {
-		const w = world({ tools });
-		try {
-			await assert.rejects(w.upgrade(["--channel", "main"]), (error: MainChannelError) => error.code === "main-requires-tools");
-			assert.deepEqual(w.calls, []);
-		} finally { w.cleanup(); }
-	}
+// A missing Go is not a blocker: the build downloads the pinned Go (main-channel.test.ts).
+test("main needs pnpm on PATH", async () => {
+	const w = world({ tools: ["go", "npm"] });
+	try {
+		await assert.rejects(w.upgrade(["--channel", "main"]), (error: MainChannelError) => error.code === "main-requires-tools");
+		assert.deepEqual(w.calls, []);
+	} finally { w.cleanup(); }
 });
 
 // S8: on Windows npm and pnpm are `.cmd` shims, which cannot run with shell:false.
@@ -326,4 +326,64 @@ test("unknown upgrade arguments are a usage error", async () => {
 			assert.deepEqual(w.fetches, []);
 		} finally { w.cleanup(); }
 	}
+});
+
+// T3 (S4): the release branch first offers the migration to the bundled install.
+test("a release upgrade that migrates installs nothing globally, records the release channel and removes only the main override", async () => {
+	const seen: { latest: string; owner: unknown }[] = [];
+	const w = world({ migrate: async ({ latest, owner }) => { seen.push({ latest, owner: await owner() }); return { code: 0, installed: true }; } });
+	try {
+		await writeChannel(w.ctx, { channel: "main", shellCommit: SHELL_SHA, gentleAiCommit: AI_SHA }, fsPromises);
+		const registration = join(w.home, ".pi", "gentle-ai", "dev-binary.json");
+		writeFileSync(registration, JSON.stringify({ schema: "gentle-pi.dev-binary/v1", path: join(w.home, ".pi", "gentle-ai", "main", "gentle-ai", AI_SHA, "gentle-ai") }));
+		assert.equal(await w.upgrade(["--channel", "release"], "4.0.0-main.6e7e3a18f794"), 0);
+		assert.deepEqual(seen, [{ latest: "4.1.0", owner: { name: "pnpm", command: "/usr/bin/pnpm", prefix: [] } }]);
+		assert.deepEqual(w.installs(), []);
+		assert.equal(existsSync(registration), false);
+		assert.deepEqual(await readChannel(w.ctx, fsPromises), { channel: "release" });
+	} finally { w.cleanup(); }
+	// A migration whose removal failed keeps the bundled install: its exit code, and the release channel recorded.
+	const kept = world({ migrate: async () => ({ code: 1, installed: true }) });
+	try {
+		assert.equal(await kept.upgrade([]), 1);
+		assert.deepEqual(kept.installs(), []);
+		assert.equal(existsSync(join(kept.home, ".pi", "gentle-ai", "channel.json")), true);
+	} finally { kept.cleanup(); }
+	// B3: a migration that failed (it printed why and returns null) leaves this run to the global update.
+	const failed = world({ migrate: async () => null });
+	try {
+		assert.equal(await failed.upgrade([]), 0);
+		assert.deepEqual(failed.installs(), ["/usr/bin/pnpm add -g gentle-pi@4.1.0 --allow-build=gentle-pi"]);
+	} finally { failed.cleanup(); }
+});
+
+test("a release upgrade the migration declines keeps the current path, and main never asks", async () => {
+	let asked = 0;
+	const w = world({ migrate: async () => { asked += 1; return null; } });
+	try {
+		assert.equal(await w.upgrade([]), 0);
+		assert.deepEqual(w.installs(), ["/usr/bin/pnpm add -g gentle-pi@4.1.0 --allow-build=gentle-pi"]);
+		assert.deepEqual(w.lines, ["Updated gentle-shell 4.0.0 to 4.1.0 (release)."]);
+		assert.equal(asked, 1);
+	} finally { w.cleanup(); }
+	// The migration's owner check keeps the current refusals for an npm link.
+	const linked = world({ owner: "linked", migrate: async ({ owner }) => owner().then(() => ({ code: 0, installed: true }), () => null) });
+	try {
+		await assert.rejects(linked.upgrade([]), (error: MainChannelError) => error.code === "upgrade-owner-unknown");
+	} finally { linked.cleanup(); }
+	const main = world({ migrate: async () => { asked += 1; return { code: 0, installed: true }; } });
+	try {
+		await writeChannel(main.ctx, { channel: "main", shellCommit: SHELL_SHA, gentleAiCommit: AI_SHA }, fsPromises);
+		assert.equal(await main.upgrade([], "4.0.0-main.6e7e3a18f794"), 0);
+		assert.equal(asked, 1);
+	} finally { main.cleanup(); }
+});
+
+test("removeGlobalShell removes gentle-pi with the manager that owns it, through its verified invocation", async () => {
+	const calls: string[] = [];
+	const run = async (command: string, argv: string[]) => { calls.push(`${command} ${argv.join(" ")}`); return { code: calls.length === 3 ? 1 : 0, stdout: "" }; };
+	assert.equal(await removeGlobalShell({ name: "pnpm", command: "/usr/bin/pnpm", prefix: [] }, run), true);
+	assert.equal(await removeGlobalShell({ name: "npm", command: "C:\\nodejs\\node.exe", prefix: ["C:\\nodejs\\npm-cli.js"] }, run), true);
+	assert.equal(await removeGlobalShell({ name: "npm", command: "/usr/bin/npm", prefix: [] }, run), false);
+	assert.deepEqual(calls, ["/usr/bin/pnpm remove -g gentle-pi", "C:\\nodejs\\node.exe C:\\nodejs\\npm-cli.js uninstall -g gentle-pi", "/usr/bin/npm uninstall -g gentle-pi"]);
 });

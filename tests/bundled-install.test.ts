@@ -3,11 +3,13 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, rmSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join, posix } from "node:path";
+import { dirname, join, posix, win32 } from "node:path";
 import test, { after, type TestContext } from "node:test";
 import { crc32, gzipSync } from "node:zlib";
-import { activateVersion, activeVersion, applyPathEntry, claimPrefix, prefixRoot, distributionFiles, ensureLauncher, ensureRuntime, filterNpmrc, installVersion, nodeExecutable,
-	nodeRuntimeFiles, pathEntryPlan, pnpmEnvironment, prefixLayout, pruneVersions, removePathEntry, setupEnvironment, userNpmrc, writeNpmrcAuth } from "../scripts/bundled-install.mjs";
+import { activateVersion, activeVersion, applyPathEntry, claimPrefix, prefixRoot, distributionFiles, engramExecutable, ensureEngram, ensureLauncher, ensureRuntime, filterNpmrc, installVersion, nodeExecutable,
+	nodeRuntimeFiles, pathEntryPlan, pnpmEnvironment, prefixLayout, pruneVersions, removePathEntry, rollbackBundled, setupEnvironment, bundledNpmCommand, ensureNpmShim, upgradeBundled, userNpmrc, writeNpmrcAuth,
+	describePathReceipt, readPathReceipt, scheduleWindowsRemoval, writePathReceipt }
+	from "../scripts/bundled-install.mjs";
 
 // Real directories, modes, symlinks and uids need a POSIX host.
 const posixHost = process.platform === "win32" ? "POSIX filesystem fixtures need a POSIX host" : false;
@@ -15,6 +17,7 @@ const posixTest = (name: string, fn: (t: TestContext) => void | Promise<void>) =
 const NODE = "24.21.0";
 const PNPM = "11.1.1";
 const NPM = "11.19.0";
+const ENGRAM = "3.4.0";
 
 // Every temporary home this file creates is removed when the file's tests end.
 const roots: string[] = [];
@@ -102,19 +105,27 @@ const pnpmArchive = tarGz([
 	// pnpm runs node-gyp from this folder: it must stay executable.
 	tarEntry("package/dist/node-gyp-bin/node-gyp", { data: Buffer.from("#!/bin/sh\n"), mode: "0000755" }),
 ]);
-const archives: Record<string, Buffer> = { node: nodeArchive, pnpm: pnpmArchive };
+// The Engram release archive's shape: the executable at the top, beside tools/.
+const engramBytes = Buffer.from("#!/bin/sh\necho fixture engram\n");
+const engramArchive = tarGz([
+	tarEntry("tools/cloud-sync-projects.sh", { data: Buffer.from("#!/bin/sh\n"), mode: "0000755" }),
+	tarEntry("engram", { data: engramBytes, mode: "0000755" }),
+]);
+const engramUrl = `https://github.com/Gentleman-Programming/engram/releases/download/v${ENGRAM}/engram_${ENGRAM}_darwin_arm64.tar.gz`;
+const archives: Record<string, Buffer> = { node: nodeArchive, pnpm: pnpmArchive, engram: engramArchive };
 const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 function adapters(overrides: Record<string, unknown> = {}) {
 	const calls: { downloads: string[]; runs: { command: string; args: string[]; cwd: string; env: Record<string, string> }[] } = { downloads: [], runs: [] };
 	return {
 		calls,
 		adapters: {
-			artifact: (name: string) => ({ name, version: name === "node" ? NODE : PNPM, maxBytes: 1 << 20, integrity: `sha256-${sha256(archives[name])}`,
-				url: name === "node" ? `https://nodejs.org/dist/v${NODE}/${nodeStem}.tar.gz` : `https://registry.npmjs.org/pnpm/-/pnpm-${PNPM}.tgz` }),
+			artifact: (name: string) => ({ name, version: name === "node" ? NODE : name === "engram" ? ENGRAM : PNPM, maxBytes: 1 << 20, integrity: `sha256-${sha256(archives[name])}`,
+				url: name === "node" ? `https://nodejs.org/dist/v${NODE}/${nodeStem}.tar.gz` : name === "engram" ? engramUrl : `https://registry.npmjs.org/pnpm/-/pnpm-${PNPM}.tgz` }),
 			download: async (descriptor: { name: string }) => { calls.downloads.push(descriptor.name); return archives[descriptor.name]; },
 			run: (command: string, args: string[], options: { cwd: string; env: Record<string, string> }) => {
 				calls.runs.push({ command, args, ...options });
 				if (args.length === 1 && args[0] === "--version") return { status: 0, stdout: `v${NODE}\n`, stderr: "" };
+				if (args.length === 1 && args[0] === "version") return { status: 0, stdout: `engram ${ENGRAM}\n`, stderr: "" };
 				if (args[1] === "--version") return { status: 0, stdout: `${args[0].endsWith("npm-cli.js") ? NPM : PNPM}\n`, stderr: "" };
 				return { status: 1, stdout: "", stderr: "unexpected" };
 			},
@@ -132,6 +143,7 @@ test("prefixLayout puts every bundled folder under ~/.gentle-shell on POSIX", ()
 	assert.equal(layout.node, `${root}/runtime/node-${NODE}/bin/node`);
 	assert.equal(layout.pnpm, `${root}/runtime/pnpm-${PNPM}/package/bin/pnpm.mjs`);
 	assert.equal(layout.goRoot, `${root}/runtime/go`);
+	assert.equal(layout.engram, `${root}/runtime/engram-${ENGRAM}/engram`);
 	assert.deepEqual([layout.pnpmHome, layout.store, layout.cache, layout.state, layout.config],
 		["pnpm", "pnpm/store", "pnpm/cache", "pnpm/state", "pnpm/config"].map((folder) => `${root}/${folder}`));
 	assert.equal(layout.versions, `${root}/versions`);
@@ -148,6 +160,7 @@ test("prefixLayout uses the Windows private folder and a pointer file for curren
 	assert.equal(layout.root, root);
 	assert.equal(layout.agent, "C:\\Users\\me\\.gentle-shell\\agent");
 	assert.equal(layout.node, `${root}\\runtime\\node-${NODE}\\node.exe`);
+	assert.equal(layout.engram, `${root}\\runtime\\engram-${ENGRAM}\\engram.exe`);
 	assert.equal(layout.currentKind, "pointer");
 	assert.equal(layout.launcher, `${root}\\bin\\gentle-shell.cmd`);
 	assert.equal(layout.tmp, `${root}\\tmp`);
@@ -155,7 +168,7 @@ test("prefixLayout uses the Windows private folder and a pointer file for curren
 	assert.equal(fallback.versions, "C:\\Users\\me\\.gentle-shell-bundle\\versions");
 });
 
-posixTest("claimPrefix creates a private root and refuses one another account can change", () => {
+posixTest("claimPrefix creates a private root, tightens its own group- or other-writable root and refuses a link or a non-folder", () => {
 	const user = home();
 	const layout = claimPrefix({ platform: "darwin", env: { HOME: user }, home: user });
 	const info = lstatSync(layout.root);
@@ -168,10 +181,20 @@ posixTest("claimPrefix creates a private root and refuses one another account ca
 	const linked = home();
 	symlinkSync(layout.root, join(linked, ".gentle-shell"));
 	assert.throws(() => claimPrefix({ platform: "darwin", env: { HOME: linked }, home: linked }), /Unsafe bundled prefix/);
-	const shared = home();
-	mkdirSync(join(shared, ".gentle-shell"));
-	chmodSync(join(shared, ".gentle-shell"), 0o777);
-	assert.throws(() => claimPrefix({ platform: "darwin", env: { HOME: shared }, home: shared }), /Unsafe bundled prefix/);
+	// T3 B3: a real folder of this user that umask 002 (or chmod) left group- or other-writable is
+	// tightened (go-w), not refused, and its contents stay.
+	for (const mode of [0o775, 0o777]) {
+		const shared = home();
+		mkdirSync(join(shared, ".gentle-shell"));
+		writeFileSync(join(shared, ".gentle-shell", "config.json"), "{}");
+		chmodSync(join(shared, ".gentle-shell"), mode);
+		assert.equal(claimPrefix({ platform: "darwin", env: { HOME: shared }, home: shared }).root, join(shared, ".gentle-shell"));
+		assert.equal(lstatSync(join(shared, ".gentle-shell")).mode & 0o777, mode & ~0o022);
+		assert.equal(readFileSync(join(shared, ".gentle-shell", "config.json"), "utf8"), "{}");
+	}
+	const file = home();
+	writeFileSync(join(file, ".gentle-shell"), "");
+	assert.throws(() => claimPrefix({ platform: "darwin", env: { HOME: file }, home: file }), /Unsafe bundled prefix|EEXIST|ENOTDIR/);
 });
 
 test("claimPrefix on Windows walks then claims %LOCALAPPDATA%, falling back to the profile only on an untrusted owner or ACL", () => {
@@ -262,7 +285,9 @@ posixTest("ensureRuntime installs the verified Node and pnpm into runtime/ and r
 	assert.equal(lstatSync(join(layout.pnpmDir, "package", "dist", "node-gyp-bin", "node-gyp")).mode & 0o777, 0o700);
 	assert.equal(lstatSync(join(layout.pnpmDir, "package", "package.json")).mode & 0o777, 0o600);
 	// The Node executable and its npm are published, no links: npm and npx are our own wrappers.
-	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`)).sort(), [".gentle-shell-runtime", "bin", "lib"]);
+	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`)).sort(), [".gentle-shell-runtime", "bin", "gentle-shell", "lib"]);
+	// Pi's npmCommand entry, named npm (ensureNpmShim).
+	assert.match(readFileSync(layout.npmShim, "utf8"), /npm-cli\.js/);
 	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`, "bin")).sort(), ["node", "npm", "npx"]);
 	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`, "lib", "node_modules")), ["npm"]);
 	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`, "lib", "node_modules", "npm", "bin")).sort(), ["npm-cli.js", "npx-cli.js"]);
@@ -310,6 +335,52 @@ posixTest("ensureRuntime acquires the pinned Go only when asked", async () => {
 	const result = await ensureRuntime({ layout, platform: "darwin", arch: "arm64", go: true, adapters: fixture });
 	assert.equal(result.go, "/go/bin/go");
 	assert.equal((asked[0] as { root: string }).root, layout.goRoot);
+});
+
+// S9: the pinned Engram, verified, published once and reused; only when asked.
+posixTest("ensureEngram publishes only the verified engram executable after running it, and ensureRuntime asks for it only when told", async () => {
+	const { layout } = claimed();
+	const { calls, adapters: fixture } = adapters();
+	assert.deepEqual((await ensureRuntime({ layout, platform: "darwin", arch: "arm64", adapters: fixture })).acquired, ["node", "pnpm"]);
+	assert.equal(existsSync(layout.engramDir), false);
+	assert.deepEqual((await ensureRuntime({ layout, platform: "darwin", arch: "arm64", engram: true, adapters: fixture })).acquired, ["engram"]);
+	assert.deepEqual(readdirSync(layout.engramDir).sort(), [".gentle-shell-runtime", "engram"]);
+	assert.deepEqual(readFileSync(layout.engram), engramBytes);
+	assert.equal(lstatSync(layout.engram).mode & 0o777, 0o700);
+	assert.equal(readFileSync(join(layout.engramDir, ".gentle-shell-runtime"), "utf8"), `${engramUrl}\n`);
+	// `engram version` ran from the staging folder, before publication.
+	const check = calls.runs.at(-1)!;
+	assert.deepEqual(check.args, ["version"]);
+	assert.match(check.command, /\/runtime\/\.stage-[^/]+\/engram$/);
+	assert.equal(await ensureEngram({ layout, platform: "darwin", arch: "arm64", adapters: fixture }), false, "reused");
+	assert.deepEqual(calls.downloads, ["node", "pnpm", "engram"]);
+	// Another version's answer, or a tampered archive, publishes nothing.
+	for (const broken of [adapters({ run: () => ({ status: 0, stdout: "engram 3.0.0\n", stderr: "" }) }).adapters, adapters({ download: async () => Buffer.from("x") }).adapters]) {
+		const other = claimed().layout;
+		await assert.rejects(ensureEngram({ layout: other, platform: "darwin", arch: "arm64", adapters: broken }), /Engram|integrity|size/);
+		assert.deepEqual(readdirSync(other.runtime), []);
+	}
+});
+
+// A4: a prefix that is not there fails before anything is downloaded.
+posixTest("ensureEngram downloads nothing when the prefix is missing", async () => {
+	const user = home();
+	const layout = prefixLayout({ platform: "darwin", env: { HOME: user }, home: user });
+	const { calls, adapters: fixture } = adapters();
+	await assert.rejects(ensureEngram({ layout, platform: "darwin", arch: "arm64", adapters: fixture }), /ENOENT/);
+	assert.deepEqual(calls.downloads, []);
+	assert.equal(existsSync(layout.root), false);
+});
+
+test("engramExecutable takes only the top-level engram from the tarball and engram.exe from the zip, regular files only", () => {
+	const tarball = { url: "https://github.com/Gentleman-Programming/engram/releases/download/v3.4.0/engram_3.4.0_linux_amd64.tar.gz" };
+	const zipped = { url: "https://github.com/Gentleman-Programming/engram/releases/download/v3.4.0/engram_3.4.0_windows_amd64.zip" };
+	assert.deepEqual(engramExecutable(engramArchive, tarball), engramBytes);
+	const exe = Buffer.from("MZ engram");
+	assert.deepEqual(engramExecutable(zip([["tools/cloud-sync-projects.ps1", Buffer.from("x")], ["engram.exe", exe]]), zipped), exe);
+	assert.throws(() => engramExecutable(tarGz([tarEntry("engram", { type: "2", link: "/bin/sh" })]), tarball), /Engram archive rejected/);
+	assert.throws(() => engramExecutable(tarGz([tarEntry("bin/engram", { data: engramBytes })]), tarball), /Engram archive rejected/);
+	assert.throws(() => engramExecutable(zip([["engram", exe]]), zipped), /Engram archive rejected/);
 });
 
 test("nodeExecutable takes only node.exe from the Windows zip and only bin/node from the tarball", () => {
@@ -699,6 +770,192 @@ test("pathEntryPlan on Windows plans one HKCU Path entry applied through an inje
 	assert.throws(() => applyPathEntry(plan), /registry adapter/);
 });
 
+// T6 (S7): uninstall reverts exactly what was applied, and nothing when nothing was.
+test("removePathEntry leaves the PATH alone for a receipt that applied nothing, and applyPathEntry applies nothing when the user Path already held the entry", () => {
+	const layout = prefixLayout({ platform: "win32", env: { LOCALAPPDATA: "C:\\L", USERPROFILE: "C:\\U" }, home: "C:\\U" });
+	const plan = pathEntryPlan(layout, { platform: "win32", env: { Path: "C:\\Windows" }, home: "C:\\U" });
+	const calls: string[] = [];
+	const registry = (added: string | undefined) => ({ add: (entry: string) => { calls.push(`+${entry}`); return added; }, remove: (entry: string) => { calls.push(`-${entry}`); } });
+	assert.deepEqual(applyPathEntry(plan, { registry: registry("present") }), { ...plan, applied: false });
+	assert.deepEqual(applyPathEntry(plan, { registry: registry("added") }), { ...plan, applied: true });
+	removePathEntry({ ...plan, applied: false }, { registry: registry(undefined) });
+	assert.deepEqual(calls, ["+C:\\L\\gentle-shell\\bin", "+C:\\L\\gentle-shell\\bin"]);
+});
+
+posixTest("removePathEntry keeps a profile line and a link that a receipt says were already there", () => {
+	const { home: user, layout } = claimed();
+	ensureLauncher(layout);
+	const zshrc = join(user, ".zshrc");
+	const plan = pathEntryPlan(layout, { platform: "darwin", env: { PATH: "/usr/bin", SHELL: "/bin/zsh" }, home: user });
+	writeFileSync(zshrc, `${plan.line}\n`);
+	const receipt = applyPathEntry({ ...plan, create: false });
+	assert.equal(receipt.applied, false);
+	removePathEntry(receipt);
+	assert.equal(readFileSync(zshrc, "utf8"), `${plan.line}\n`);
+	const link = join(user, ".local", "bin", "gentle-shell");
+	mkdirSync(dirname(link), { recursive: true });
+	symlinkSync(layout.launcher, link);
+	removePathEntry({ kind: "symlink", path: link, target: layout.launcher, applied: false });
+	assert.equal(readlinkSync(link), layout.launcher);
+});
+
+posixTest("writePathReceipt keeps only an applied receipt in the prefix, private and replaced whole, and readPathReceipt accepts only this install's entry", () => {
+	const { home: user, layout } = claimed();
+	const env = { SHELL: "/bin/zsh" };
+	const line = `export PATH="${layout.bin}:$PATH" # gentle-shell bundled install`;
+	const profile = { kind: "profile", path: join(user, ".zshrc"), line, create: true };
+	assert.equal(layout.pathReceipt, join(layout.root, "path-entry.json"));
+	assert.deepEqual(readPathReceipt(layout, { env, home: user }), { status: "none" });
+	assert.equal(writePathReceipt(layout, { ...profile, applied: false }), false);
+	assert.equal(existsSync(layout.pathReceipt), false);
+	assert.equal(writePathReceipt(layout, { ...profile, applied: true, separator: false }), true);
+	assert.equal(lstatSync(layout.pathReceipt).mode & 0o777, 0o600);
+	assert.deepEqual(JSON.parse(readFileSync(layout.pathReceipt, "utf8")), { schema: 1, ...profile, separator: false });
+	assert.deepEqual(readPathReceipt(layout, { env, home: user }), { status: "recorded", receipt: { ...profile, separator: false, applied: true } });
+	assert.match(describePathReceipt({ ...profile, separator: false, applied: true }), new RegExp(`${line.replace(/[$"]/g, "\\$&")}.*\\.zshrc`));
+	const link = { kind: "symlink", path: join(user, ".local", "bin", "gentle-shell"), target: layout.launcher };
+	writePathReceipt(layout, { ...link, applied: true });
+	assert.deepEqual(readPathReceipt(layout, { env, home: user }), { status: "recorded", receipt: { ...link, applied: true } });
+	assert.deepEqual(readdirSync(layout.root).filter((name) => name.includes("path-entry")), ["path-entry.json"]);
+	// Anything this prefix did not write is never acted on.
+	const foreign = [
+		{ ...link, target: "/usr/local/bin/gentle-shell" },
+		{ ...profile, line: "export PATH=\"/opt/x:$PATH\" # gentle-shell bundled install", separator: false },
+		{ ...profile, path: "relative/.zshrc", separator: false },
+		{ kind: "registry", key: "HKCU\\Environment", name: "Path", entry: "C:\\Windows" },
+		{ kind: "none" },
+	];
+	for (const receipt of foreign) {
+		writeFileSync(layout.pathReceipt, JSON.stringify({ schema: 1, ...receipt }));
+		assert.equal(readPathReceipt(layout, { env, home: user }).status, "invalid", JSON.stringify(receipt));
+	}
+	for (const text of ["{", JSON.stringify({ schema: 2, ...link }), "[]"]) {
+		writeFileSync(layout.pathReceipt, text);
+		assert.equal(readPathReceipt(layout, { env, home: user }).status, "invalid", text);
+	}
+	rmSync(layout.pathReceipt);
+	symlinkSync(join(user, ".zshrc"), layout.pathReceipt);
+	assert.equal(readPathReceipt(layout, { env, home: user }).status, "invalid");
+});
+
+// A1 (T6 verifier): a receipt is trusted only for a file or link the PATH plan
+// itself can choose for this user; a forged one is named, never acted on.
+posixTest("readPathReceipt accepts a profile line only in a startup file the PATH plan can choose, and a link only at ~/.local/bin/gentle-shell", () => {
+	const { home: user, layout } = claimed();
+	const { sh, fish } = { sh: `export PATH="${layout.bin}:$PATH" # gentle-shell bundled install`, fish: `set -gx PATH '${layout.bin}' $PATH # gentle-shell bundled install` };
+	const read = (receipt: Record<string, unknown>, env: Record<string, string> = {}, platform = "darwin") => {
+		writeFileSync(layout.pathReceipt, JSON.stringify({ schema: 1, create: false, separator: false, ...receipt }));
+		return readPathReceipt({ ...layout, platform }, { env, home: user }).status;
+	};
+	// Every file pathEntryPlan picks, per shell, on macOS and Linux.
+	for (const name of [".zshrc", ".bash_profile", ".bash_login", ".profile"]) assert.equal(read({ kind: "profile", path: join(user, name), line: sh }), "recorded", name);
+	assert.equal(read({ kind: "profile", path: join(user, ".bashrc"), line: sh }, {}, "linux"), "recorded");
+	assert.equal(read({ kind: "profile", path: join(user, ".config", "fish", "conf.d", "gentle-shell.fish"), line: fish }), "recorded");
+	// ZDOTDIR and XDG_CONFIG_HOME move the zsh and fish files exactly as the plan moves them.
+	const zdot = join(user, "zdot");
+	const xdg = join(user, "xdg");
+	assert.equal(read({ kind: "profile", path: join(zdot, ".zshrc"), line: sh }, { ZDOTDIR: zdot }), "recorded");
+	assert.equal(read({ kind: "profile", path: join(user, ".zshrc"), line: sh }, { ZDOTDIR: zdot }), "invalid");
+	assert.equal(read({ kind: "profile", path: join(xdg, "fish", "conf.d", "gentle-shell.fish"), line: fish }, { XDG_CONFIG_HOME: xdg }), "recorded");
+	// E1: our exact line, but in a file the plan never edits on this system; E2: a created file elsewhere.
+	assert.equal(read({ kind: "profile", path: join(user, ".bashrc"), line: sh }), "invalid");
+	assert.equal(read({ kind: "profile", path: join(user, "dotfiles", "path.sh"), line: sh, create: true }), "invalid");
+	assert.equal(read({ kind: "profile", path: join(user, ".zshenv"), line: sh }), "invalid");
+	// The fish line belongs only in the fish file, the sh line only in sh files.
+	assert.equal(read({ kind: "profile", path: join(user, ".zshrc"), line: fish }), "invalid");
+	assert.equal(read({ kind: "profile", path: join(user, ".config", "fish", "conf.d", "gentle-shell.fish"), line: sh }), "invalid");
+	// The link: only ~/.local/bin/gentle-shell to our launcher.
+	assert.equal(read({ kind: "symlink", path: join(user, ".local", "bin", "gentle-shell"), target: layout.launcher }), "recorded");
+	assert.equal(read({ kind: "symlink", path: join(user, "bin", "gentle-shell"), target: layout.launcher }), "invalid");
+	// The bundled self-uninstall, given the forged receipts, leaves both files as they are.
+	const bashrc = join(user, ".bashrc");
+	const dotfile = join(user, "dotfiles", "path.sh");
+	mkdirSync(dirname(dotfile), { recursive: true });
+	writeFileSync(bashrc, `alias l=ls\n${sh}\n`);
+	writeFileSync(dotfile, `${sh}\n`);
+	const forged = readPathReceipt(layout, { env: { SHELL: "/bin/zsh" }, home: user });
+	assert.equal(forged.status, "invalid");
+	assert.match(forged.status === "invalid" ? forged.reason : "", /does not describe this install's PATH entry/);
+	assert.deepEqual([readFileSync(bashrc, "utf8"), readFileSync(dotfile, "utf8")], [`alias l=ls\n${sh}\n`, `${sh}\n`]);
+});
+
+// A2: a line the user edited is kept, and the caller learns which file still holds what.
+posixTest("removePathEntry reports a profile line it could not find and a link that no longer points at our launcher", () => {
+	const { home: user, layout } = claimed();
+	const zshrc = join(user, ".zshrc");
+	writeFileSync(zshrc, "alias x=y\n");
+	const receipt = applyPathEntry(pathEntryPlan(layout, { platform: "darwin", env: { PATH: "/usr/bin", SHELL: "/bin/zsh" }, home: user }));
+	const edited = `export PATH="$PATH:${layout.bin}" # gentle-shell bundled install`;
+	writeFileSync(zshrc, `alias x=y\n${edited}\n`);
+	const kept = removePathEntry(receipt);
+	assert.equal(readFileSync(zshrc, "utf8"), `alias x=y\n${edited}\n`);
+	assert.equal(kept.removed, false);
+	assert.ok(kept.note.includes(zshrc) && kept.note.includes(edited), kept.note);
+	writeFileSync(zshrc, `alias x=y\n${receipt.line}\n`);
+	assert.deepEqual(removePathEntry(receipt), { removed: true });
+	const link = join(user, ".local", "bin", "gentle-shell");
+	mkdirSync(dirname(link), { recursive: true });
+	symlinkSync("/usr/local/bin/other", link);
+	const other = removePathEntry({ kind: "symlink", path: link, target: layout.launcher, applied: true });
+	assert.equal(other.removed, false);
+	assert.ok(other.note.includes(link), other.note);
+	assert.equal(readlinkSync(link), "/usr/local/bin/other");
+});
+
+test("readPathReceipt accepts the Windows user Path entry of this prefix only", (t) => {
+	// Path arithmetic only: the receipt file itself lives in a real temporary folder.
+	const folder = home();
+	const layout = { ...prefixLayout({ platform: "win32", env: { LOCALAPPDATA: "C:\\L", USERPROFILE: "C:\\U" }, home: "C:\\U" }), pathReceipt: join(folder, "path-entry.json") };
+	const entry = { kind: "registry", key: "HKCU\\Environment", name: "Path", entry: layout.bin };
+	writeFileSync(layout.pathReceipt, JSON.stringify({ schema: 1, ...entry }));
+	assert.deepEqual(readPathReceipt(layout, { env: {}, home: "C:\\U" }), { status: "recorded", receipt: { ...entry, applied: true } });
+	assert.match(describePathReceipt({ ...entry, applied: true }), /C:\\L\\gentle-shell\\bin in your user Path/);
+	writeFileSync(layout.pathReceipt, JSON.stringify({ schema: 1, ...entry, key: "HKLM\\Environment" }));
+	assert.equal(readPathReceipt(layout, { env: {}, home: "C:\\U" }).status, "invalid");
+	t.diagnostic("simulated Windows layout, real receipt file");
+});
+
+// T6: the running node.exe and .cmd launcher cannot delete themselves; a detached
+// Windows PowerShell removes them once this process exits, with every path as data.
+test("scheduleWindowsRemoval starts one detached Windows PowerShell that waits for the process, with the paths only in its environment", () => {
+	const calls: { command: string; args: string[]; options: Record<string, any> }[] = [];
+	let unref = false;
+	const spawn = (command: string, args: string[], options: Record<string, any>) => { calls.push({ command, args, options }); return { unref: () => { unref = true; } }; };
+	const files = ["C:\\L\\gentle shell's $x;\\runtime\\node-24.21.0\\node.exe", "C:\\L\\gentle shell's $x;\\bin\\gentle-shell.cmd"];
+	const directories = ["C:\\L\\gentle shell's $x;\\runtime\\node-24.21.0", "C:\\L\\gentle shell's $x;"];
+	const last = "C:\\L\\gentle shell's $x;\\.gentle-shell-bundle";
+	scheduleWindowsRemoval({ pid: 4242, files, last, directories, env: { SystemRoot: "C:\\Windows", Path: "C:\\Windows" }, spawn });
+	assert.equal(calls.length, 1);
+	const [{ command, args, options }] = calls;
+	// cmd.exe, detached, starts PowerShell with `start`: a detached PowerShell never ran on
+	// the Windows runner, and one in Node's job object died with the exiting launcher.
+	assert.equal(command, "C:\\Windows\\System32\\cmd.exe");
+	assert.deepEqual(args.slice(0, 6), ["/d", "/c", "start", "\"\"", "/min", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"]);
+	const shellArgs = args.slice(6);
+	// Only fixed tokens and base64 reach cmd's command line: no cmd metacharacter.
+	assert.equal(shellArgs.every((arg) => /^[-A-Za-z0-9+/=]+$/.test(arg)), true);
+	// The script travels base64-encoded (UTF-16LE): Windows PowerShell 5.1 does not
+	// read Node's escaped quotes in a -Command argument, so a plain script arrives broken.
+	assert.deepEqual(shellArgs.slice(0, 6), ["-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand"]);
+	assert.equal(shellArgs.length, 7);
+	const script = Buffer.from(shellArgs[6], "base64").toString("utf16le");
+	assert.match(script, /Wait-Process -Id \$waitFor/);
+	assert.match(script, /GENTLE_SHELL_REMOVE_FILES/);
+	// A4: the marker goes only once every listed file is gone, so a retry still finds the install.
+	assert.match(script, /GENTLE_SHELL_REMOVE_LAST/);
+	assert.equal(options.env.GENTLE_SHELL_REMOVE_LAST, last);
+	for (const path of [...files, ...directories]) assert.equal(args.join(" ").includes(path), false, path);
+	assert.deepEqual([options.detached, options.stdio, options.windowsHide, options.cwd, unref], [true, "ignore", true, "C:\\Windows", true]);
+	assert.deepEqual([options.env.GENTLE_SHELL_REMOVE_AFTER_PID, options.env.GENTLE_SHELL_REMOVE_FILES, options.env.GENTLE_SHELL_REMOVE_DIRECTORIES, options.env.Path],
+		["4242", files.join("\n"), directories.join("\n"), "C:\\Windows"]);
+	for (const bad of [{ pid: 0 }, { files: ["relative\\node.exe"] }, { directories: ["\\\\server\\share"] }, { env: {} }, { last: "relative\\marker" },
+		// SystemRoot reaches cmd's command line (the PowerShell path): a cmd metacharacter refuses.
+		{ env: { SystemRoot: "C:\\Win&calc" } }, { env: { SystemRoot: "C:\\Win%PATH%" } }, { env: { SystemRoot: "C:\\Win^x" } }, { env: { SystemRoot: "C:\\Win\"x" } }]) {
+		assert.throws(() => scheduleWindowsRemoval({ pid: 4242, files, directories, env: { SystemRoot: "C:\\Windows" }, spawn, ...bad }), /deferred removal/, JSON.stringify(bad));
+	}
+	assert.equal(calls.length, 1);
+});
+
 // Rule 6 (T1c): Pi installs its packages with npm, so our npm comes from the same verified Node archive.
 test("nodeRuntimeFiles takes node.exe, npm and its .cmd shims from the Windows zip, and node plus npm with our wrappers from the tarball", () => {
 	const stem = `node-v${NODE}-win-x64`;
@@ -794,4 +1051,269 @@ test("setupEnvironment runs setup with our Node and npm, then the version's Pi, 
 		{ platform: "win32", id: "4.1.0-1.0.2", env: { Path: "C:\\Windows" } });
 	assert.equal(windows.Path, `C:\\L\\gentle-shell\\runtime\\node-${NODE};C:\\L\\gentle-shell\\versions\\4.1.0-1.0.2\\node_modules\\.bin;C:\\Windows`);
 	assert.throws(() => setupEnvironment(layout, { platform: "linux", id: "../x", env: {} }), /Unsafe version id/);
+});
+
+// T2 (S5, S6, S8): `gentle-shell upgrade` in a bundled install.
+const LATEST = { shell: "4.2.0", pi: "1.0.2" };
+const releaseModuleFile = (layout: ReturnType<typeof prefixLayout>, id: string) => join(layout.versions, id, "node_modules", "gentle-pi", "scripts", "bundled-install.mjs");
+function upgradeAdapters(layout: ReturnType<typeof prefixLayout>, { release = LATEST, status = "published", reported = release, module = {} as Record<string, unknown> } = {}) {
+	const calls: { ensureRuntime: unknown[]; verify: { command: string; args: string[]; env: Record<string, string> }[]; loaded: string[]; launchers: unknown[] } =
+		{ ensureRuntime: [], verify: [], loaded: [], launchers: [] };
+	const releaseModule = { prefixLayout, ensureRuntime: async (options: unknown) => { calls.ensureRuntime.push(options); return { go: null }; },
+		ensureLauncher: (next: unknown) => { calls.launchers.push(next); return { written: false }; }, ...module };
+	const adapters = {
+		latest: async () => release.shell,
+		distribution: async (version: string) => (status === "published" ? { status, manifest: { ...release, shell: version }, lockfile: "lockfileVersion: '9.0'\n" } : { status }),
+		ensureRuntime: async (options: unknown) => { calls.ensureRuntime.push(options); return { go: null }; },
+		install: { run: fakePnpm(release).run },
+		load: async (file: string) => { calls.loaded.push(file); return releaseModule; },
+		run: async (command: string, args: string[], options: { env: Record<string, string> }) => {
+			calls.verify.push({ command, args, env: options.env });
+			return { status: 0, stdout: `gentle-shell ${reported.shell}\npi ${reported.pi}\nhome isolated /x\n`, stderr: "" };
+		},
+	};
+	return { adapters, calls };
+}
+async function activeInstall() {
+	const { home: user, layout } = claimed();
+	await installed(layout, [["4.0.0", "1.0.0"], ["4.1.0", "1.0.1"]]);
+	for (const id of ["4.0.0-1.0.0", "4.1.0-1.0.1"]) activateVersion(layout, id);
+	return { user, layout };
+}
+
+posixTest("upgradeBundled installs the latest release beside the active one, verifies it, switches current and keeps two", async () => {
+	const { user, layout } = await activeInstall();
+	const { adapters, calls } = upgradeAdapters(layout);
+	const lines: string[] = [];
+	const result = await upgradeBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: { PATH: "/usr/bin", GENTLE_SHELL_PI: "/x/pi", PI_CODING_AGENT_DIR: "/x" },
+		adapters, out: (line: string) => lines.push(line) });
+	assert.deepEqual(result, { id: "4.2.0-1.0.2", changed: true, previous: "4.1.0-1.0.1", removed: ["4.0.0-1.0.0"] });
+	assert.equal(activeVersion(layout), "4.2.0-1.0.2");
+	assert.deepEqual(readdirSync(layout.versions).sort(), ["4.1.0-1.0.1", "4.2.0-1.0.2"]);
+	// Only the freshly installed version's own module is loaded.
+	assert.deepEqual(calls.loaded, [releaseModuleFile(layout, "4.2.0-1.0.2")]);
+	const [verify] = calls.verify;
+	assert.equal(verify.command, layout.node);
+	assert.deepEqual(verify.args, [join(layout.versions, "4.2.0-1.0.2", "node_modules", "gentle-pi", "bin", "gentle-shell.mjs"), "--version"]);
+	assert.equal(verify.env.GENTLE_SHELL_PI, undefined);
+	assert.equal(verify.env.PI_CODING_AGENT_DIR, undefined);
+	// The check runs that version in bundled mode, as if current named it (only for --version).
+	assert.equal(verify.env.GENTLE_SHELL_VERIFY_VERSION, "4.2.0-1.0.2");
+	assert.match(lines.join("\n"), /Gentle Shell 4\.2\.0 with Pi 1\.0\.2.*4\.1\.0-1\.0\.1.*--rollback/s);
+});
+
+posixTest("upgradeBundled changes nothing when the latest release is already current", async () => {
+	const { user, layout } = await activeInstall();
+	const { adapters, calls } = upgradeAdapters(layout, { release: { shell: "4.1.0", pi: "1.0.1" } });
+	const lines: string[] = [];
+	const result = await upgradeBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters, out: (line: string) => lines.push(line) });
+	assert.deepEqual(result, { id: "4.1.0-1.0.1", changed: false });
+	assert.deepEqual([calls.ensureRuntime.length, calls.verify.length, calls.loaded.length], [0, 0, 0]);
+	assert.match(lines.join("\n"), /Gentle Shell 4\.1\.0 with Pi 1\.0\.1 is already current/);
+	assert.deepEqual(readdirSync(layout.versions).sort(), ["4.0.0-1.0.0", "4.1.0-1.0.1"]);
+});
+
+posixTest("upgradeBundled leaves current untouched when the release is unpublished or its verification fails", async () => {
+	const { user, layout } = await activeInstall();
+	for (const status of ["missing", "unavailable", "rejected"]) {
+		await assert.rejects(upgradeBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters: upgradeAdapters(layout, { status }).adapters }), /v4\.2\.0/);
+	}
+	const wrong = upgradeAdapters(layout, { reported: { shell: "4.2.0", pi: "1.0.0" } });
+	await assert.rejects(upgradeBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters: wrong.adapters }), /reported/);
+	assert.equal(activeVersion(layout), "4.1.0-1.0.1");
+	// The version this upgrade installed and could not verify is removed again.
+	assert.deepEqual(readdirSync(layout.versions).sort(), ["4.0.0-1.0.0", "4.1.0-1.0.1"]);
+});
+
+posixTest("upgradeBundled fails closed when the new version's own module is missing or lacks an export it needs", async () => {
+	const { user, layout } = await activeInstall();
+	for (const module of [{ ensureLauncher: undefined }, { prefixLayout: "not a function" }]) {
+		const { adapters, calls } = upgradeAdapters(layout, { module });
+		await assert.rejects(upgradeBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters }), /4\.2\.0-1\.0\.2.*bundled-install\.mjs/s);
+		assert.equal(calls.verify.length, 0);
+	}
+	const absent = upgradeAdapters(layout);
+	await assert.rejects(upgradeBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters: { ...absent.adapters, load: undefined } }), /bundled-install\.mjs/);
+	assert.equal(activeVersion(layout), "4.1.0-1.0.1");
+	assert.deepEqual(readdirSync(layout.versions).sort(), ["4.0.0-1.0.0", "4.1.0-1.0.1"]);
+});
+
+posixTest("upgradeBundled installs a new release's own pinned runtime and launcher when its pins moved", async () => {
+	const { user, layout } = await activeInstall();
+	const next = { ...layout, node: join(layout.runtime, "node-26.0.0", "bin", "node") };
+	const { adapters, calls } = upgradeAdapters(layout, { module: { prefixLayout: (options: { root: string; home: string }) => {
+		assert.deepEqual([options.root, options.home], [layout.root, user]);
+		return next;
+	} } });
+	await upgradeBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters });
+	// Ours first (the install runs on it), then the release's own, before verification runs on its Node.
+	assert.equal(calls.ensureRuntime.length, 2);
+	assert.equal((calls.ensureRuntime[1] as { layout: unknown }).layout, next);
+	// The release's own runtime includes its pinned Engram (S9); an older release module ignores the flag.
+	assert.deepEqual(calls.ensureRuntime.map((options) => (options as { engram?: boolean }).engram), [undefined, true]);
+	assert.equal(calls.verify[0].command, next.node);
+	assert.deepEqual(calls.launchers, [next]);
+	assert.equal(activeVersion(layout), "4.2.0-1.0.2");
+});
+
+posixTest("upgradeBundled puts current back when the new launcher cannot be written", async () => {
+	const { user, layout } = await activeInstall();
+	const { adapters } = upgradeAdapters(layout, { module: { ensureLauncher: () => { throw new Error("Conflicting launcher: /x"); } } });
+	await assert.rejects(upgradeBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters }), /launcher.*current stays at 4\.1\.0-1\.0\.1/s);
+	assert.equal(activeVersion(layout), "4.1.0-1.0.1");
+	assert.deepEqual(readdirSync(layout.versions).sort(), ["4.0.0-1.0.0", "4.1.0-1.0.1"]);
+});
+
+posixTest("upgradeBundled reports success with a warning when only pruning fails", async () => {
+	const { user, layout } = await activeInstall();
+	const { adapters } = upgradeAdapters(layout);
+	const lines: string[] = [];
+	const result = await upgradeBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters: { ...adapters, prune: () => { throw new Error("EBUSY"); } },
+		out: (line: string) => lines.push(line) });
+	assert.deepEqual(result, { id: "4.2.0-1.0.2", changed: true, previous: "4.1.0-1.0.1", removed: [], warning: "older versions were not removed (EBUSY)" });
+	assert.equal(activeVersion(layout), "4.2.0-1.0.2");
+	assert.match(lines.join("\n"), /Upgraded to Gentle Shell 4\.2\.0.*warning: older versions were not removed \(EBUSY\)/s);
+});
+
+function rollbackAdapters(module: Record<string, unknown> = {}) {
+	const calls: { loaded: string[]; runtimes: unknown[]; engram: unknown[]; launchers: unknown[] } = { loaded: [], runtimes: [], engram: [], launchers: [] };
+	const releaseModule = { prefixLayout, ensureRuntime: async (options: { layout: unknown; engram?: boolean }) => {
+		calls.runtimes.push(options.layout); calls.engram.push(options.engram); return { go: null }; },
+		ensureLauncher: (next: unknown) => { calls.launchers.push(next); return { written: true }; }, ...module };
+	return { calls, adapters: { load: async (file: string) => { calls.loaded.push(file); return releaseModule; } } };
+}
+
+posixTest("rollbackBundled switches current to the kept previous version with its own launcher, and back", async () => {
+	const { user, layout } = await activeInstall();
+	const { calls, adapters } = rollbackAdapters();
+	const options = { layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters };
+	assert.deepEqual(await rollbackBundled(options), { from: "4.1.0-1.0.1", to: "4.0.0-1.0.0" });
+	assert.equal(activeVersion(layout), "4.0.0-1.0.0");
+	assert.deepEqual(calls.loaded, [releaseModuleFile(layout, "4.0.0-1.0.0")]);
+	assert.equal(calls.runtimes.length, 1);
+	assert.equal(calls.engram[0], true, "the target's runtime includes its pinned Engram");
+	assert.equal(calls.launchers.length, 1);
+	assert.deepEqual(await rollbackBundled(options), { from: "4.0.0-1.0.0", to: "4.1.0-1.0.1" });
+	assert.equal(calls.loaded[1], releaseModuleFile(layout, "4.1.0-1.0.1"));
+	const single = claimed();
+	await installed(single.layout, [["4.0.0", "1.0.0"]]);
+	activateVersion(single.layout, "4.0.0-1.0.0");
+	await assert.rejects(rollbackBundled({ ...options, layout: single.layout, home: single.home }), /No previous Gentle Shell version/);
+	assert.equal(activeVersion(single.layout), "4.0.0-1.0.0");
+});
+
+posixTest("rollbackBundled fails closed without the target's own module and puts current back when its launcher fails", async () => {
+	const { user, layout } = await activeInstall();
+	for (const module of [{ ensureLauncher: undefined }, { ensureRuntime: 1 }]) {
+		const { calls, adapters } = rollbackAdapters(module);
+		await assert.rejects(rollbackBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters }), /4\.0\.0-1\.0\.0.*bundled-install\.mjs/s);
+		assert.equal(calls.launchers.length, 0);
+		assert.equal(activeVersion(layout), "4.1.0-1.0.1");
+	}
+	// The real loader: these fixture versions ship no module at all.
+	await assert.rejects(rollbackBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {} }), /bundled-install\.mjs/);
+	const failing = rollbackAdapters({ ensureLauncher: () => { throw new Error("Conflicting launcher: /x"); } });
+	await assert.rejects(rollbackBundled({ layout, home: user, platform: "darwin", arch: "arm64", env: {}, adapters: failing.adapters }), /launcher.*current stays at 4\.1\.0-1\.0\.1/s);
+	assert.equal(activeVersion(layout), "4.1.0-1.0.1");
+	assert.deepEqual(readdirSync(layout.versions).sort(), ["4.0.0-1.0.0", "4.1.0-1.0.1"]);
+});
+
+test("bundledNpmCommand runs our npm through an entry named npm, with only the prefix configuration", () => {
+	const layout = prefixLayout({ platform: "linux", env: {}, home: "/home/me" });
+	const root = "/home/me/.gentle-shell";
+	assert.deepEqual(bundledNpmCommand(layout), [`${root}/runtime/node-${NODE}/bin/node`, `${root}/runtime/node-${NODE}/gentle-shell/npm`,
+		`--userconfig=${root}/pnpm/config/npmrc`, `--globalconfig=${root}/npm/npmrc`, `--cache=${root}/npm/cache`, "--update-notifier=false"]);
+	// A --prefix flag would also set npm's local prefix: Pi's git-extension
+	// install (npm install in the clone, no --prefix of its own) would land there.
+	assert.equal(bundledNpmCommand(layout).some((part) => /^--prefix(?:=|$)/.test(part)), false);
+	const windows = bundledNpmCommand(prefixLayout({ platform: "win32", env: { LOCALAPPDATA: "C:\\L" }, home: "C:\\U" }));
+	assert.deepEqual(windows.slice(0, 2), [`C:\\L\\gentle-shell\\runtime\\node-${NODE}\\node.exe`, `C:\\L\\gentle-shell\\runtime\\node-${NODE}\\gentle-shell\\npm`]);
+});
+
+// N1: Pi 1.1.0 names the package manager from the basenames in npmCommand
+// (DefaultPackageManager.getPackageManagerName) and picks its install flags from
+// that name. Its own code, on this host's paths.
+const PI_PACKAGE_MANAGER = new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/package-manager.js", import.meta.url);
+async function piPackageManager(command: string[]) {
+	const { DefaultPackageManager } = await import(PI_PACKAGE_MANAGER.href);
+	return new DefaultPackageManager({ cwd: tmpdir(), agentDir: tmpdir(), settingsManager: { getNpmCommand: () => command } });
+}
+// The same rule with Windows paths, on any runner: Pi calls node:path's
+// basename, which is win32's on Windows, and strips only .cmd and .exe.
+function windowsPackageManagerName(command: string[]) {
+	const name = (part: string) => win32.basename(part).replace(/\.(cmd|exe)$/i, "");
+	const supported = new Set(["npm", "pnpm", "bun"]);
+	if (supported.has(name(command[0]))) return name(command[0]);
+	const wrapped = [...new Set(command.slice(1).map(name).filter((part) => supported.has(part)))];
+	if (wrapped.length > 1) throw new Error(`Ambiguous npmCommand package managers: ${wrapped.join(", ")}`);
+	return wrapped[0] ?? name(command[0]);
+}
+
+test("Pi reads the bundled npmCommand as npm and installs git extensions with npm's flags", async () => {
+	const host = process.platform === "win32"
+		? prefixLayout({ platform: "win32", env: { LOCALAPPDATA: "C:\\Users\\Ana Li\\AppData\\Local" }, home: "C:\\Users\\Ana Li" })
+		: prefixLayout({ platform: process.platform, env: {}, home: "/home/npm" });
+	const pi = await piPackageManager(bundledNpmCommand(host));
+	assert.equal(pi.getPackageManagerName(), "npm");
+	assert.deepEqual(pi.getGitDependencyInstallArgs(), ["install", "--omit=dev", "--legacy-peer-deps"]);
+	// The command before N1 read as `node`: plain `npm install` for git extensions.
+	const before = await piPackageManager([host.node, host.npmCli, ...bundledNpmCommand(host).slice(2)]);
+	assert.equal(before.getPackageManagerName(), "node");
+	assert.deepEqual(before.getGitDependencyInstallArgs(), ["install"]);
+	// Windows-shaped paths, whatever the folder names (here "npm" and "pnpm" ones).
+	const windows = prefixLayout({ platform: "win32", env: { LOCALAPPDATA: "C:\\pnpm\\npm" }, home: "C:\\Users\\bun" });
+	assert.equal(windowsPackageManagerName(bundledNpmCommand(windows)), "npm");
+	assert.equal(windowsPackageManagerName([windows.node, windows.npmCli]), "node");
+});
+
+posixTest("ensureNpmShim writes one regular npm entry that runs our npm-cli.js, rewritten only when it differs", () => {
+	const { layout } = claimed();
+	assert.throws(() => ensureNpmShim(layout), /npm/);
+	mkdirSync(posix.dirname(layout.npmCli), { recursive: true });
+	// Prints its version and the arguments it got, like npm --version.
+	writeFileSync(layout.npmCli, "console.log(process.argv.slice(2).includes('--version') ? '11.19.0' : JSON.stringify(process.argv.slice(2)));\n");
+	// A user's package.json with type module above the prefix must not make the entry an ES module.
+	writeFileSync(join(layout.root, "..", "package.json"), JSON.stringify({ type: "module" }));
+	assert.deepEqual(ensureNpmShim(layout), { written: true });
+	assert.equal(posix.basename(layout.npmShim), "npm");
+	assert.equal(lstatSync(layout.npmShim).isFile(), true);
+	const version = spawnSync(process.execPath, [layout.npmShim, "--version"], { encoding: "utf8" });
+	assert.equal(version.status, 0, version.stderr);
+	assert.equal(version.stdout, "11.19.0\n");
+	assert.equal(spawnSync(process.execPath, [layout.npmShim, "install", "--omit=dev"], { encoding: "utf8" }).stdout, '["install","--omit=dev"]\n');
+	const text = readFileSync(layout.npmShim, "utf8");
+	assert.deepEqual(ensureNpmShim(layout), { written: false });
+	writeFileSync(layout.npmShim, "// stale\n");
+	assert.deepEqual(ensureNpmShim(layout), { written: true });
+	assert.equal(readFileSync(layout.npmShim, "utf8"), text);
+	// A link or a folder in its place is never written through or replaced.
+	rmSync(layout.npmShim);
+	symlinkSync(layout.npmCli, layout.npmShim);
+	assert.throws(() => ensureNpmShim(layout), /Conflicting npm entry/);
+	assert.equal(readlinkSync(layout.npmShim), layout.npmCli);
+});
+
+test("publishing a runtime retries only Windows lock errors on rename, then gives up with the original error", async () => {
+	const { renameWithWindowsRetry } = await import("../scripts/bundled-install.mjs");
+	const lock = (code: string) => Object.assign(new Error(code), { code });
+	const flaky = (failures: string[]) => {
+		const calls: string[] = [];
+		return { calls, rename: (from: string, to: string) => { calls.push(`${from}>${to}`); const code = failures.shift(); if (code) throw lock(code); } };
+	};
+	const noWait = { delays: [0, 0, 0, 0] };
+	// A scanner or the just-run node.exe holding the staging folder clears after a moment.
+	const recovers = flaky(["EPERM", "EBUSY", "EACCES"]);
+	await renameWithWindowsRetry("s", "d", { platform: "win32", rename: recovers.rename, ...noWait });
+	assert.equal(recovers.calls.length, 4);
+	// A lock that never clears surfaces the original error after the last delay.
+	const stuck = flaky(["EPERM", "EPERM", "EPERM", "EPERM", "EPERM"]);
+	await assert.rejects(renameWithWindowsRetry("s", "d", { platform: "win32", rename: stuck.rename, ...noWait }), (error: { code?: string }) => error.code === "EPERM");
+	assert.equal(stuck.calls.length, 5);
+	// Any other error, or any other platform, fails at once.
+	const other = flaky(["EEXIST"]);
+	await assert.rejects(renameWithWindowsRetry("s", "d", { platform: "win32", rename: other.rename, ...noWait }), (error: { code?: string }) => error.code === "EEXIST");
+	assert.equal(other.calls.length, 1);
+	const posixLock = flaky(["EPERM"]);
+	await assert.rejects(renameWithWindowsRetry("s", "d", { platform: "linux", rename: posixLock.rename, ...noWait }), (error: { code?: string }) => error.code === "EPERM");
+	assert.equal(posixLock.calls.length, 1);
 });

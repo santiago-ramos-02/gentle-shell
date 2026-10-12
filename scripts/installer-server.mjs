@@ -90,6 +90,7 @@ export const actionDescriptions = Object.freeze({
 	"bundled-activate": "Make this version the active one and write the `gentle-shell` launcher.",
 	"bundled-path": "Make new terminals find `gentle-shell`.",
 	"bundled-setup": "Run `gentle-shell setup` with the bundled launcher.",
+	"remove-global-shell": "Remove the old global gentle-pi with the package manager that installed it.",
 });
 
 const tryAgain = "Fix the cause, then run the installer again.";
@@ -147,13 +148,12 @@ export const guidance = Object.freeze({
 		"activate-version": `The installed version could not be made the active one. ${tryAgain}`,
 		"write-launcher": `The \`gentle-shell\` launcher could not be written in Gentle Shell's private folder. ${tryAgain}`,
 		"bundled-path": "Gentle Shell is installed, but the PATH change could not be made, or it is no longer the one the plan showed, so nothing was changed. Run the installer again to see the current PATH plan.",
+		"verify-launcher": `The new \`gentle-shell\` launcher did not report the expected Gentle Shell and Pi versions, so your old global Gentle Shell was kept. ${tryAgain}`,
 	}),
 	blockers: Object.freeze({
 		"unsupported-target": "This operating system or CPU is not supported by the wizard. Follow the README for a manual installation.",
 		"unknown-tool": "A required tool could not be checked safely. Make sure it runs from a terminal, or remove the broken installation, then run the installer again.",
 		"incompatible-tool": "A required tool is installed at an incompatible version. Update it, then run the installer again.",
-		"main-requires-go": "The `main` channel builds Gentle AI with Go, but `go version` did not report a version this installer can check. " +
-			"Make sure `go version` works in a terminal, or choose the release channel, then select Check again.",
 		"untrusted-pnpm-home": "Another account can change the pnpm home folder (PNPM_HOME), where pnpm installs and runs programs, so nothing was installed. " +
 			"Remove that account's write access, or set PNPM_HOME to a private folder such as %USERPROFILE%\\.pnpm, then select Check again.",
 	}),
@@ -162,6 +162,8 @@ export const guidance = Object.freeze({
 		"terminal-action-required": "Gentle Shell is installed. Open a new terminal so it picks up the updated PATH, then run `gentle-shell`.",
 		"add-path-line": "Gentle Shell is installed. Add the line below to your shell profile, open a new terminal, then run `gentle-shell`.",
 	}),
+	// A migration whose old global gentle-pi could not be removed: the install stays.
+	removeGlobalFailed: "The old global gentle-pi could not be removed, so a terminal may still find it first. Remove it with the command below.",
 	// A failed install, main-channel or update step whose detail shows GitHub's anonymous API limit.
 	githubRateLimit: "GitHub's limit for anonymous API requests was reached on this network, so the installation could not finish. Wait up to an hour, then run the installer again.",
 	// A failed shell-setup whose detail shows GitHub's anonymous API limit.
@@ -187,7 +189,10 @@ const goConflict = (detail) => detail.startsWith("Conflicting Go destination: ")
 // The main channel's typed error when GitHub refused the latest main commit with HTTP 403.
 const githubLimited = (detail) => rateLimited(detail) || (/\bmain-commit-unavailable\b/.test(detail) && /\bHTTP 403\b/.test(detail));
 // Fixed steps whose sanitized last error line may reach the browser.
-const detailSteps = Object.freeze({ "shell-setup": rateLimited, "install-version": () => false, "persist-path": unknownShell, "acquire-go": goConflict,
+// The bundled steps send a detail only for a migration (its error message); a new install's send none.
+const bundledDetail = Object.fromEntries(["claim-prefix", "copy-npm-settings", "install-runtime", "activate-version", "write-launcher", "verify-launcher", "bundled-path"]
+	.map((step) => [step, () => false]));
+const detailSteps = Object.freeze({ ...bundledDetail, "shell-setup": rateLimited, "install-version": () => false, "persist-path": unknownShell, "acquire-go": goConflict,
 	"install-global": githubLimited, "install-shell-main": githubLimited, "build-gentle-ai-main": githubLimited, "update-shell": githubLimited });
 const detailGuidance = Object.freeze({ "shell-setup": "setupRateLimit", "persist-path": "persistPathShell", "acquire-go": "goDestinationConflict",
 	"install-global": "githubRateLimit", "install-shell-main": "githubRateLimit", "build-gentle-ai-main": "githubRateLimit", "update-shell": "githubRateLimit" });
@@ -253,13 +258,9 @@ function globalBinPnpm(blocker, found, required) {
 		return `A pnpm ${where} but its version could not be checked. Nothing was replaced. ` +
 			`If \`pnpm --version\` reports a version older than ${required}, update it with ${update}, then select Check again.`;
 	}
-	const major = required.split(".")[0];
-	if (older(found, required)) {
-		return `pnpm ${found} ${where} but this installer needs pnpm ${required} or a newer ${major}.x. Nothing was replaced. ` +
-			`Update it with ${update}, then select Check again.`;
-	}
-	return `pnpm ${found} ${where} but this installer only runs pnpm ${major} (${required} or a newer ${major}.x). ` +
-		`Nothing was replaced, and this installer never downgrades pnpm. To use it, make a pnpm ${major} release your global pnpm the way you prefer, then select Check again.`;
+	// Only an older pnpm is incompatible: the pin or newer, of any major, is used as it is.
+	return `pnpm ${found} ${where} but this installer needs pnpm ${required} or newer. Nothing was replaced. ` +
+		`Update it with ${update}, then select Check again.`;
 }
 
 // S6: what the storage walk found on a Windows PNPM_HOME candidate, from the
@@ -351,10 +352,11 @@ function actionDescription(action, plan) {
 		return `Install Pi ${PI_INSTALL_VERSION} globally with pnpm for Gentle Shell. The Pi ${bare(pi.version)} already on this computer ` +
 			"was not installed with pnpm or npm, so it is left unchanged. Gentle Shell uses the installer's Pi; the `pi` command in a terminal may still run the older one.";
 	}
-	// The pinned Go: its version, the Go found (or missing), and what stays unchanged.
+	// The pinned Go: its version, the Go found (older, unchecked or missing), and what stays unchanged.
 	const go = plan.tools?.go;
 	if (action.id === "acquire-go" && go?.status === "needs-acquire" && stable(action.version, go.required)) {
-		const found = stable(go.found) ? `Go ${bare(go.found)} on this computer is older than ${bare(go.required)}` : "Go is missing on this computer";
+		const found = stable(go.found) ? `Go ${bare(go.found)} on this computer is older than ${bare(go.required)}`
+			: go.unchecked === true ? "The Go on this computer did not report a version this installer can check" : "Go is missing on this computer";
 		return `${found}, so the installer downloads Go ${bare(action.version)} from go.dev, verifies its pinned SHA-256 checksum and uses it only to build Gentle AI. ` +
 			"It is kept in the installer's own folder (~/.pi/gentle-ai/tools/go); your Go, PATH and shell profile are not changed.";
 	}
@@ -393,6 +395,19 @@ function privateHomeDescription(home) {
 		"pnpm's default configuration, cache and state under %LOCALAPPDATA%, which pnpm offers no safe persistent setting to move. This is an accepted risk.";
 }
 
+// A missing Git (never a blocker): installing does not need it, repository features do.
+const gitInstall = Object.freeze({
+	darwin: "`xcode-select --install` (Apple's Command Line Tools)",
+	win32: "`winget install --id Git.Git -e`",
+	linux: "your package manager, for example `sudo apt-get install -y git` on Debian or Ubuntu",
+});
+function gitNoticeView(inventory) {
+	if (inventory?.git?.available !== false) return null;
+	const install = gitInstall[inventory.platform] ?? gitInstall.linux;
+	return { description: "Git was not found on this computer. Gentle Shell installs and starts without it, but code review, worktrees and other " +
+		`repository features need it. Install it with ${install}, then open a new terminal. This is not a blocker.` };
+}
+
 // S6 notice: reused tools whose folders another account can change (never a blocker).
 const folderTools = Object.freeze({ node: "Node.js", npm: "npm", go: "Go", pi: "Pi", shell: "Gentle Shell" });
 function sharedFoldersView(plan) {
@@ -426,11 +441,13 @@ function bundledDescription(action, bundled) {
 		: bundled.path?.kind === "symlink" ? `Link ${file} to the \`gentle-shell\` launcher; that folder is already on your PATH.`
 		: `Add one line to ${file} so new terminals find \`gentle-shell\`.`;
 	case "bundled-setup": return "Run `gentle-shell setup` with the bundled launcher to set up Gentle Shell's own Pi home (~/.gentle-shell/agent).";
+	case "remove-global-shell": return `Once the new launcher reports Gentle Shell ${plainText(bundled.shell)} with Pi ${plainText(bundled.pi)}, remove the old global gentle-pi with ` +
+		`\`${plainText(bundled.migrate?.command)}\`. Your Pi and ~/.gentle-shell/agent are not changed.`;
 	default: return actionDescriptions[action.id] ?? "Prepare the installation.";
 	}
 }
 /** The bundled plan's view: the same shape as planView's, with `bundled: true`. */
-function bundledView(planId, plan) {
+function bundledView(planId, plan, inventory) {
 	const bundled = plan.bundled;
 	const [root, bin, file, line] = [plainText(bundled.root), plainText(bundled.bin), plainText(bundled.path?.file), plainText(bundled.path?.line)];
 	const kind = bundled.path?.kind;
@@ -449,6 +466,7 @@ function bundledView(planId, plan) {
 		blockers: [],
 		profileChange: { changesProfile: ["symlink", "profile", "registry"].includes(kind), command: null, binDir: bin, description: profile },
 		sharedFolders: null,
+		gitNotice: gitNoticeView(inventory),
 		persistence: {
 			tools: ["node", "npm", "pnpm", ...(go ? ["go"] : [])],
 			pnpmHome: root,
@@ -459,7 +477,7 @@ function bundledView(planId, plan) {
 }
 
 function planView(planId, { inventory, plan }) {
-	if (plainObject(plan.bundled)) return bundledView(planId, plan);
+	if (plainObject(plan.bundled)) return bundledView(planId, plan, inventory);
 	const ids = plan.actions.map((action) => action.id);
 	const binDir = typeof inventory?.globalBin?.path === "string" ? inventory.globalBin.path : null;
 	// A private PNPM_HOME (S6) is always persisted by `pnpm setup` (the runner's persist-path).
@@ -498,6 +516,7 @@ function planView(planId, { inventory, plan }) {
 				: "Your PATH already contains the pnpm global bin directory; no shell profile or PATH change is planned.",
 		},
 		sharedFolders: sharedFoldersView(plan),
+		gitNotice: gitNoticeView(inventory),
 		persistence: {
 			tools,
 			pnpmHome,
@@ -542,6 +561,12 @@ function outcomeView(result) {
 			if (file === pathLine.file && line === pathLine.line && file && line) view.pathLine = { file, line };
 		}
 		if (["configured", "unchanged"].includes(result.npmPrefix)) view.npmPrefix = result.npmPrefix;
+		// Only the two fixed removal commands are ever shown.
+		const remove = plainObject(result.removeGlobal) && result.removeGlobal.status === "failed" ? result.removeGlobal.command : null;
+		if (["pnpm remove -g gentle-pi", "npm uninstall -g gentle-pi"].includes(remove)) {
+			view.removeCommand = remove;
+			view.guidance += ` ${guidance.removeGlobalFailed}`;
+		}
 	}
 	return view;
 }

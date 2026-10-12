@@ -306,8 +306,8 @@ test("/api/plan names the found and required version of an older Gentle Shell an
 		const view = await plan(port, await login());
 		assert.deepEqual(view.blockers.map((blocker: { code: string; tool: string }) => [blocker.code, blocker.tool]), [["incompatible-tool", "shell"]]);
 		assert.equal(view.blockers[0].guidance,
-			"Gentle Shell 3.4.0 is installed globally with pnpm, but this installer needs 4.0.0 or newer. Nothing was replaced. " +
-			"Update it with `pnpm add -g gentle-pi@4.0.0`, or remove it with `pnpm remove -g gentle-pi`, then select Check again.");
+			"Gentle Shell 3.4.0 is installed globally with pnpm, but this installer needs 4.1.0 or newer. Nothing was replaced. " +
+			"Update it with `pnpm add -g gentle-pi@4.1.0`, or remove it with `pnpm remove -g gentle-pi`, then select Check again.");
 		assert.deepEqual(view.actions, []);
 	} finally {
 		await host.close("test");
@@ -427,11 +427,8 @@ test("/api/plan explains a pnpm in $PNPM_HOME/bin that the installer will not re
 	const inGlobalBin = (pnpm: object) => ({ pnpm: { ...pnpm, inGlobalBin: true } });
 	const cases = [
 		[inGlobalBin({ available: true, version: "11.0.5", usable: true, compatible: false, persistent: true }), "incompatible-tool",
-			`pnpm 11.0.5 is installed in the pnpm global bin directory, where this installer would put its own pnpm, but this installer needs pnpm ${requirements.pnpm} or a newer 11.x. ` +
+			`pnpm 11.0.5 is installed in the pnpm global bin directory, where this installer would put its own pnpm, but this installer needs pnpm ${requirements.pnpm} or newer. ` +
 			`Nothing was replaced. Update it with \`pnpm self-update ${requirements.pnpm}\`, then select Check again.`],
-		[inGlobalBin({ available: true, version: "12.0.0", usable: true, compatible: false, persistent: true }), "incompatible-tool",
-			`pnpm 12.0.0 is installed in the pnpm global bin directory, where this installer would put its own pnpm, but this installer only runs pnpm 11 (${requirements.pnpm} or a newer 11.x). ` +
-			"Nothing was replaced, and this installer never downgrades pnpm. To use it, make a pnpm 11 release your global pnpm the way you prefer, then select Check again."],
 		[inGlobalBin({ available: null }), "unknown-tool",
 			"A pnpm is installed in the pnpm global bin directory, where this installer would put its own pnpm, but its version could not be checked. " +
 			`Nothing was replaced. If \`pnpm --version\` reports a version older than ${requirements.pnpm}, update it with \`pnpm self-update ${requirements.pnpm}\`, then select Check again.`],
@@ -610,15 +607,17 @@ test("installing a main plan re-checks the computer on the main channel", async 
 	}
 });
 
-test("/api/plan explains that the main channel cannot use a Go it cannot check", async () => {
+test("/api/plan offers the pinned Go on the main channel for a Go it cannot check", async () => {
 	const { host, port, login } = await start({ collect: async (channel) => collectedFor(channel, { pi: { available: false }, shell: { available: false }, go: { available: null } }) });
 	try {
 		const cookie = await login();
 		const view = JSON.parse((await send(port, { path: "/api/plan?channel=main", headers: { cookie, ...API } })).body);
-		const blocker = view.blockers.find((item: { code: string }) => item.code === "main-requires-go");
-		assert.equal(blocker.guidance, "The `main` channel builds Gentle AI with Go, but `go version` did not report a version this installer can check. " +
-			"Make sure `go version` works in a terminal, or choose the release channel, then select Check again.");
-		assert.deepEqual(view.actions, []);
+		assert.equal(view.blockers.some((item: { tool: string }) => item.tool === "go"), false);
+		const ids = view.actions.map((action: { id: string }) => action.id);
+		assert.equal(ids.indexOf("verify-go"), ids.indexOf("acquire-go") + 1);
+		assert.equal(view.actions.find((action: { id: string }) => action.id === "acquire-go").description, "The Go on this computer did not report a version this installer can check, so the installer downloads Go 1.25.14 " +
+			"from go.dev, verifies its pinned SHA-256 checksum and uses it only to build Gentle AI. It is kept in the installer's own folder " +
+			"(~/.pi/gentle-ai/tools/go); your Go, PATH and shell profile are not changed.");
 	} finally {
 		await host.close("test");
 	}
@@ -1419,6 +1418,20 @@ test("/api/plan describes the bundled install: its own pinned runtimes, the user
 	} finally {
 		await host.close("test");
 	}
+	// T3: a migration's plan names the old package's removal with its own manager, last.
+	const migrating = bundledCollected({ kind: "none" });
+	migrating.plan = bundledPlan({ platform: "linux", distribution: bundledDistribution, layout: prefixLayout({ platform: "linux", env: {}, home: "/home/u" }),
+		path: { kind: "none" }, migrate: { manager: "npm", removal: "plan" } }) as never;
+	const server = await start({ collect: async () => migrating });
+	try {
+		const view = await plan(server.port, await server.login());
+		assert.equal(view.actions.at(-1).id, "remove-global-shell");
+		assert.match(view.actions.at(-1).description, /`npm uninstall -g gentle-pi`/);
+		assert.match(view.actions.at(-1).description, /reports Gentle Shell 4\.1\.0 with Pi 1\.0\.2/);
+		assert.match(view.actions.at(-1).description, /Your Pi and ~\/\.gentle-shell\/agent are not changed/);
+	} finally {
+		await server.host.close("test");
+	}
 	const cases: [Record<string, unknown>, RegExp, boolean, string?][] = [
 		[{ kind: "none" }, /already finds/, false],
 		[{ kind: "symlink", path: "/home/u/.local/bin/gentle-shell", target: "/home/u/.gentle-shell/bin/gentle-shell" }, /\/home\/u\/\.local\/bin\/gentle-shell/, true],
@@ -1455,6 +1468,21 @@ test("bundled outcomes: every bundled step has guidance, pnpm's error line is sh
 			}],
 		[{ outcome: "terminal-action-required", action: "add-path-line", pathLine: { file: "/home/u/.zshrc\u001b[2J", line: 7 }, completed: [] },
 			(view) => { assert.equal("pathLine" in view, false); }],
+		// T3: a failed removal keeps the install and names the exact command; anything else is not shown.
+		[{ outcome: "terminal-action-required", action: "open-new-terminal", completed: [], removeGlobal: { status: "failed", command: "npm uninstall -g gentle-pi" } },
+			(view) => {
+				assert.equal(view.removeCommand, "npm uninstall -g gentle-pi");
+				assert.match(String(view.guidance), /old global gentle-pi could not be removed/);
+			}],
+		[{ outcome: "ready", completed: [], removeGlobal: { status: "failed", command: "rm -rf ~" } }, (view) => { assert.equal("removeCommand" in view, false); }],
+		[{ outcome: "ready", completed: [], removeGlobal: { status: "removed", command: "pnpm remove -g gentle-pi" } },
+			(view) => { assert.equal("removeCommand" in view, false); assert.equal(view.guidance, guidance.outcomes.ready); }],
+		[{ outcome: "failed", failedStep: "verify-launcher", completed: [], detail: "Error: no Pi" },
+			(view) => { assert.equal(view.detail, "Error: no Pi"); assert.match(String(view.guidance), /old global Gentle Shell was kept/); }],
+		// B3: a migration's failed bundled step shows its detail; a new install's sends none, so nothing changes there.
+		[{ outcome: "failed", failedStep: "claim-prefix", completed: [], detail: "Unsafe bundled prefix: ~/.gentle-shell" },
+			(view) => { assert.equal(view.detail, "Unsafe bundled prefix: ~/.gentle-shell"); assert.equal(view.guidance, guidance.failed["claim-prefix"]); }],
+		[{ outcome: "failed", failedStep: "claim-prefix", completed: [] }, (view) => { assert.equal("detail" in view, false); }],
 	];
 	for (const [result, check] of cases) {
 		const { host, port, login } = await start({ runInstall: async () => result as never });
@@ -1495,14 +1523,45 @@ test("wizardHandlers plans the bundled install only when the gate says so, and r
 		urls.length = 0;
 		assert.deepEqual((await handlers(false).collectPlan("release")).plan, planPreflight(cleanInventory));
 		assert.deepEqual((await handlers(true).collectPlan("main")).plan, planPreflight(cleanInventory, { channel: "main" }));
+		// T3: an existing Gentle Shell that pnpm or npm owns moves to the bundled install and its old package is removed last.
 		const existing = { ...cleanInventory, shell: { available: true, version: requirements.shell, usable: true, global: true, owner: "pnpm" } };
-		assert.deepEqual((await handlers(true, existing).collectPlan("release")).plan, planPreflight(existing));
-		assert.equal(urls.length, 1, "only the release check of a new installation asks for the assets");
+		const migration = (await handlers(true, existing).collectPlan("release")).plan;
+		assert.deepEqual(migration.bundled.migrate, { manager: "pnpm", command: "pnpm remove -g gentle-pi", removal: "plan" });
+		assert.equal(migration.actions.at(-1).id, "remove-global-shell");
+		// An npm link (no owner) or a release without the assets: the standard plan, unchanged.
+		const linked = { ...existing, shell: { available: true, version: requirements.shell, usable: true, global: true } };
+		assert.deepEqual((await handlers(true, linked).collectPlan("release")).plan, planPreflight(linked));
+		assert.deepEqual((await handlers(false, existing).collectPlan("release")).plan, planPreflight(existing));
+		assert.equal(urls.length, 4, "only the release check of a new or migrating installation asks for the assets");
 		// The bundled plan goes to the bundled runner, which needs consent like the standard one.
 		const routed = handlers(true);
 		const { plan: consented } = await routed.collectPlan("release");
 		assert.deepEqual(await routed.runInstall({ plan: consented, consent: false }, () => {}), { outcome: "blocked", reason: "consent-required", completed: [] });
 	} finally {
 		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+// Git is not needed to install; the plan notes a missing Git, never as a blocker,
+// for the standard and the bundled plan alike (both inventories carry the probe).
+const gitNoticeText = (install: string) => "Git was not found on this computer. Gentle Shell installs and starts without it, but code review, worktrees and other " +
+	`repository features need it. Install it with ${install}, then open a new terminal. This is not a blocker.`;
+test("/api/plan notes a missing Git for the standard and the bundled plan, never as a blocker", async () => {
+	const cases = [
+		[collected({ git: { available: false } }), gitNoticeText("your package manager, for example `sudo apt-get install -y git` on Debian or Ubuntu")],
+		[collected({ platform: "darwin", git: { available: false } }), gitNoticeText("`xcode-select --install` (Apple's Command Line Tools)")],
+		[{ ...bundledCollected({ kind: "none" }), inventory: { ...bundledCollected({ kind: "none" }).inventory, git: { available: false } } }, gitNoticeText("your package manager, for example `sudo apt-get install -y git` on Debian or Ubuntu")],
+		[collected({ git: { available: true } }), null],
+		[collected({}), null],
+	] as const;
+	for (const [result, text] of cases) {
+		const { host, port, login } = await start({ collect: async () => result });
+		try {
+			const view = await plan(port, await login());
+			assert.equal(view.gitNotice?.description ?? null, text);
+			assert.equal(view.blockers.some((blocker: { tool: string }) => blocker.tool === "git"), false);
+		} finally {
+			await host.close("test");
+		}
 	}
 });

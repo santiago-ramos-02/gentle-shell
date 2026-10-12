@@ -52,6 +52,8 @@ export const stepLabels = Object.freeze({
 	"activate-version": "Activate the installed version",
 	"write-launcher": "Write the gentle-shell launcher",
 	"bundled-path": "Add gentle-shell to PATH",
+	"verify-launcher": "Check the new gentle-shell launcher",
+	"remove-global-shell": "Remove the old global gentle-pi",
 });
 export function stepLabel(id) {
 	return typeof id === "string" && Object.hasOwn(stepLabels, id) ? stepLabels[id] : String(id);
@@ -110,10 +112,12 @@ function withMain(ids, steps) {
 
 export function expectedSteps(actionIds) {
 	const ids = new Set(list(actionIds));
-	// The bundled install (runBundledInstall): the PATH step only when the installer applies it.
+	// The bundled install (runBundledInstall): the PATH step only when the installer applies it; a
+	// migration checks the new launcher before the PATH step and removes the old global gentle-pi last.
 	if (ids.has("bundled-version")) {
+		const migration = ids.has("remove-global-shell");
 		return ["claim-prefix", "copy-npm-settings", "install-runtime", "install-version", "activate-version", "write-launcher",
-			...(ids.has("bundled-path") ? ["bundled-path"] : []), "shell-setup"];
+			...(migration ? ["verify-launcher"] : []), ...(ids.has("bundled-path") ? ["bundled-path"] : []), "shell-setup", ...(migration ? ["remove-global-shell"] : [])];
 	}
 	// An older Pi is found, updated and verified before any Gentle Shell step.
 	const piCheck = ids.has("update-pi") ? ["check-installed-pi"] : [];
@@ -198,6 +202,8 @@ export function planModel(view) {
 		blockers,
 		// S6: reused tools in folders another account can change; a notice, never a blocker.
 		notice: typeof view?.sharedFolders?.description === "string" ? text(view.sharedFolders.description) : null,
+		// A missing Git: noted before consent, never a blocker.
+		gitNotice: typeof view?.gitNotice?.description === "string" ? text(view.gitNotice.description) : null,
 		disclosures: [
 			{
 				id: "profile",
@@ -255,7 +261,9 @@ export function progressModel(steps, entries, { running = false, outcome = null 
 
 const detailCommands = new Map([["shell-setup", "gentle-shell setup"], ["install-version", "pnpm install"], ["persist-path", "pnpm setup"], ["acquire-go", "the Go download"],
 	["install-global", "pnpm add -g"], ["install-shell-main", "the Gentle Shell main install"], ["build-gentle-ai-main", "the Gentle AI main build"],
-	["update-shell", "the Gentle Shell update"]]);
+	["update-shell", "the Gentle Shell update"], ["claim-prefix", "the bundled install"], ["copy-npm-settings", "the bundled install"],
+	["install-runtime", "the bundled install"], ["activate-version", "the bundled install"], ["write-launcher", "the bundled install"],
+	["verify-launcher", "gentle-shell --version"], ["bundled-path", "the bundled install"]]);
 
 /** Final screen model for every runner outcome. Guidance always comes from the host. */
 export function outcomeModel(outcome) {
@@ -264,6 +272,8 @@ export function outcomeModel(outcome) {
 	const notes = [];
 	if (outcome?.npmPrefix === "configured") notes.push("npm's user-level global prefix now points at PNPM_HOME.");
 	if (outcome?.npmPrefix === "unchanged") notes.push("npm's global prefix was already correct and was left unchanged.");
+	// A migration whose old global gentle-pi could not be removed (the host sends only the fixed commands).
+	if (typeof outcome?.removeCommand === "string") notes.push(`The old global gentle-pi could not be removed. Remove it with \`${text(outcome.removeCommand)}\`.`);
 	const base = { outcome: outcome?.outcome, guidance, completed, notes, reason: null, failedStep: null, command: null, detail: null, detailCommand: null };
 	if (outcome?.outcome === "ready") {
 		return { ...base, tone: "success", badge: "Installed", title: "Gentle Shell is ready",
@@ -419,7 +429,7 @@ function disclosureCard(doc, item) {
 
 const channels = Object.freeze([
 	{ value: "release", label: "Latest release", hint: "Recommended. The published Gentle Shell and its pinned Gentle AI binary." },
-	{ value: "main", label: "Latest main", hint: "Development builds: Gentle Shell and Gentle AI from the latest commit of `main`, built on this computer with Go. If yours is missing or older, the installer downloads its own pinned Go only for the build." },
+	{ value: "main", label: "Latest main", hint: "Development builds: Gentle Shell and Gentle AI from the latest commit of `main`, built on this computer with Go. If yours is missing, older or cannot be checked, the installer downloads its own pinned Go only for the build." },
 ]);
 
 /** Channel choice shown on every review screen; a change reloads the plan. */
@@ -501,6 +511,9 @@ export function renderPlan(doc, model, handlers) {
 	model.notice ? el(doc, "section", { class: "alert alert-warning", "aria-labelledby": "notice-title" },
 		el(doc, "h2", { id: "notice-title", class: "alert-title" }, el(doc, "span", { "aria-hidden": "true" }, "! "), "Tools in folders other accounts can change"),
 		el(doc, "p", {}, rich(doc, model.notice))) : null,
+	model.gitNotice ? el(doc, "section", { class: "alert alert-warning", "aria-labelledby": "git-notice-title" },
+		el(doc, "h2", { id: "git-notice-title", class: "alert-title" }, el(doc, "span", { "aria-hidden": "true" }, "! "), "Git not found"),
+		el(doc, "p", {}, rich(doc, model.gitNotice))) : null,
 	el(doc, "section", { class: "block", "aria-labelledby": "steps-title" },
 		el(doc, "h2", { id: "steps-title", class: "section-title" }, recovery ? "Setup steps" : updating || updatingPi ? "Update steps" : "Installation steps"),
 		el(doc, "ol", { class: "plan-steps" }, model.actions.map((action) => el(doc, "li", {},
