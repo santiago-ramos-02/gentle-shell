@@ -931,6 +931,32 @@ test("Go has no descriptor for other targets", () => {
 	}
 });
 
+// The Engram release the bundled install ships (S9), from its checksums.txt and
+// the GitHub asset digests; every archive was downloaded and re-hashed.
+const engramPins = {
+	"darwin-arm64": ["darwin_arm64.tar.gz", "3d6b4ac0055883ec23d5b0a04a3cda041653cdf4916fd7e98944692e62fd0441", 7465858],
+	"darwin-x64": ["darwin_amd64.tar.gz", "3da8d7befe8500ff09aa44c48f493eda96513fd3f63c7e4bfb95e3ae85dfae52", 7952089],
+	"linux-x64": ["linux_amd64.tar.gz", "8694d3817b63c5fc5607b5919e88aa929bffa0bafda330513364e10c8ab61445", 7817468],
+	"linux-arm64": ["linux_arm64.tar.gz", "b4546b6e00f68e56da52064f1865c6cbae1d5b0633aeebc36e1a2f20b17683e7", 7168173],
+	"win32-x64": ["windows_amd64.zip", "e00afe91d1baade484d217606d78c2fd91e26a4f9823b603d050c1e4be78233c", 8013889],
+	"win32-arm64": ["windows_arm64.zip", "251d467017f88e4eb7fc186c635a9bf64db5aa39cfc251d35dd4035f38941454", 7224229],
+} as const;
+test("fixed Engram descriptors are the GitHub release archives and checksums, and nothing else", () => {
+	for (const [target, [suffix, sha256, size]] of Object.entries(engramPins)) {
+		const [platform, arch] = target.split("-");
+		const artifact = artifactFor("engram", platform, arch);
+		assert.equal(artifact.version, "3.3.2");
+		assert.equal(artifact.url, `https://github.com/Gentleman-Programming/engram/releases/download/v3.3.2/engram_3.3.2_${suffix}`);
+		assert.equal(artifact.integrity, `sha256-${sha256}`);
+		assert.deepEqual([artifact.size, artifact.maxBytes], [size, size]);
+		// GitHub serves release assets from its asset hosts.
+		assert.deepEqual(artifact.redirectHosts, ["objects.githubusercontent.com", "release-assets.githubusercontent.com"]);
+	}
+	for (const [platform, arch] of [["linux", "ia32"], ["freebsd", "x64"], ["win32", "ia32"]]) {
+		assert.throws(() => artifactFor("engram", platform, arch), /Unsupported/);
+	}
+});
+
 function tarHeader(name: string, size: number, { type = "0", mode = 0o644, link = "", prefix = "" } = {}) {
 	const header = Buffer.alloc(512);
 	header.write(name, 0, 100, "utf8");
@@ -1170,6 +1196,6 @@ test("the CI native Windows gate requires exactly the native tests the Windows b
 	const gate = /\[int\]\$passes\.Groups\[1\]\.Value -ne (\d+) -or/.exec(ci);
 	assert.ok(gate, "the gate compares the passed count exactly");
 	assert.ok(/\[int\]\$skips\.Groups\[1\]\.Value -ne 0/.test(ci), "0 skips stays required");
-	assert.equal(literal + modes, 37);
+	assert.equal(literal + modes, 38);
 	assert.equal(Number(gate[1]), literal + modes);
 });

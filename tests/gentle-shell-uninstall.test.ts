@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { askLine, runSelfUninstall, SHARED_CONFIG_FILES } from "../lib/gentle-shell-uninstall.ts";
+import { askLine, runBundledSelfUninstall, runSelfUninstall, SHARED_CONFIG_FILES } from "../lib/gentle-shell-uninstall.ts";
 
 const posixOnly = { skip: process.platform === "win32" };
 const SHA = "1f9d5e6423e37f7d2316859045f379ba9b5d8c3a";
@@ -662,4 +662,317 @@ test("a failed removal stops before the package is removed", { skip: process.pla
 		chmodSync(locked, 0o700);
 		w.cleanup();
 	}
+});
+
+// T6 (S6, S7): self-uninstall run from the bundled launcher removes the prefix's
+// own folders and exactly the PATH entry its receipt records; the Gentle Shell
+// home is shared data. POSIX fixtures use the real `current` symlink; the
+// Windows ones simulate the platform with real temporary paths.
+const BUNDLED_ID = "4.1.0-1.1.0";
+type BundledOptions = {
+	platform?: string;
+	env?: Record<string, string>;
+	interactive?: boolean;
+	answers?: string[];
+	ask?: (question: string) => Promise<string>;
+	pathEntry?: "recorded" | "none" | "invalid" | "fails" | "edited";
+	execPath?: string;
+	root?: string;
+};
+
+function bundledWorld({ platform = "darwin" } = {}) {
+	const base = realpathSync(mkdtempSync(join(tmpdir(), "bundled-uninstall-")));
+	const home = join(base, "home");
+	const windows = platform === "win32";
+	const shellHome = join(home, ".gentle-shell");
+	const prefix = windows ? join(home, "AppData", "Local", "gentle-shell") : shellHome;
+	const node = windows ? join(prefix, "runtime", "node-24.21.0", "node.exe") : join(prefix, "runtime", "node-24.21.0", "bin", "node");
+	const launcher = join(prefix, "bin", windows ? "gentle-shell.cmd" : "gentle-shell");
+	const own = ["bin", "current", "versions", "versions.history", "runtime", "pnpm", "npm", "gentle-ai", "config", "tmp", "path-entry.json",
+		...(windows ? [".gentle-shell-bundle"] : [])].map((name) => join(prefix, name));
+	write(launcher, "launcher\n");
+	write(join(prefix, "versions", BUNDLED_ID, ".gentle-shell-version"), `${BUNDLED_ID}\n`);
+	write(join(prefix, "versions", BUNDLED_ID, "node_modules", "gentle-pi", "package.json"));
+	write(join(prefix, "versions.history"), `${BUNDLED_ID}\n`);
+	if (windows) write(join(prefix, "current"), `${BUNDLED_ID}\n`);
+	else symlinkSync(`versions/${BUNDLED_ID}`, join(prefix, "current"));
+	write(node, "node");
+	write(join(prefix, "runtime", "pnpm-11.1.1", "package", "package.json"));
+	write(join(prefix, "pnpm", "store", "v10", "index"));
+	write(join(prefix, "npm", "cache", "index"));
+	write(join(prefix, "gentle-ai", "state.json"));
+	write(join(prefix, "config", "gentle-ai", "persona.json"));
+	mkdirSync(join(prefix, "tmp"));
+	write(join(prefix, "path-entry.json"));
+	if (windows) write(join(prefix, ".gentle-shell-bundle"), "gentle-shell bundled install");
+	const shared = { agent: join(shellHome, "agent"), config: join(shellHome, "config.json") };
+	write(join(shared.agent, "auth.json"));
+	write(shared.config, JSON.stringify({ home: "isolated" }));
+	// The user's own data, never touched: Pi's home, Gentle AI's config and state, Engram's memory.
+	const kept = [join(home, ".pi", "agent", "settings.json"), join(home, ".pi", "gentle-ai", "profiles.json"), join(home, ".gentle-ai", "state.json"),
+		join(home, ".engram", "engram.db")];
+	for (const path of kept) write(path);
+	const out: string[] = [];
+	const err: string[] = [];
+	const questions: string[] = [];
+	const pathCalls: { ownLeft: number }[] = [];
+	const deferred: { pid: number; files: string[]; last?: string; directories: string[] }[] = [];
+	const ownLeft = () => own.filter((path) => { try { lstatSync(path); return true; } catch { return false; } });
+	const uninstall = (args: string[], options: BundledOptions = {}) => {
+		const answers = [...(options.answers ?? [])];
+		const state = options.pathEntry ?? "recorded";
+		return runBundledSelfUninstall({
+			args,
+			env: options.env ?? {},
+			homedir: home,
+			platform,
+			interactive: options.interactive ?? false,
+			root: options.root ?? prefix,
+			pathEntry: state === "none" ? { status: "none" }
+				: state === "invalid" ? { status: "invalid", reason: `${join(prefix, "path-entry.json")} does not describe this install's PATH entry` }
+				: {
+					status: "recorded",
+					description: `the line export PATH="${join(prefix, "bin")}:$PATH" # gentle-shell bundled install in ${join(home, ".zshrc")}`,
+					remove: () => {
+						pathCalls.push({ ownLeft: ownLeft().length });
+						if (state === "fails") throw new Error("EACCES: permission denied");
+						return state === "edited" ? { removed: false, note: `${join(home, ".zshrc")} still holds export PATH="$PATH:${join(prefix, "bin")}" # gentle-shell bundled install (edited, so it was kept)` }
+							: { removed: true };
+					},
+				},
+			process: { pid: 4242, execPath: options.execPath ?? node },
+			deferRemoval: (request: { pid: number; files: string[]; last?: string; directories: string[] }) => { deferred.push(request); },
+			ask: options.ask ?? (async (question: string) => {
+				questions.push(question);
+				return answers.shift() ?? "";
+			}),
+			out: (line: string) => out.push(line),
+			err: (line: string) => err.push(line),
+		});
+	};
+	return { base, home, prefix, shellHome, node, launcher, own, shared, kept, out, err, questions, pathCalls, deferred, ownLeft, uninstall,
+		cleanup: () => rmSync(base, { recursive: true, force: true }) };
+}
+
+type BundledWorld = ReturnType<typeof bundledWorld>;
+
+function bundledUntouched(w: BundledWorld) {
+	assert.deepEqual(w.ownLeft(), w.own);
+	for (const path of [...w.kept, w.shared.config, join(w.shared.agent, "auth.json")]) assert.equal(existsSync(path), true, path);
+	assert.deepEqual(w.pathCalls, []);
+	assert.deepEqual(w.deferred, []);
+}
+
+test("bundled: --dry-run lists the PATH entry, the prefix's own folders, the shared home and what is never touched, and removes nothing", posixOnly, async () => {
+	const w = bundledWorld();
+	try {
+		assert.equal(await w.uninstall(["--dry-run"]), 0);
+		const plan = w.out.join("\n");
+		assert.match(plan, /bundled install/);
+		assert.ok(section(w.out, "Remove the PATH entry:")[0]?.includes(join(w.home, ".zshrc")));
+		const removed = section(w.out, "Remove the bundled install:").join("\n");
+		for (const path of w.own) assert.ok(removed.includes(path), path);
+		assert.ok(removed.includes(`${w.prefix} itself`));
+		const shared = section(w.out, "Your Gentle Shell home").join("\n");
+		for (const path of Object.values(w.shared)) assert.ok(shared.includes(path), path);
+		const never = section(w.out, "Not touched:").join("\n");
+		for (const name of [join(".pi", "agent"), ".gentle-ai", ".engram"]) assert.ok(never.includes(join(w.home, name)), name);
+		assert.match(plan, /Dry run: nothing was removed\./);
+		bundledUntouched(w);
+	} finally { w.cleanup(); }
+});
+
+test("bundled: --yes removes the PATH entry first, then the prefix's own folders, and keeps the shared home and so the prefix", posixOnly, async () => {
+	const w = bundledWorld();
+	try {
+		assert.equal(await w.uninstall(["--yes"]), 0, w.err.join("\n"));
+		assert.deepEqual(w.pathCalls, [{ ownLeft: w.own.length }]);
+		assert.deepEqual(w.ownLeft(), []);
+		for (const path of [...w.kept, w.shared.config, join(w.shared.agent, "auth.json")]) assert.equal(existsSync(path), true, path);
+		assert.deepEqual(readdirSync(w.prefix).sort(), ["agent", "config.json"]);
+		assert.deepEqual(w.deferred, []);
+		assert.match(w.out.join("\n"), /Gentle Shell was removed\./);
+	} finally { w.cleanup(); }
+});
+
+test("bundled: --yes --include-shared also removes the Gentle Shell home, then the empty prefix, and nothing of the user's", posixOnly, async () => {
+	const w = bundledWorld();
+	try {
+		assert.equal(await w.uninstall(["--yes", "--include-shared"]), 0, w.err.join("\n"));
+		assert.equal(existsSync(w.prefix), false);
+		for (const path of w.kept) assert.equal(existsSync(path), true, path);
+	} finally { w.cleanup(); }
+});
+
+test("bundled: anything the install did not write keeps the prefix, and links inside it are never followed", posixOnly, async () => {
+	const w = bundledWorld();
+	try {
+		write(join(w.prefix, "notes.txt"), "mine");
+		const outside = join(w.base, "outside");
+		write(join(outside, "keep.txt"), "mine");
+		rmSync(join(w.prefix, "pnpm"), { recursive: true });
+		symlinkSync(outside, join(w.prefix, "pnpm"));
+		// A link inside a removed folder (pnpm's node_modules) goes, its target stays.
+		symlinkSync(outside, join(w.prefix, "versions", BUNDLED_ID, "node_modules", "linked"));
+		assert.equal(await w.uninstall(["--yes", "--include-shared"]), 0, w.err.join("\n"));
+		assert.equal(existsSync(join(w.prefix, "versions")), false);
+		assert.equal(readFileSync(join(outside, "keep.txt"), "utf8"), "mine");
+		assert.deepEqual(readdirSync(w.prefix).sort(), ["notes.txt", "pnpm"]);
+		const kept = section(w.out, "Kept:").join("\n");
+		assert.ok(kept.includes(`${join(w.prefix, "pnpm")}: a symbolic link, not followed`));
+		assert.ok(kept.includes(`${join(w.prefix, "notes.txt")}: not written by the bundled install`));
+	} finally { w.cleanup(); }
+});
+
+test("bundled: without a valid receipt the PATH entry is named for the user to remove, never guessed", posixOnly, async () => {
+	for (const pathEntry of ["none", "invalid"] as const) {
+		const w = bundledWorld();
+		try {
+			assert.equal(await w.uninstall(["--yes"], { pathEntry }), 0, w.err.join("\n"));
+			assert.deepEqual(w.pathCalls, []);
+			const plan = w.out.join("\n");
+			assert.ok(section(w.out, "Remove the PATH entry:").join("\n").includes("(none recorded"), pathEntry);
+			assert.match(plan, /# gentle-shell bundled install/);
+			assert.ok(plan.includes(join(w.prefix, "bin")), pathEntry);
+			if (pathEntry === "invalid") assert.match(plan, /does not describe this install's PATH entry/);
+			// A5: said once, in the plan.
+			assert.equal(w.out.filter((line) => line.includes("If a new terminal still finds gentle-shell")).length, 1, pathEntry);
+			assert.deepEqual(w.ownLeft(), []);
+		} finally { w.cleanup(); }
+	}
+});
+
+// A2: a PATH line the user edited is kept and named, not silently reported as removed.
+test("bundled: a PATH entry the user changed is kept, and the final message names the file and the line it still holds", posixOnly, async () => {
+	const w = bundledWorld();
+	try {
+		assert.equal(await w.uninstall(["--yes"], { pathEntry: "edited" }), 0, w.err.join("\n"));
+		const tail = w.out.slice(-2);
+		assert.match(tail[0], /The PATH entry was kept: .*\.zshrc still holds export PATH="\$PATH:.*# gentle-shell bundled install/);
+		assert.match(tail[1], /Gentle Shell was removed\./);
+		assert.deepEqual(w.ownLeft(), []);
+	} finally { w.cleanup(); }
+});
+
+test("bundled: a prefix that is not the real ~/.gentle-shell, or a Windows prefix without its marker, is refused before anything is removed", async () => {
+	if (process.platform !== "win32") {
+		const posix = bundledWorld();
+		try {
+			const elsewhere = join(posix.base, "elsewhere");
+			mkdirSync(elsewhere);
+			for (const root of [elsewhere, posix.home]) {
+				posix.out.length = 0;
+				posix.err.length = 0;
+				assert.equal(await posix.uninstall(["--yes"], { root }), 1, root);
+				assert.match(posix.err.join("\n"), /refusing to remove anything/);
+				assert.match(posix.err.join("\n"), /Nothing was removed\./);
+			}
+			bundledUntouched(posix);
+		} finally { posix.cleanup(); }
+		const linked = bundledWorld();
+		try {
+			const moved = join(linked.base, "moved");
+			const { renameSync } = await import("node:fs");
+			renameSync(linked.prefix, moved);
+			symlinkSync(moved, linked.prefix);
+			assert.equal(await linked.uninstall(["--yes"], { root: moved }), 1);
+			assert.match(linked.err.join("\n"), /refusing to remove anything/);
+			assert.equal(readdirSync(moved).includes("runtime"), true);
+		} finally { linked.cleanup(); }
+	}
+	// The Windows prefix is the user's home itself: refused even with the marker.
+	const homeRoot = bundledWorld({ platform: "win32" });
+	try {
+		write(join(homeRoot.home, ".gentle-shell-bundle"), "gentle-shell bundled install");
+		assert.equal(await homeRoot.uninstall(["--yes"], { root: homeRoot.home }), 1);
+		assert.match(homeRoot.err.join("\n"), /your home directory/);
+		bundledUntouched(homeRoot);
+	} finally { homeRoot.cleanup(); }
+	for (const marker of [undefined, "someone else's folder"]) {
+		const w = bundledWorld({ platform: "win32" });
+		try {
+			const path = join(w.prefix, ".gentle-shell-bundle");
+			if (marker === undefined) rmSync(path);
+			else writeFileSync(path, marker);
+			assert.equal(await w.uninstall(["--yes"]), 1, String(marker));
+			assert.match(w.err.join("\n"), /\.gentle-shell-bundle/);
+			assert.equal(existsSync(join(w.prefix, "runtime")), true);
+			assert.deepEqual([w.pathCalls, w.deferred], [[], []]);
+		} finally { w.cleanup(); }
+	}
+});
+
+test("bundled: a Pi home inside the prefix is protected, except the session's own Gentle Shell home", posixOnly, async () => {
+	const w = bundledWorld();
+	try {
+		assert.equal(await w.uninstall(["--yes", "--include-shared"], { env: { PI_CODING_AGENT_DIR: w.shared.agent } }), 1);
+		assert.match(w.err.join("\n"), /your Pi home/);
+		bundledUntouched(w);
+		const session = { PI_CODING_AGENT_DIR: w.shared.agent, GENTLE_SHELL_USER_PI_HOME: join(w.home, ".pi", "agent") };
+		assert.equal(await w.uninstall(["--yes", "--include-shared"], { env: session }), 0, w.err.join("\n"));
+		assert.equal(existsSync(w.prefix), false);
+		for (const path of w.kept) assert.equal(existsSync(path), true, path);
+	} finally { w.cleanup(); }
+});
+
+test("bundled: in a terminal one question confirms, the shared home is asked separately and kept by default; EOF cancels and Ctrl-C aborts", posixOnly, async () => {
+	const cancelled = bundledWorld();
+	try {
+		assert.equal(await cancelled.uninstall([], { interactive: true, answers: [""] }), 1);
+		assert.match(cancelled.out.join("\n"), /Cancelled; nothing was removed\./);
+		bundledUntouched(cancelled);
+	} finally { cancelled.cleanup(); }
+	const confirmed = bundledWorld();
+	try {
+		assert.equal(await confirmed.uninstall([], { interactive: true, answers: ["y", ""] }), 0, confirmed.err.join("\n"));
+		assert.equal(confirmed.questions.length, 2);
+		assert.match(confirmed.questions[1], /\[y\/N\]/);
+		assert.deepEqual(confirmed.ownLeft(), []);
+		assert.equal(existsSync(join(confirmed.shared.agent, "auth.json")), true);
+	} finally { confirmed.cleanup(); }
+	for (const keys of [["\x04"], ["\x03"], ["y\r", "\x03"]]) {
+		const w = bundledWorld();
+		try {
+			assert.equal(await w.uninstall([], { interactive: true, ask: typing([...keys]) }), 1, JSON.stringify(keys));
+			assert.match([...w.out, ...w.err].join("\n"), keys.includes("\x03") ? /Interrupted; nothing was removed\./ : /Cancelled; nothing was removed\./);
+			bundledUntouched(w);
+		} finally { w.cleanup(); }
+	}
+	const script = bundledWorld();
+	try {
+		assert.equal(await script.uninstall([]), 2);
+		assert.match(script.err.join("\n"), /pass --yes/);
+		assert.equal(await script.uninstall(["--nope"]), 2);
+		bundledUntouched(script);
+	} finally { script.cleanup(); }
+});
+
+test("bundled: a PATH entry that cannot be removed stops before anything else is removed", posixOnly, async () => {
+	const w = bundledWorld();
+	try {
+		assert.equal(await w.uninstall(["--yes"], { pathEntry: "fails" }), 1);
+		assert.match(w.err.join("\n"), /EACCES/);
+		assert.deepEqual(w.ownLeft(), w.own);
+	} finally { w.cleanup(); }
+});
+
+test("bundled on Windows: the user Path entry goes first, the running node.exe, the launcher and the marker after this process exits", async () => {
+	const w = bundledWorld({ platform: "win32" });
+	try {
+		assert.equal(await w.uninstall(["--yes"]), 0, w.err.join("\n"));
+		assert.equal(w.pathCalls.length, 1);
+		const marker = join(w.prefix, ".gentle-shell-bundle");
+		const nodeDir = dirname(w.node);
+		// A4: the marker goes last, only once the others are gone, so a failed removal can be retried.
+		assert.deepEqual(w.deferred, [{ pid: 4242, files: [w.node, w.launcher], last: marker,
+			directories: [nodeDir, join(w.prefix, "runtime"), join(w.prefix, "bin"), w.prefix] }]);
+		// Everything else is already gone; those three wait for the detached removal.
+		assert.deepEqual(readdirSync(w.prefix).sort(), [".gentle-shell-bundle", "bin", "runtime"]);
+		assert.deepEqual(readdirSync(join(w.prefix, "runtime")), ["node-24.21.0"]);
+		assert.deepEqual(readdirSync(nodeDir), ["node.exe"]);
+		assert.deepEqual(readdirSync(join(w.prefix, "bin")), ["gentle-shell.cmd"]);
+		assert.match(w.out.join("\n"), /after this command exits/);
+		// The Gentle Shell home lives outside the prefix on Windows and stays.
+		assert.equal(existsSync(join(w.shared.agent, "auth.json")), true);
+	} finally { w.cleanup(); }
 });

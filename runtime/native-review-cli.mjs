@@ -4,7 +4,7 @@ import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, posix, win32 } from "node:path";
 import { promisify } from "node:util";
-import { PackageLocalGentleAiBinaryMissingError, resolveGentleAiBinary } from "./gentle-ai-binary.mjs";
+import { gentleAiIsolationEnv, PackageLocalGentleAiBinaryMissingError, resolveGentleAiBinary } from "./gentle-ai-binary.mjs";
 import { GENTLE_PI_REVIEW_RELAY_CONTRACT, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV } from "./review-relay-contract.mjs";
 import { decodeReviewAssessmentV1,                         } from "./review-risk-assessment.mjs";
 import {
@@ -1117,9 +1117,10 @@ export class NativeReviewCliError extends Error {
 // makes. It declares the Pi host relay handshake on each spawn: gentle-ai
 // refuses pi admission pre-authority without it (gentle-pi#311 P4), and a
 // single injection point keeps the declaration impossible to forget on any
-// individual operation.
+// individual operation. In a bundled install it also keeps Gentle AI's state
+// inside the prefix (gentleAiIsolationEnv, S9).
 export function gentleAiProcessEnvironment(base                    = process.env)                    {
-	return { ...base, [GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV]: GENTLE_PI_REVIEW_RELAY_CONTRACT };
+	return { ...gentleAiIsolationEnv(base), [GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV]: GENTLE_PI_REVIEW_RELAY_CONTRACT };
 }
 
 export function createNodeExecFileAdapter()                  {

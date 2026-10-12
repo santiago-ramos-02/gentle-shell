@@ -121,7 +121,7 @@ test("bundledPlan lists the bundled steps, the versions and the single PATH chan
 // Rule 3: the fixed step order, logged like the standard runner's steps.
 function harness({ platform = "linux", path = profile as Record<string, unknown>, failAt = "", setup = { status: 0, stdout: "", stderr: "" },
 	changes = {} as Record<string, unknown>, migrate = undefined as Record<string, unknown> | undefined, launcher = { ok: true, reported: "", stderr: "" },
-	removed = true } = {}) {
+	removed = true, applied = true } = {}) {
 	const layout = platform === "win32" ? prefixLayout({ platform, env: { LOCALAPPDATA: "C:\\L" }, home: "C:\\U" }) : posixLayout;
 	const plan = bundledPlan({ platform, distribution: published, layout, path, ...(migrate ? { migrate } : {}) });
 	const calls: string[] = [];
@@ -150,7 +150,9 @@ function harness({ platform = "linux", path = profile as Record<string, unknown>
 			activateVersion: (_: unknown, id: string) => step(`activate ${id}`, { id, previous: null }),
 			ensureLauncher: () => step("launcher", { written: true }),
 			pathEntryPlan: () => path,
-			applyPathEntry: (plan: { kind: string }, options: { registry: unknown }) => step(`path ${plan.kind} ${options.registry === registry}`, { ...plan, applied: true }),
+			applyPathEntry: (plan: { kind: string }, options: { registry: unknown }) => step(`path ${plan.kind} ${options.registry === registry}`, { ...plan, applied }),
+			writePathReceipt: (written: unknown, receipt: { kind: string }) => step(`receipt ${receipt.kind} ${written === layout}`, true),
+			removePathEntry: (receipt: { kind: string }, options: { registry: unknown }) => step(`unpath ${receipt.kind} ${options.registry === registry}`, undefined),
 			run: async (command: string, args: string[], options: { env: Record<string, string>; cwd: string }) => {
 				runs.push({ command, args, options });
 				return step("setup", setup);
@@ -169,7 +171,7 @@ test("runBundledInstall claims, copies the npm settings, installs runtimes and t
 	assert.deepEqual(h.log, steps.map((step) => ({ step, status: "done" })));
 	// writeNpmrcAuth gets the user's npmrc text and keeps only the S12 keys itself.
 	assert.deepEqual(h.calls, ["claim", "npmrc registry=https://r.example/\nsave-exact=true", "runtime go=false", "install 4.1.0-1.0.2 true go=false", "activate 4.1.0-1.0.2",
-		"launcher", "path profile true", "setup"]);
+		"launcher", "path profile true", "receipt profile true", "setup"]);
 	// Setup runs through the launcher, in the bundled setup environment.
 	assert.equal(h.runs[0].command, h.layout.launcher);
 	assert.deepEqual(h.runs[0].args, ["setup"]);
@@ -195,6 +197,22 @@ test("runBundledInstall on Windows installs the pinned Go, writes the user Path 
 	// A .cmd launcher would need cmd.exe: setup runs the same Node and entry it runs.
 	assert.equal(h.runs[0].command, h.layout.node);
 	assert.deepEqual(h.runs[0].args, ["C:\\L\\gentle-shell\\versions\\4.1.0-1.0.2\\node_modules\\gentle-pi\\bin\\gentle-shell.mjs", "setup"]);
+});
+
+// T6 (S7): the applied PATH entry is kept in the prefix, so self-uninstall reverts exactly it.
+test("runBundledInstall keeps the receipt of the PATH entry it applied, writes none when nothing was applied, and reverts the entry when the receipt cannot be kept", async () => {
+	const windows = harness({ platform: "win32", path: { kind: "registry", key: "HKCU\\Environment", name: "Path", entry: "C:\\L\\gentle-shell\\bin" } });
+	await windows.run();
+	assert.deepEqual(windows.calls.filter((call) => /^(path|receipt|unpath) /.test(call)), ["path registry true", "receipt registry true"]);
+	const present = harness({ applied: false });
+	assert.equal((await present.run()).outcome, "terminal-action-required");
+	assert.deepEqual(present.calls.filter((call) => /^(path|receipt|unpath) /.test(call)), ["path profile true"]);
+	const unwritable = harness();
+	unwritable.adapters.operations.writePathReceipt = () => { throw new Error("EACCES"); };
+	const failed = await unwritable.run();
+	assert.equal(failed.failedStep, "bundled-path");
+	assert.deepEqual(unwritable.calls.filter((call) => /^(path|receipt|unpath) /.test(call)), ["path profile true", "unpath profile true"]);
+	assert.equal(unwritable.calls.includes("setup"), false);
 });
 
 test("runBundledInstall stops at the first failed step, keeps what finished and reports pnpm's or setup's last error line", async () => {
@@ -245,7 +263,7 @@ test("windowsPathRegistry edits only the HKCU user Path through Windows PowerShe
 		seen.push({ command, args, env });
 		return answer;
 	});
-	registry.add("C:\\L\\gentle-shell\\bin");
+	assert.equal(registry.add("C:\\L\\gentle-shell\\bin"), "added");
 	answer = "removed";
 	registry.remove("C:\\L\\gentle-shell\\bin");
 	assert.equal(seen[0].command, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
@@ -256,8 +274,9 @@ test("windowsPathRegistry edits only the HKCU user Path through Windows PowerShe
 	assert.match(seen[0].args[4], /DoNotExpandEnvironmentNames/);
 	assert.deepEqual([seen[0].env.GENTLE_BUNDLED_PATH_ENTRY, seen[0].env.GENTLE_BUNDLED_PATH_MODE], ["C:\\L\\gentle-shell\\bin", "add"]);
 	assert.equal(seen[1].env.GENTLE_BUNDLED_PATH_MODE, "remove");
+	// What applyPathEntry reads: an entry the user Path already held was not applied.
 	answer = "present";
-	registry.add("C:\\L\\gentle-shell\\bin");
+	assert.equal(registry.add("C:\\L\\gentle-shell\\bin"), "present");
 	answer = "something else";
 	assert.throws(() => registry.add("C:\\L\\gentle-shell\\bin"), /user Path/);
 	assert.throws(() => registry.add("relative\\bin"), /user Path/);
@@ -299,7 +318,7 @@ test("runBundledInstall for a migration checks the launcher's versions, then rem
 		"shell-setup", "remove-global-shell"];
 	assert.deepEqual(await h.run(), { outcome: "terminal-action-required", action: "open-new-terminal", completed: steps,
 		removeGlobal: { status: "removed", command: "pnpm remove -g gentle-pi" } });
-	assert.deepEqual(h.calls.slice(-4), ["check 4.1.0-1.0.2 4.1.0 1.0.2 launcher=true", "path profile true", "setup", "remove pnpm"]);
+	assert.deepEqual(h.calls.slice(-5), ["check 4.1.0-1.0.2 4.1.0 1.0.2 launcher=true", "path profile true", "receipt profile true", "setup", "remove pnpm"]);
 	// A launcher that does not report both versions: no PATH change, and the old global gentle-pi is never removed.
 	// The detail names what the launcher reported and what was expected (A1).
 	const broken = harness({ migrate: { manager: "pnpm", removal: "plan" }, launcher: { ok: false, reported: "gentle-shell 4.0.0\npi 1.0.0", stderr: "Error: no Pi\n" } });

@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { posix, win32 } from "node:path";
 import { DISTRIBUTION_ASSETS, activateVersion, applyPathEntry, checkLauncher, claimPrefix, ensureLauncher, ensureRuntime, installVersion, pathEntryPlan,
-	prefixLayout, prefixRoot, readDistribution, runCommand, setupEnvironment, userNpmrc, writeNpmrcAuth } from "./bundled-install.mjs";
+	prefixLayout, prefixRoot, readDistribution, removePathEntry, runCommand, setupEnvironment, userNpmrc, writeNpmrcAuth, writePathReceipt } from "./bundled-install.mjs";
 import { removeGlobalCommand, removeGlobalShell } from "./main-channel.mjs";
 import { artifactFor, download as httpDownload, goPinVersion } from "./installer-downloads.mjs";
 import { setupErrorDetail } from "./installer-runner.mjs";
@@ -164,7 +164,7 @@ export async function runBundledInstall(request, adapters) {
 	if (request?.consent !== true) return blocked(validPlan(request?.plan, distribution) ? "consent-required" : "invalid-request");
 	if (!validPlan(request.plan, distribution)) return blocked("invalid-request");
 	const ops = { claimPrefix, userNpmrc, writeNpmrcAuth, ensureRuntime, installVersion, activateVersion, ensureLauncher, pathEntryPlan, applyPathEntry, checkLauncher,
-		run: runCommand, ...adapters.operations };
+		writePathReceipt, removePathEntry, run: runCommand, ...adapters.operations };
 	const consented = request.plan.bundled;
 	const planned = (id) => request.plan.actions.some((action) => action.id === id);
 	let layout = null;
@@ -200,7 +200,15 @@ export async function runBundledInstall(request, adapters) {
 		...(planned("bundled-path") ? [["bundled-path", () => {
 			const plan = ops.pathEntryPlan(layout, { platform, env, home });
 			if (JSON.stringify(pathSummary(plan)) !== JSON.stringify(consented.path)) throw new Error("The PATH change differs from the plan");
-			ops.applyPathEntry(plan, { registry });
+			const receipt = ops.applyPathEntry(plan, { registry });
+			if (receipt?.applied !== true) return;
+			// self-uninstall reverts exactly this receipt; an entry it could not record is taken back.
+			try {
+				ops.writePathReceipt(layout, receipt);
+			} catch (error) {
+				ops.removePathEntry(receipt, { registry });
+				throw error;
+			}
 		}]] : []),
 		// The .cmd launcher would need cmd.exe on Windows: there setup runs the Node and entry it runs.
 		...(planned("bundled-setup") ? [["shell-setup", async () => {
@@ -372,8 +380,9 @@ if ($result -eq 'added' -or $result -eq 'removed') {
 }
 $result`;
 /** The registry adapter applyPathEntry and removePathEntry use on Windows:
- * add(entry) appends the absolute `entry` to the HKCU user Path once, remove(entry)
- * removes every spelling of it; nothing else in the Path changes.
+ * add(entry) appends the absolute `entry` to the HKCU user Path once and returns
+ * "added", or "present" when the Path already held it; remove(entry) removes
+ * every spelling of it; nothing else in the Path changes.
  */
 export function windowsPathRegistry(env, processAdapter = windowsProcessCheck) {
 	const systemRoot = env.SystemRoot ?? Object.entries(env).find(([key]) => key.toLowerCase() === "systemroot")?.[1];
@@ -384,6 +393,7 @@ export function windowsPathRegistry(env, processAdapter = windowsProcessCheck) {
 		const output = processAdapter(win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
 			["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", pathScript], { ...env, GENTLE_BUNDLED_PATH_ENTRY: entry, GENTLE_BUNDLED_PATH_MODE: mode });
 		if (!expected.includes(output)) throw new Error("The user Path could not be changed");
+		return output;
 	};
 	return { add: (entry) => edit("add", entry, ["added", "present"]), remove: (entry) => edit("remove", entry, ["removed", "absent"]) };
 }

@@ -34,7 +34,7 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
-import { resolveGentleAiBinary } from "./gentle-ai-binary.ts";
+import { gentleAiIsolationEnv, resolveGentleAiBinary } from "./gentle-ai-binary.ts";
 import {
 	INPROCESS_REVIEWER_FAILURE,
 	runInProcessReviewer,
@@ -501,7 +501,8 @@ function collectGentleAiProcess(
 		const startedAt = Date.now();
 		const child = spawn(file, [...arguments_], {
 			cwd: options.cwd,
-			env: options.env,
+			// S9: a bundled install keeps Gentle AI's state inside its prefix.
+			env: gentleAiIsolationEnv(options.env),
 			stdio: ["pipe", "pipe", "pipe"],
 			shell: false,
 			windowsHide: true,

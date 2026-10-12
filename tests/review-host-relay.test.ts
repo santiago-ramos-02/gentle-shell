@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createNodeExecFileAdapter } from "../lib/native-review-cli.ts";
+import { setBundledInstallForTesting } from "../lib/gentle-shell-bundled.ts";
 import { INPROCESS_REVIEWER_FAILURE, type InProcessReviewerOutcome, type InProcessReviewerRequest, type InProcessReviewerDeps, runInProcessReviewer } from "../lib/inprocess-reviewer.ts";
 import {
 	REVIEW_HOST_RELAY_FAILURE,
@@ -53,7 +54,7 @@ const FAKE_GENTLE_AI = `#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
 const argv = process.argv.slice(2);
-if (process.env.RELAY_FAKE_LOG) fs.appendFileSync(process.env.RELAY_FAKE_LOG, JSON.stringify({ argv, cwd: process.cwd(), contract: process.env.${GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV} ?? null }) + "\\n");
+if (process.env.RELAY_FAKE_LOG) fs.appendFileSync(process.env.RELAY_FAKE_LOG, JSON.stringify({ argv, cwd: process.cwd(), contract: process.env.${GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV} ?? null, home: process.env.GENTLE_AI_HOME ?? null }) + "\\n");
 if (argv.some((token) => token === "--materialize" || token.startsWith("--materialize="))) {
 	const mode = process.env.RELAY_FAKE_MATERIALIZE_MODE || "ok";
 	if (mode === "ok") { process.stdout.write(Buffer.from(process.env.RELAY_FAKE_PROMPT_B64 || "", "base64")); process.exit(0); }
@@ -137,7 +138,7 @@ function harness(t: test.TestContext, overrides: Record<string, string> = {}): R
 	return { directory, gentleAi, logPath, submitCapturePath, targetCwd, environment };
 }
 
-function readLog(path: string): Array<{ argv: string[]; contract: string | null; cwd?: string }> {
+function readLog(path: string): Array<{ argv: string[]; contract: string | null; cwd?: string; home?: string | null }> {
 	if (!existsSync(path)) return [];
 	return readFileSync(path, "utf8").split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line));
 }
@@ -271,6 +272,24 @@ test("the central native CLI runner declares the relay contract on every gentle-
 		assert.equal(result.exitCode, 0);
 		assert.deepEqual(JSON.parse(result.stdout), { contract: GENTLE_PI_REVIEW_RELAY_CONTRACT });
 	}
+});
+
+// S9: in a bundled install (the testing overlay stands in for this package
+// running from it) both relay invocations get Gentle AI's isolation
+// variables; otherwise neither does.
+test("both relay gentle-ai invocations carry Gentle AI's isolation variables only in a bundled install", async (t) => {
+	const ordinary = harness(t);
+	await runRelay(ordinary);
+	assert.deepEqual(readLog(ordinary.logPath).map((call) => call.home), [null, null]);
+	const prefix = realpathSync(mkdtempSync(join(tmpdir(), "gentle-ai-isolation-relay-")));
+	setBundledInstallForTesting({ root: prefix });
+	t.after(() => {
+		setBundledInstallForTesting(undefined);
+		rmSync(prefix, { recursive: true, force: true });
+	});
+	const bundled = harness(t, { GENTLE_SHELL_PREFIX: prefix });
+	await runRelay(bundled);
+	assert.deepEqual(readLog(bundled.logPath).map((call) => call.home), [join(prefix, "gentle-ai"), join(prefix, "gentle-ai")]);
 });
 
 test("relay contract constants are the compiled gentle-ai handshake values", () => {
