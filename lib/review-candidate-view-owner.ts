@@ -23,6 +23,11 @@ export function setWindowsAclAuthorityForTesting(authority?: WindowsAclAuthority
 	testingWindowsAclAuthority = authority;
 }
 
+let testingWindowsDaclWrite: ((path: string) => void) | undefined;
+export function observeWindowsDaclWritesForTesting(observer?: (path: string) => void): void {
+	testingWindowsDaclWrite = observer;
+}
+
 const WINDOWS_SYSTEM = "S-1-5-18";
 const WINDOWS_ADMINISTRATORS = "S-1-5-32-544";
 const WINDOWS_SYSTEM_DIRECTORY = "\\\\?\\GLOBALROOT\\SystemRoot\\System32";
@@ -198,8 +203,23 @@ function assertPrivateWindowsDacl(path: string, kind: WindowsObjectKind, protect
 	validatePrivateWindowsDacl(windowsDacl(path), identity.user, protectedDacl, identity.localAdministrator);
 }
 
+function hasPrivateWindowsDacl(path: string, identity: WindowsAclIdentity): boolean {
+	try {
+		validatePrivateWindowsDacl(windowsDacl(path), identity.user, true, identity.localAdministrator);
+		return true;
+	} catch (error) {
+		if (error instanceof WindowsDaclValidationError) return false;
+		throw error;
+	}
+}
+
 function enforcePrivateWindowsDacl(path: string, identity: WindowsAclIdentity = windowsAclIdentity()): void {
 	validatePrivateWindowsOwner(windowsOwnerSid(path, "directory"), identity.user);
+	// Writing an inheritable DACL makes Windows propagate it to every descendant,
+	// which on a large Git common directory outlasts the system probe timeout.
+	// A boundary that is already private keeps its DACL untouched.
+	if (hasPrivateWindowsDacl(path, identity)) return;
+	testingWindowsDaclWrite?.(path);
 	const { user, localAdministrator } = identity;
 	const sddl = `D:P(A;OICI;FA;;;${user})(A;OICI;FA;;;${WINDOWS_SYSTEM})(A;OICI;FA;;;${WINDOWS_ADMINISTRATORS})`;
 	const script = "$ErrorActionPreference='Stop';$acl=New-Object System.Security.AccessControl.DirectorySecurity;$acl.SetSecurityDescriptorSddlForm($env:GENTLE_PI_CANDIDATE_ACL_SDDL,[System.Security.AccessControl.AccessControlSections]::Access);[System.IO.Directory]::SetAccessControl($env:GENTLE_PI_CANDIDATE_ACL_PATH,$acl)";
