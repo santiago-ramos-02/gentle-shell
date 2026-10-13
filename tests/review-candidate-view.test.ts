@@ -24,7 +24,7 @@ import {
 	resolveCanonicalCandidateBase,
 	type NativeCandidateProjectionDescriptor,
 } from "../lib/review-candidate-view.ts";
-import { assertCandidateOwnerParent, assertTrustedWindowsOwner, prepareCandidateOwnerParent, setWindowsAclAuthorityForTesting, validatePrivateWindowsDacl, validatePrivateWindowsOwner, WindowsDaclValidationError, WindowsOwnerValidationError } from "../lib/review-candidate-view-owner.ts";
+import { assertCandidateOwnerParent, assertTrustedWindowsOwner, observeWindowsDaclWritesForTesting, prepareCandidateOwnerParent, setWindowsAclAuthorityForTesting, validatePrivateWindowsDacl, validatePrivateWindowsOwner, WindowsDaclValidationError, WindowsOwnerValidationError } from "../lib/review-candidate-view-owner.ts";
 
 function git(cwd: string, ...arguments_: string[]): string {
 	return execFileSync("git", arguments_, { cwd, encoding: "utf8" }).trim();
@@ -227,7 +227,14 @@ test("private candidate owner removes unrelated explicit Windows grants during e
 		const before = readFileSync(join(parent, archive), "utf16le").match(/D:[^\r\n]+/)?.[0];
 		assert.ok(before);
 		assert.match(before, /;;;(?:BU|S-1-5-32-545)\)/i);
-		assert.doesNotThrow(() => prepareCandidateOwnerParent(commonDir));
+		const written: string[] = [];
+		observeWindowsDaclWritesForTesting((path) => written.push(path));
+		try {
+			assert.doesNotThrow(() => prepareCandidateOwnerParent(commonDir));
+		} finally {
+			observeWindowsDaclWritesForTesting();
+		}
+		assert.deepEqual(written, [parent]);
 		execFileSync(`${system}\\System32\\icacls.exe`, [parent, "/save", archive, "/c"], { cwd: parent, encoding: "utf8" });
 		const after = readFileSync(join(parent, archive), "utf16le").match(/D:[^\r\n]+/)?.[0];
 		assert.ok(after);
@@ -235,6 +242,24 @@ test("private candidate owner removes unrelated explicit Windows grants during e
 	} finally {
 		rmSync(join(parent, archive), { force: true });
 	}
+});
+
+test("private candidate owner leaves an already private Windows boundary DACL unwritten", { skip: process.platform !== "win32" }, (t) => {
+	const cwd = repository(t), commonDir = join(cwd, ".git");
+	new CandidateViewRegistry().create({ contributorRoot: cwd }).cleanup();
+	// Rewriting the inheritable boundary DACL propagates to every descendant,
+	// which on a large repository outlasts the system probe timeout.
+	const written: string[] = [];
+	observeWindowsDaclWritesForTesting((path) => written.push(path));
+	try {
+		assert.doesNotThrow(() => prepareCandidateOwnerParent(commonDir));
+		const view = new CandidateViewRegistry().create({ contributorRoot: cwd });
+		view.cleanup();
+	} finally {
+		observeWindowsDaclWritesForTesting();
+	}
+	assert.deepEqual(written, []);
+	assert.equal(assertCandidateOwnerParent(commonDir, "win32"), join(commonDir, "gentle-ai", "candidate-views"));
 });
 
 test("candidate contributor root accepts canonical Windows Git path spelling", { skip: process.platform !== "win32" }, (t) => {
