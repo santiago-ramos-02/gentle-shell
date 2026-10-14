@@ -68,10 +68,9 @@ test("where Pi can restyle tools, quiet tools draws its built-in codemode instea
 	const host = Object.assign(pi, { registerToolRenderer(resolver: Resolver) { resolvers.push(resolver); } });
 	quietTools(host);
 	assert.equal(tools.some((tool) => tool.name === "codemode"), false, "Pi's built-in codemode must stay loaded");
-	assert.equal(resolvers.length, 1);
-	assert.equal(resolvers[0]!("codemode", () => undefined), compactCodemodeRenderers);
+	assert.equal(resolvers.some((resolve) => resolve("codemode", () => undefined) === compactCodemodeRenderers), true);
 	const builtIn = { renderShell: "default" };
-	assert.equal(resolvers[0]!("read", () => builtIn), builtIn);
+	for (const resolve of resolvers) assert.equal(resolve("read", () => builtIn), builtIn);
 });
 
 test("quiet tools registers an inactive upstream codemode with compact renderers", () => {

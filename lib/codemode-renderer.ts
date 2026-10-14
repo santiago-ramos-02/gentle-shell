@@ -188,12 +188,8 @@ function textOutput(result: AgentToolResult<unknown>, showImages: boolean): stri
 		: item.type === "image" && showImageFallback ? [imageFallback(safe(item.mimeType))] : []);
 }
 
-/** Pi 1.0.1's hook for drawing any tool, built-in or not; older Pi does not have it. */
-type ToolRendererHost = {
-	registerToolRenderer(resolver: (toolName: string, next: () => CodemodeRenderers | undefined) => CodemodeRenderers | undefined): void;
-};
-
-export function hasToolRenderers(pi: ExtensionAPI): pi is ExtensionAPI & ToolRendererHost {
+/** Pi 1.0.1's hook for drawing any tool, built-in or not; older Pi does not have it at runtime. */
+export function hasToolRenderers(pi: ExtensionAPI): boolean {
 	return "registerToolRenderer" in pi && typeof pi.registerToolRenderer === "function";
 }
 
