@@ -340,9 +340,16 @@ test("AC6: parallel writers need disjoint Allowed edit surfaces (runtime-enforce
 	const harness = read("extensions/gentle-ai.ts");
 	const docs = read("docs/readme-reference.md");
 	assert.ok(core.includes(`- P${rule}.`), "core Safety must carry the relaxed writer rule");
-	assert.ok(harness.includes(`- P${rule}.`), "harness principles must carry the relaxed writer rule");
-	for (const [path, text] of Object.entries({ core, delegation, harness, skill, docs })) {
+	// S11 T3: deduplicated. The harness principle repeated core Safety in the same
+	// parent prompt; the rendered prompt now carries the rule once, from Safety.
+	assert.ok(!harness.includes(rule), "harness principles restate the core Safety writer rule");
+	for (const persona of ["gentleman", "neutral"] as const) {
+		assert.equal(__testing.buildGentlePrompt(persona).split(rule).length - 1, 1, `[${persona}] the parent prompt must carry the writer rule once`);
+	}
+	for (const [path, text] of Object.entries({ core, delegation, skill, docs })) {
 		assert.ok(text.includes(rule), `${path} is missing the relaxed writer rule`);
+	}
+	for (const [path, text] of Object.entries({ core, delegation, harness, skill, docs })) {
 		for (const retired of ["single-threaded", "Never run parallel writers in one worktree", "do not run parallel writers unless isolated worktrees", "preserves a single writer thread", "one writer per task"]) {
 			assert.ok(!text.includes(retired), `${path} keeps the single-writer wording: ${retired}`);
 		}

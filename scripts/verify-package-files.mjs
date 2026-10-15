@@ -53,6 +53,7 @@ export const requiredPaths = [
   "scripts/npm-pack-result.mjs",
   "assets/orchestrator.md",
   "assets/orchestrator-delegation.md",
+  "assets/orchestrator-delegation-reference.md",
   "assets/orchestrator-tracking.md",
   "assets/orchestrator-verification.md",
   "assets/orchestrator-writer.md",
