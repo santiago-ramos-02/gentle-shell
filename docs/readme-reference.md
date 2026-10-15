@@ -16,7 +16,7 @@ ODD runs on every request, without the user asking for a workflow, a plan, or ta
 3. **Resolve uncertainty** — optional research or one focused product question only for a real unresolved decision.
 4. **Classify** — by the Task Size section: small when understood, risk is contained, and the work could be resumed from the request plus `git diff`; large only when that resume test fails. Counts never classify.
 5. **Track before the first write** — create the feature document and Engram mirror automatically for large work, and tell the user in one line.
-6. **Implement task by task** — route each task through the smallest safe workflow, with configured TDD and applicable checks. Every task closes with at least one work-unit commit on the feature branch (branch first when on the default branch), with tests and docs alongside the behavior, using a Conventional Commit message; the feature document records the commit identity as evidence.
+6. **Implement task by task** — route each task through the smallest safe workflow, with configured TDD and applicable checks. Commit work units in reviewable slices of about 400 authored changed lines on the feature branch (branch first when on the default branch), with tests and docs alongside the behavior and a Conventional Commit message; a unit whose Risk line names a high-risk item gets its own commit so native review can take it alone, and the last slice closes the feature; the feature document records the commit that holds each task as evidence.
 7. **Close** — report the verified outcome, failed/pending checks, and the next step. The native review candidate is a work-unit commit or a PR slice, never a TODO checkbox and never the accumulated feature branch.
 
 - **One feature document:** `odd/tasks/<feature-name>.md` holds objective, problem, why, scope, constraints, actionable checklist with stable IDs and acceptance criteria, verification evidence, progress, and next step. Project-scoped Engram topic `odd/<feature-name>/tasks` mirrors the full document and repository-relative locator. Keep concise rationale for meaningful accepted changes here, not a separate plan or exhaustive journal. Accepted user, review, or verification changes update intent and tasks together; preserve valid completed work, add new tasks or reopen invalidated items with reasons. Findings alone do not authorize expansion or acceptance. Routine corrections stay with their tasks; checkoffs require observed proof.
@@ -57,7 +57,7 @@ flowchart TD
     TC --> M[Implement next authorized task]
     M --> N[Applicable functional checks]
     N --> O[Record truthful results; update tracked intent, tasks and mirror]
-    O --> OC[Close task with a work-unit commit]
+    O --> OC[Commit at a slice boundary; a high-risk unit alone]
     OC --> P{Authorized work remains?}
     P -->|Yes| M
     P -->|No| Q{RDD enabled at work-unit commit boundary?}
@@ -714,6 +714,8 @@ parent git/status + clarify → one worker writes authorized fixes → focused v
 `scout`/`context-builder` save parent context by compressing broad exploration. `worker` runs one bounded writer thread; parallel writers only with disjoint Allowed edit surfaces (runtime-enforced) or isolated worktrees.
 
 "Runtime-enforced" means an admission-time check inside one Pi process: when `subagent_run` or `subagent_continue` queues a bounded writer, it is rejected if a queued or running writer of the same parent process, in the same worktree, has an overlapping `## Allowed edit surfaces` entry. Writers are keyed by their canonical worktree root (the realpath of the Git worktree root, or the realpath of the cwd outside Git), so a subdirectory cwd, the root itself, and a symlinked spelling count as one worktree. It is not a write-time guard: it does not stop a writer from editing outside its declared surfaces, and separate Pi parent processes do not coordinate with each other. Overlap is conservative: an entry also covers everything under it, a whole-segment `**` covers any depth, while `**` inside a segment (for example `src/**.ts`) matches within that one segment, like minimatch. Entries compare in Unicode NFC. Entries with bracket classes, extglob groups, backslashes, or nested, unbalanced, or `/`-spanning braces overlap every other entry, and a wildcard never proves two entries disjoint when either contains non-ASCII characters. A quarantined writer whose process exit is unconfirmed keeps its surfaces until the exit is confirmed; a process that survives quarantine keeps both its surface claim and its concurrency slot until its exit is observed, which can last for the parent's lifetime. Any RDD-specific actor behavior belongs to the runtime instruction supplied by Gentle AI, not to this README.
+
+A second admission check stops small-task delegation: in the primary session, a `gentle-ai-worker` or `worker` launch is admitted only when its task or context has a line that starts with `Spec: odd/tasks/<feature>.md` and names a task `T<n>` later on that line (for example `, T2, S3` or the delegation card's `(read until "## Log"). Do T2; S3.`), where the document is a regular file under the writer root's `odd/tasks/` after resolving symlinks, or when the parent's measured context (`getContextUsage().tokens`) reaches the 150,000-token context backstop. Otherwise the launch is rejected with an instruction to write the unit inline. Judgment Day fix agents, read-only subagents, and continuations are not affected.
 
 ### Review authority recovery and reset safety
 
@@ -1376,7 +1378,8 @@ To opt out:
 | `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills and closes file watchers on shutdown.          |
 | `extensions/codegraph-tools.ts` | Runs workspace-scoped CodeGraph init/query/explore and keeps `.codegraph/` out of git through the worktree's local `info/exclude` (never a tracked file). |
 | `assets/orchestrator.md`       | Parent-session orchestration contract (always-on core).                                                    |
-| `assets/orchestrator-delegation.md` | Lazy-loaded delegation and routing detail, including the mirrored gentle-ai canon; indexes the per-mechanism modules below. |
+| `assets/orchestrator-delegation.md` | Lazy-loaded delegation card read when the parent delegates: the mirrored gentle-ai triggers, handoff, launch, and Key Learnings rules. |
+| `assets/orchestrator-delegation-reference.md` | Lazy-loaded delegation reference read only when named: per-action table, Work Routing Ladder, background policy, runtime bindings, canonical workflows. |
 | `assets/orchestrator-tracking.md` | Lazy-loaded large-task ODD tracking: authorization, research, checks and consent, phase signaling, RDD assess, delivery. |
 | `assets/orchestrator-verification.md` | Lazy-loaded Verification rule, native risk tiers, and writer verification contract. |
 | `assets/orchestrator-writer.md` | Lazy-loaded allowed edit surfaces and Judgment Day fix dispatch. |
