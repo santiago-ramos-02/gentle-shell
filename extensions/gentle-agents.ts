@@ -50,6 +50,7 @@ import { discoverOrchestrators } from "../lib/orchestrator-discovery.ts";
 import { consultPublishedMetadata, unavailableMetadata, type MetadataReceipt } from "../lib/orchestrator-consultation.ts";
 import { HelperCostPermission } from "../lib/orchestrator-helper-consent.ts";
 import { OrchestratorStateCache } from "../lib/orchestrator-state.ts";
+import { TODO_PROGRESS_EVENT, type TodoProgress } from "../lib/shell-todo.ts";
 import { normalizeTaskSubject } from "../lib/orchestrator-alias.ts";
 import { decodeWorkDescriptor } from "../lib/orchestrator-work.ts";
 import { validateWorkFilter, searchPublishedWork } from "../lib/orchestrator-work-search.ts";
@@ -590,6 +591,28 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		scopeCache.clear();
 		publishActivity();
 	});
+	// The todo list is the session's progress: publish it for peers so the model
+	// spends no turn on orchestrator_session_id. Merged into the owner's curated
+	// state; a publication that cannot be made never fails the todo write.
+	// Counts only: a todo title is private work text, never published to peers.
+	// The last automatic line survives an owner publication that omits `progress`.
+	let automaticProgress: { sessionId: string; text: string } | undefined;
+	const unsubscribeTodoProgress = pi.events.on(TODO_PROGRESS_EVENT, (event) => {
+		const progress = event as Partial<TodoProgress> | undefined;
+		if (!sessions || progress?.sessionId !== sessions.getSessionId() || typeof progress.done !== "number" || typeof progress.total !== "number") return;
+		const text = `${progress.done}/${progress.total} done`;
+		try {
+			const owned = stateCache.get(sessions);
+			// A state the owner withdrew stays withdrawn until the owner publishes again.
+			if (owned?.state === null) return;
+			const { progress: previous, ...curated } = owned?.state ?? {};
+			// A cleared list has no progress to report: drop the line, publish nothing new.
+			if (progress.total === 0 && previous === undefined) return;
+			stateCache.publish(sessions, progress.total === 0 ? curated : { ...curated, progress: text }, (type, data) => pi.appendEntry(type, data));
+			automaticProgress = progress.total === 0 ? undefined : { sessionId: progress.sessionId, text };
+			publishActivity();
+		} catch { /* stale session or over the state budget: keep the previous publication */ }
+	});
 	let worktrees: SessionWorktreeRegistry | undefined;
 	let worktreeManager: ExtensionContext["sessionManager"] | undefined;
 	let worktreeAuthority: (() => boolean) | undefined;
@@ -635,6 +658,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		clearTaskMetrics();
 		unsubscribeMetrics();
 		unsubscribeScope();
+		unsubscribeTodoProgress();
 		scopeCache.clear();
 	});
 	let stopAllConfirmation: Promise<void> | undefined;
@@ -1911,7 +1935,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	pi.registerTool({
 		name: "orchestrator_session_id",
 		label: "Orchestrator session ID",
-		description: "Return this host session's stable routing ID, Initial alias (FIRST TASK), Current alias (CURRENT TASK), and separate human Session name. Explicit subjects update Current even when named; Initial stays the first declared branch topic, unknown for legacy history. Before delegation or cross-session coordination, declare a short recognizable subject here. Do not require a subject declaration for small direct tasks; do not query all peers. Names never authenticate. Existing Pi names and human renames are preserved. Use a concise non-sensitive label, not a prompt. For work beyond small direct tasks, publish subject and current/next status here; refresh at task changes/completion. Owner-curated state (2048 UTF-8 bytes total): null withdraws, omission leaves unchanged. Never include credentials, internal instructions, or raw prompts. Historical notes are not consent or an owner reply.",
+		description: "Return this host session's stable routing ID, Initial alias (FIRST TASK), Current alias (CURRENT TASK), and separate human Session name. Explicit subjects update Current even when named; Initial stays the first declared branch topic, unknown for legacy history. Before delegation or cross-session coordination, declare a short recognizable subject here. Do not require a subject declaration for small direct tasks; do not query all peers. Names never authenticate. Existing Pi names and human renames are preserved. Use a concise non-sensitive label, not a prompt. Progress is published automatically from the todo list; publish state here only for objective, decisions, blockers, or work, never just to report progress. Owner-curated state (2048 UTF-8 bytes total): null withdraws, omission leaves unchanged. Never include credentials, internal instructions, or raw prompts. Historical notes are not consent or an owner reply.",
 		...orchestratorToolRenderers("session", expandHint),
 		parameters: { type: "object", additionalProperties: false, properties: {
 			subject: { type: "string", maxLength: 120, description: "Optional short task subject; updates task aliases independently of human names. Also names an unnamed Pi session." },
@@ -1933,7 +1957,20 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			if (!transport) return text("Error: session messaging is not ready.", { error: "not ready" });
 			const { subject, state } = params as { subject?: unknown; state?: unknown };
 			const declared = normalizeTaskSubject(subject);
-			if (state !== undefined || declared) stateCache.publish(ctx.sessionManager, state, (type, data) => pi.appendEntry(type, data), Date.now(), declared);
+			// An owner object without `progress` keeps the automatic todo progress still on
+			// display; null and an explicit `progress` win, and an over-budget merge does not fail the call.
+			const shown = stateCache.get(ctx.sessionManager)?.state?.progress;
+			const merged = state && typeof state === "object" && !Array.isArray(state) && !Object.hasOwn(state, "progress")
+				&& automaticProgress?.sessionId === ctx.sessionManager.getSessionId() && shown === automaticProgress.text
+				? { ...state, progress: shown } : undefined;
+			const append = (type: string, data: unknown) => pi.appendEntry(type, data);
+			if (merged) {
+				try { stateCache.publish(ctx.sessionManager, merged, append, Date.now(), declared); }
+				catch (error) {
+					if ((error as Error).message !== "invalid-published-state") throw error;
+					stateCache.publish(ctx.sessionManager, state, append, Date.now(), declared);
+				}
+			} else if (state !== undefined || declared) stateCache.publish(ctx.sessionManager, state, append, Date.now(), declared);
 			if (activeTransportFor(ctx) !== transport) throw new Error("stale-published-state");
 			if (declared && !ctx.sessionManager.getSessionName?.()) pi.setSessionName(declared);
 			const alias = sanitizeDisplayLabel(ctx.sessionManager.getSessionName?.() ?? "");

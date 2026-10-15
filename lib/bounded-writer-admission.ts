@@ -1,6 +1,7 @@
 import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, parse, relative, resolve } from "node:path";
+import { contextBackstopReached, type MeasuredContext } from "./context-backstop.ts";
 import { resolveSessionWorktree, type WorktreeResolver } from "./session-worktree-registry.ts";
 
 const WRITER_NAMES = ["gentle-ai-worker", "worker", "jd-fix-agent"];
@@ -81,9 +82,8 @@ export function rejectUnscopedBoundedWriterDispatch(input: unknown): { block: tr
 
 // Pain-point iteration S16: prompt rules alone did not stop small-task delegation (a two-feature request still
 // started two writers for ~35-line units). A generic writer launch is admitted only for a task of an existing ODD
-// feature document, or when the parent's measured context reaches the context backstop. Judgment Day fix agents
-// and continuations keep their own protocols.
-export const WRITER_CONTEXT_BACKSTOP_TOKENS = 150_000;
+// feature document, or when the parent's measured context reaches the context backstop (the same threshold as the
+// runtime notice, lib/context-backstop.ts). Judgment Day fix agents and continuations keep their own protocols.
 // A line that starts with `Spec:` (optionally as a list item), names an odd/tasks document, and names a task
 // `T<n>` later on the same line: covers the canon (`, T2, S3-S4`), the delegation card (`(read until "## Log").
 // Do T2; S3.`), and comma-free forms (`.md T1 S1;`). A mention inside prose does not start the line.
@@ -106,20 +106,27 @@ function featureDocumentExists(root: string, relativePath: string): boolean {
 	}
 }
 
+// True when a string value has a `Spec:` task line naming an existing feature document under `root`. Shared by
+// writer and verifier admission so both accept exactly the same task lines.
+export function namesExistingFeatureDocumentTask(values: readonly unknown[], root: string): boolean {
+	for (const value of values) {
+		if (typeof value !== "string") continue;
+		for (const match of value.matchAll(FEATURE_DOCUMENT_TASK)) {
+			if (featureDocumentExists(root, match[1])) return true;
+		}
+	}
+	return false;
+}
+
 export function rejectUndocumentedWriterLaunch(
 	input: unknown,
-	options: { root: string; contextTokens: number | null | undefined },
+	options: { root: string; contextUsage: MeasuredContext | undefined; env?: Readonly<Record<string, string | undefined>> },
 ): { block: true; reason: string } | undefined {
 	if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
 	const record = input as Record<string, unknown>;
 	if (typeof record.agent !== "string" || !isGenericBoundedWriter(record.agent)) return undefined;
-	for (const value of [record.task, record.context]) {
-		if (typeof value !== "string") continue;
-		for (const match of value.matchAll(FEATURE_DOCUMENT_TASK)) {
-			if (featureDocumentExists(options.root, match[1])) return undefined;
-		}
-	}
-	if (typeof options.contextTokens === "number" && options.contextTokens >= WRITER_CONTEXT_BACKSTOP_TOKENS) return undefined;
+	if (namesExistingFeatureDocumentTask([record.task, record.context], options.root)) return undefined;
+	if (contextBackstopReached(options.contextUsage, options.env)) return undefined;
 	return { block: true, reason: WRITER_FEATURE_DOCUMENT_REJECTION };
 }
 

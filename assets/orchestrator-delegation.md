@@ -11,7 +11,7 @@ Exceptions:
 - Preserve exact user quotes, UI copy, error messages, filenames, commands, and domain terms in their original language when they are evidence.
 - Ask a subagent to produce Spanish only when its output is intended to be pasted directly to the user, a PR/comment/reply in Spanish, or Spanish-language product/documentation text.
 
-Before delegating, publish subject and state via `orchestrator_session_id` (reference).
+Before delegating, declare a subject via `orchestrator_session_id` (reference).
 
 #### Delegation Triggers
 
@@ -23,7 +23,7 @@ These are parent-orchestrator routing boundaries; do not pass these rules to chi
 4. **Track:** a large task gets the feature document, Engram mirror, `todo`, and work-unit commits (`orchestrator-memory.md`).
 5. **Writer trigger (Writer rule):** a large task alone never delegates, and file count never fires this trigger. Delegate one bounded writer per unit only for a named reason: (a) parallelism — 2+ independent units of behavior with disjoint edit surfaces, each needing several minutes of work (several files or ~100+ changed lines; a subagent spends 1-2 minutes reading before it writes), launched together; (b) context — the Context backstop below. A unit is one independent piece of behavior with its code, tests, and docs together: never split one behavior into test, docs, and code writers; a delivery that depends on another is not independent; several small independent changes run inline, one after another. Units of about 100 changed lines or less always run inline: writing them costs less than starting workers. The runtime admits writers only for a feature-document task or at the measured context backstop. Never for a price ratio. Without a reason, the parent works inline, following the logbook (feature document, mirror, `todo`, work-unit commits).
 6. **Incident rule:** after a wrong `cwd`, accidental repository/worktree mutation, failed merge recovery, or environment workaround, stop and diagnose it separately before resuming.
-7. **Context backstop:** when the parent context passes ~150k tokens, pause and delegate the next bounded unit of work.
+7. **Context backstop:** when the runtime signals it, pause and delegate the next bounded unit of work that needs several steps.
 
 **Invariants:** whoever writes, inline or delegated, reuses the existing function for shared state and keeps its invariants (ordering, uniqueness, validation, normalization); writer prompts name those helpers (`orchestrator-writer.md`).
 

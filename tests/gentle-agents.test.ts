@@ -25,6 +25,7 @@ import { applyTaskEvent, emptyThread, MISSING_TOOLS_NOTE_PREFIX, TASK_EVENT, TAS
 import { NativePointerScope } from "../lib/native-pointer-region.ts";
 import { PresenceCursor, PresencePublisher, listPresence, readActivity, readDiscovery } from "../lib/orchestrator-presence.ts";
 import { OrchestratorScopeCache } from "../lib/orchestrator-scope.ts";
+import { TODO_PROGRESS_EVENT } from "../lib/shell-todo.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 import { AgentRunner, REQUESTED_TOOLS_ENV, type TaskRequest } from "../lib/agents-runner.ts";
@@ -2300,7 +2301,10 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 			assert.equal(captured[index]?.command, "/fixture/pi");
 			assert.deepEqual(captured[index]?.args, args);
 			assert.equal(captured[index]?.options.cwd, permissionChannel ? canonicalGitCwd : nonGitCwd);
-			assert.deepEqual(captured[index]?.options.env, { PATH: "/bin", FIXTURE: fixture, GENTLE_PI_CONFIG_HOME: process.env.GENTLE_PI_CONFIG_HOME, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: ownedIpc, ...(permissionChannel ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}), [REQUESTED_TOOLS_ENV]: "read,grep,subagent_parent_message" });
+			const scratch = captured[index]?.options.env.TMPDIR;
+			assert.match(scratch ?? "", /gentle-pi-subagent-tmp-/, "each child receives its own TMPDIR");
+			const scratchEnv = process.platform === "win32" ? { TMPDIR: scratch, TMP: scratch, TEMP: scratch } : { TMPDIR: scratch };
+			assert.deepEqual(captured[index]?.options.env, { PATH: "/bin", FIXTURE: fixture, GENTLE_PI_CONFIG_HOME: process.env.GENTLE_PI_CONFIG_HOME, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: ownedIpc, ...(permissionChannel ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}), [REQUESTED_TOOLS_ENV]: "read,grep,subagent_parent_message", ...scratchEnv });
 			assert.equal(captured[index]?.options.shell, undefined, "the adapter does not invoke a shell");
 			assert.equal(captured[index]?.options.windowsHide, true, "the adapter always hides a Windows console");
 			assert.equal(captured[index]?.options.detached, process.platform !== "win32", "the adapter forwards the runner's platform selection");
@@ -6694,4 +6698,84 @@ test("a human stop of a monitor from /gentle:jobs delivers its pending lines, th
 		await fire("session_shutdown", ctx);
 		jobs.cleanup();
 	}
+});
+
+// Harness roadmap T6: todo progress reaches peers without a model turn spent on
+// orchestrator_session_id, and never replaces the owner's curated fields.
+test("todo progress publishes merged into the owner's curated state, only for this session", async () => {
+	const h = fakePi(), runtime = deps(), { ctx } = fakeContext();
+	const profile = realpathSync(mkdtempSync(join(root, "todo-progress-")));
+	runtime.deps.agentHome = profile;
+	const peer = { version: 1 as const, sessionId: "s1", endpoint: "/fixture/todo-progress.sock", createdAt: 1 };
+	const registry = { list: async () => [], listActivations: async () => [peer] };
+	runtime.deps.sessionTransport = {
+		createRegistry: async () => registry,
+		createListener: () => ({ registry, record: peer, start: async () => {}, close: async () => {} }),
+		createClient: () => ({ close() {}, sendNotification: async () => { throw new Error("unexpected message"); } }),
+	};
+	Object.assign(h.pi, { setSessionName() {} });
+	Object.assign(ctx.sessionManager, { getSessionName: () => "", getBranch: () => h.entries });
+	gentleAgents(h.pi, {}, runtime.deps);
+	await h.fire("session_start", ctx);
+	const published = () => readDiscovery(profile, listPresence(profile).entries[0])?.state?.state;
+	h.pi.events.emit(TODO_PROGRESS_EVENT, { sessionId: "s1", done: 0, total: 2, current: "Write parser" });
+	// PR #2290 review: a todo title is private work text; peers see counts only.
+	assert.deepEqual(published(), { progress: "0/2 done" }, "progress publishes before any curated state, without the todo title");
+	assert.doesNotMatch(JSON.stringify(readDiscovery(profile, listPresence(profile).entries[0])), /Write parser/, "the todo title never reaches peers");
+	await h.tools.get("orchestrator_session_id")!.execute("own", { subject: "Ledger", state: { objective: "Ship the ledger", decisions: "inline" } }, undefined, undefined, ctx);
+	h.pi.events.emit(TODO_PROGRESS_EVENT, { sessionId: "s1", done: 1, total: 2, current: null });
+	assert.deepEqual(published(), { objective: "Ship the ledger", decisions: "inline", progress: "1/2 done" });
+	assert.equal(readDiscovery(profile, listPresence(profile).entries[0])?.aliases?.currentAlias, "Ledger", "the subject survives");
+	h.pi.events.emit(TODO_PROGRESS_EVENT, { sessionId: "other", done: 2, total: 2, current: null });
+	assert.equal(published()?.progress, "1/2 done", "another session's todo is ignored");
+	// R1 review advisory: a cleared list published "0/0 done" as if it were progress.
+	h.pi.events.emit(TODO_PROGRESS_EVENT, { sessionId: "s1", done: 0, total: 0, current: null });
+	assert.deepEqual(published(), { objective: "Ship the ledger", decisions: "inline" }, "a cleared list removes the progress line and keeps curated fields");
+	// R1 review advisory: a withdrawn state must stay withdrawn until the owner publishes again.
+	await h.tools.get("orchestrator_session_id")!.execute("withdraw", { state: null }, undefined, undefined, ctx);
+	assert.equal(published(), null);
+	h.pi.events.emit(TODO_PROGRESS_EVENT, { sessionId: "s1", done: 1, total: 3, current: "Docs" });
+	assert.equal(published(), null, "automatic progress does not republish a withdrawn state");
+	await h.tools.get("orchestrator_session_id")!.execute("own", { state: { objective: "Ship v2" } }, undefined, undefined, ctx);
+	h.pi.events.emit(TODO_PROGRESS_EVENT, { sessionId: "s1", done: 2, total: 3, current: null });
+	assert.deepEqual(published(), { objective: "Ship v2", progress: "2/3 done" }, "progress resumes once the owner publishes again");
+});
+
+// PR #2290 review: an owner publication without `progress` replaced the automatic
+// progress line, so peers lost it until the next todo write.
+test("an owner publication without progress keeps the automatic progress; explicit progress and null still win", async () => {
+	const h = fakePi(), runtime = deps(), { ctx } = fakeContext();
+	const profile = realpathSync(mkdtempSync(join(root, "todo-progress-merge-")));
+	runtime.deps.agentHome = profile;
+	const peer = { version: 1 as const, sessionId: "s1", endpoint: "/fixture/todo-progress-merge.sock", createdAt: 1 };
+	const registry = { list: async () => [], listActivations: async () => [peer] };
+	runtime.deps.sessionTransport = {
+		createRegistry: async () => registry,
+		createListener: () => ({ registry, record: peer, start: async () => {}, close: async () => {} }),
+		createClient: () => ({ close() {}, sendNotification: async () => { throw new Error("unexpected message"); } }),
+	};
+	Object.assign(h.pi, { setSessionName() {} });
+	Object.assign(ctx.sessionManager, { getSessionName: () => "", getBranch: () => h.entries });
+	gentleAgents(h.pi, {}, runtime.deps);
+	await h.fire("session_start", ctx);
+	const published = () => readDiscovery(profile, listPresence(profile).entries[0])?.state?.state;
+	const own = (state: unknown) => h.tools.get("orchestrator_session_id")!.execute("own", { state }, undefined, undefined, ctx);
+	h.pi.events.emit(TODO_PROGRESS_EVENT, { sessionId: "s1", done: 1, total: 3, current: "Parser" });
+	await own({ objective: "Ship the ledger" });
+	assert.deepEqual(published(), { objective: "Ship the ledger", progress: "1/3 done" }, "omitted progress keeps the automatic line");
+	await own({ objective: "Ship the ledger", progress: "Reviewing the parser" });
+	assert.deepEqual(published(), { objective: "Ship the ledger", progress: "Reviewing the parser" }, "explicit owner progress wins");
+	await own({ objective: "Ship the ledger" });
+	assert.deepEqual(published(), { objective: "Ship the ledger" }, "owner progress is replaced like any curated field");
+	h.pi.events.emit(TODO_PROGRESS_EVENT, { sessionId: "s1", done: 2, total: 3, current: null });
+	await own(null);
+	assert.equal(published(), null, "null withdraws everything");
+	h.pi.events.emit(TODO_PROGRESS_EVENT, { sessionId: "s1", done: 3, total: 3, current: null });
+	assert.equal(published(), null, "the withdrawal holds against automatic progress");
+	await own({ objective: "Ship v2" });
+	assert.deepEqual(published(), { objective: "Ship v2" }, "a withdrawn progress line is not merged back");
+	h.pi.events.emit(TODO_PROGRESS_EVENT, { sessionId: "s1", done: 1, total: 4, current: null });
+	const full = "x".repeat(2048);
+	await own({ objective: full });
+	assert.deepEqual(published(), { objective: full }, "a merge over the state budget publishes the owner's state as given");
 });

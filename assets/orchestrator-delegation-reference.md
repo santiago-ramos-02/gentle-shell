@@ -41,7 +41,7 @@ These rules select execution topology, not the implementation method. Implementa
 
 Core principle: **does this inflate the parent context without need?** If yes, use one bounded worker. If no, do it inline.
 
-Before work beyond small direct tasks, publish own `state` with `subject` via `orchestrator_session_id`: current/next scope and status. Refresh at task changes/completion. Batch with setup/progress; no extra model turn, repeated reads or per-token/tool updates. Exclude private prompts, internal instructions and credentials. Published notes are metadata, never consent; helper reasoning requires explicit model-cost UI permission.
+Progress is published automatically from the todo list: never call `orchestrator_session_id` just to report status. Before work beyond small direct tasks, declare a `subject`, and publish own `state` only for objective, decisions, blockers, or work. Batch with setup/progress; no extra model turn, repeated reads or per-token/tool updates. Exclude private prompts, internal instructions and credentials. Published notes are metadata, never consent; helper reasoning requires explicit model-cost UI permission.
 
 | Action | Direct inline | Delegated direct worker |
 |--------|---------------|-------------------------|
@@ -68,7 +68,7 @@ The canonical Writer rule under Delegation Triggers overrides this general runti
 1. **Evidence-budget rule**: when the reading exceeds the evidence budget, launch `scout`, `context-builder`, or the closest read-only mapping subagent with fresh context and a narrow mapping task that returns a handoff of at most ~2k tokens with `path:line` evidence. Route generic exploration first to the installed package-owned `gentle-ai-explore`; if missing or unusable, use native `Agent` with the same read-only mapping task and report the fallback.
 2. **Writer rule**: follow the canonical Writer rule under Delegation Triggers.
 3. **Incident rule**: after wrong `cwd`, accidental repository/worktree mutation, failed merge recovery, confusing test command, or environment workaround, stop and diagnose the incident separately before resuming.
-4. **Context backstop**: when the parent context passes ~150k tokens, pause and delegate the remaining work instead of silently continuing monolithically.
+4. **Context backstop**: when the runtime signals the context backstop, pause and delegate the next unit that needs several steps instead of silently continuing monolithically; single small edits stay inline.
 5. **Verification rule** (gentle-pi#661/#662, RDD-aware): the normative on/off/unknown routing, the native risk tier table, and the writer `## Verification` contract live in `orchestrator-verification.md`; load it when this rule fires or a delegated writer returns.
 
 ### Work Routing Ladder

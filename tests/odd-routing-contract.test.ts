@@ -10,7 +10,9 @@ const read = (path: string) => readFileSync(join(import.meta.dirname, "..", path
 const core = read("assets/orchestrator.md");
 const delegation = readDelegationDetail();
 const memory = read("assets/orchestrator-memory.md");
-const wrapper = read("extensions/gentle-ai.ts");
+// The harness as rendered by extensions/gentle-ai.ts, including the ODD steps
+// it takes from the mirrored provider bundle's routing/pi.md.
+const wrapper = __testing.buildGentlePrompt("gentleman");
 
 function containsAll(text: string, clauses: readonly string[]): void {
 	for (const clause of clauses) assert.ok(text.includes(clause), `missing contract: ${clause}`);
@@ -28,7 +30,7 @@ test("organic entry stays read-only without authorization and loads detail befor
 	containsAll(wrapper, [
 		"Default workflow: Organic Driven Development (MANDATORY)",
 		"Every request enters it",
-		"Detail for steps 3–7: \\`orchestrator-delegation.md\\` and \\`orchestrator-memory.md\\`.",
+		"Detail for steps 3–7: `orchestrator-delegation.md` and `orchestrator-memory.md`.",
 	]);
 	containsAll(delegation, [
 		"Investigation, explanation, review, comparison, and proposal-only requests remain read-only",
@@ -421,7 +423,6 @@ test("evidence-budget numbers agree across routing surfaces and retired triggers
 			"~10k tokens",
 			"at most ~2k tokens",
 			"`path:line`",
-			"~150k tokens",
 			"Context backstop",
 		]);
 		assert.doesNotMatch(text, /4-file rule|20 tool calls|5 exploratory (?:file )?reads/, `${path} keeps a retired trigger`);
@@ -429,6 +430,20 @@ test("evidence-budget numbers agree across routing surfaces and retired triggers
 	for (const agent of ["assets/agents/gentle-ai-explore.md", "assets/agents/gentle-ai-verify.md"]) {
 		containsAll(read(agent), ["at most ~2k tokens", "`path:line`"]);
 	}
+});
+
+// Harness roadmap R1: the backstop is a measured runtime signal (min(absolute cap, fraction x window)), so the
+// prompt modules stop stating a fixed token count and only a unit needing several steps is worth delegating.
+test("context backstop prompt text defers to the runtime signal instead of a fixed token count", () => {
+	const reference = read("assets/orchestrator-delegation-reference.md");
+	for (const [path, text] of Object.entries({ "assets/orchestrator.md": core, "assets/orchestrator-delegation.md": read("assets/orchestrator-delegation.md"), "assets/orchestrator-delegation-reference.md": reference })) {
+		assert.doesNotMatch(text, /~?150k tokens/, `${path} still states a fixed backstop`);
+		assert.match(text, /\*\*Context backstop(?::\*\*|\*\*:?)[^\n]*when the runtime signals/, `${path} must defer to the runtime signal`);
+		assert.ok(text.includes("several steps"), `${path} must say only a unit needing several steps is delegated`);
+	}
+	const docs = read("docs/readme-reference.md");
+	containsAll(docs, ["GENTLE_PI_CONTEXT_BACKSTOP_TOKENS", "GENTLE_PI_CONTEXT_BACKSTOP_FRACTION", "min(", "`getContextUsage()`", "re-armed"]);
+	assert.doesNotMatch(docs, /~150k tokens|150,000-token context backstop/, "docs still describe the fixed backstop");
 });
 
 test("ODD protocol is always-on in the rendered system prompt and runs by default", () => {

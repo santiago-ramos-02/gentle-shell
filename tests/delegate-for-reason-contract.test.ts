@@ -112,10 +112,11 @@ test("T24/L49: configured per-agent model routing still applies to writers launc
 
 // Verification by named risk changed the core rule 3 text: only a named
 // high-risk item, passed as assess `escalate`, adds the independent verifier.
+// odd/tasks/verifier-admission.md S6: the rule names the runtime admission of the verifier launch.
 test("AC4: verification stays risk-gated and the writer reasons never include risk", () => {
 	assert.ok(
 		core.includes(
-			"3. **Verification rule** — only a named high-risk item (assess `escalate`) → independent `gentle-ai-verify`, as rarely as possible; else inline; gates/overengineering: `orchestrator-verification.md`.",
+			"3. **Verification rule** — only a named high-risk item (assess `escalate`) → independent `gentle-ai-verify`; else inline; runtime admission, gates/overengineering: `orchestrator-verification.md`.",
 		),
 		"core Verification rule changed",
 	);
@@ -237,13 +238,15 @@ test("T11/S4: the parent hands verify the whole spec, authorizes its probes and 
 
 // verify-always-rdd-high S1 deliberately rewrote this section: verification follows the
 // risk tier in every RDD state. Verification by named risk deliberately rewrote
-// the tier table again (escalate-only verifier, no small-model bias). The pin
-// still guards against accidental drift.
+// the tier table again (escalate-only verifier, no small-model bias), and
+// verifier admission (odd/tasks/verifier-admission.md S6) names the runtime
+// check of the verifier launch; the PR #2290 review (odd/tasks/pr-2290-review.md S4)
+// names every line that admits it. The pin still guards against accidental drift.
 test("AC4/S4: the normative verification rule text is unchanged by the review protocol", () => {
 	const normative = sectionFrom(verification, "## Verification rule (normative)");
 	assert.equal(
 		createHash("sha256").update(normative).digest("hex"),
-		"14dbcaa9169072090f91868344287838b02ed57b2ad45b90ae299b7c9a8bc3e6",
+		"b159829cad24a31e23d6309b3bfe0e4cc71eec2316775ba07314fecd1fb6a63f",
 		"the normative Verification rule section changed",
 	);
 	assert.ok(verification.includes("or a delegated writer returns"), "the module must still load when a delegated writer returns");
