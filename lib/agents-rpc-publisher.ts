@@ -15,8 +15,11 @@ export const ACTIVITY_SCHEMA = "gentle-agents.activity/v1";
  * on the wire even though they share a key. */
 export const ACTIVITY_WIDGET_KEY = "gentle-agents";
 
-/** Prompts are the field most likely to carry a long user request; keep only a preview. */
-const PROMPT_LIMIT = 200;
+/** A subagent's prompt is what it was asked, published whole so a host can show it.
+ * Still bounded, so one runaway prompt stays well under the payload limit. */
+const PROMPT_LIMIT = 32_000;
+/** The preview prompts shrink to when the payload is over its bound. */
+const PROMPT_PREVIEW_LIMIT = 200;
 /** Tool args/output can be arbitrarily large; bound each independently. */
 const TOOL_ARGS_LIMIT = 500;
 const TOOL_OUTPUT_LIMIT = 500;
@@ -205,7 +208,8 @@ function lastFinishedIndex(tasks: readonly RpcTask[]): number {
 /**
  * Serializes `activity` as one JSON line, shrinking it under `maxBytes` when
  * needed, in order: first halve every task's kept thread items (repeatedly,
- * down to one item each), then empty finished tasks' threads, then drop
+ * down to one item each), then shorten every prompt to a preview, then empty
+ * finished tasks' threads, then drop
  * whole finished tasks (oldest-finished first, by `endedAt`), and finally --
  * once only active (running/waiting/queued) tasks with one item each
  * remain -- empty every remaining task's thread too, emitting a
@@ -219,6 +223,11 @@ export function encodeActivityLines(activity: RpcActivity, maxBytes: number = DE
 
 	while (byteLength(line) > maxBytes && working.tasks.some((task) => task.thread.items.length > 1)) {
 		working = { ...working, tasks: working.tasks.map(halveThreadItems) };
+		line = JSON.stringify(working);
+	}
+
+	if (byteLength(line) > maxBytes && working.tasks.some((task) => task.summary.prompt.length > PROMPT_PREVIEW_LIMIT)) {
+		working = { ...working, tasks: working.tasks.map((task) => ({ ...task, summary: { ...task.summary, prompt: truncate(task.summary.prompt, PROMPT_PREVIEW_LIMIT) } })) };
 		line = JSON.stringify(working);
 	}
 

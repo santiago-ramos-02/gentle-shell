@@ -588,7 +588,7 @@ Every bound below fails closed: a value that cannot fit is truncated or dropped,
 
 | Field | Bound |
 |---|---|
-| `summary.prompt` | 200 characters, trailing `…` |
+| `summary.prompt` | 32000 characters, trailing `…`, so a host can show what the subagent was asked |
 | `summary.error`, `summary.label`, `summary.lastStep` | 500 characters, trailing `…` |
 | tool `args` (stringified) | 500 characters, trailing `…` |
 | tool `output` | 500 characters, trailing `…` |
@@ -601,11 +601,12 @@ Truncation always keeps the field's prefix and marks the cut with a trailing `�
 When the whole-payload bound is still exceeded after the field- and item-level truncations above, `encodeActivityLines` shrinks the payload in this order:
 
 1. Halve every task's kept `thread.items` (repeatedly, down to one item each).
-2. Empty finished tasks' threads entirely.
-3. Drop whole finished tasks — oldest-finished first, by `endedAt`.
-4. Last resort: once only active (running/waiting/queued) tasks remain, each already down to one thread item, empty every remaining task's thread too — a summary-only payload.
+2. Shorten every `summary.prompt` to a 200-character preview, trailing `…`.
+3. Empty finished tasks' threads entirely.
+4. Drop whole finished tasks — oldest-finished first, by `endedAt`.
+5. Last resort: once only active (running/waiting/queued) tasks remain, each already down to one thread item, empty every remaining task's thread too — a summary-only payload.
 
-An active task's `summary` (running, waiting or queued) is never dropped; only its `thread.items` shrink. Finished tasks can be dropped whole by step 3, oldest first.
+An active task's `summary` (running, waiting or queued) is never dropped; only its `thread.items` shrink. Finished tasks can be dropped whole by step 4, oldest first.
 
 ## Generation and watchdog progress
 

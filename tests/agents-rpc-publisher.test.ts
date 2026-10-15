@@ -121,16 +121,26 @@ test("projectRpcActivity numbers the kept thread items so a host can place each 
 	assert.deepEqual(thread.items.map((item) => ("text" in item ? item.text : "")), ["two", "three"]);
 });
 
-test("projectRpcActivity truncates the prompt, tool args, and tool output to their bounds", () => {
+test("projectRpcActivity publishes a prompt whole, bounding only a runaway one", () => {
 	const store = new TaskStore();
-	store.add(task("t1", "s1", { prompt: "x".repeat(250) }));
+	const prompt = "Fix the Ubicacion component. ".repeat(40);
+	store.add(task("t1", "s1", { prompt }));
+	store.add(task("t2", "s1", { prompt: "x".repeat(40_000) }));
+
+	const tasks = projectRpcActivity(store).tasks;
+	assert.equal(tasks.find((entry) => entry.summary.id === "t1")!.summary.prompt, prompt);
+	const runaway = tasks.find((entry) => entry.summary.id === "t2")!.summary.prompt;
+	assert.equal(runaway.length, 32_000);
+	assert.ok(runaway.endsWith("…"));
+});
+
+test("projectRpcActivity truncates tool args and tool output to their bounds", () => {
+	const store = new TaskStore();
+	store.add(task("t1", "s1"));
 	store.apply("t1", { type: TASK_EVENT.TOOL_START, callId: "c1", name: "bash", args: { note: "y".repeat(600) } }, 1);
 	store.apply("t1", { type: TASK_EVENT.TOOL_END, callId: "c1", output: "z".repeat(600), isError: false }, 2);
 
 	const activity = projectRpcActivity(store);
-	const summary = activity.tasks[0]!.summary;
-	assert.equal(summary.prompt.length, 200);
-	assert.ok(summary.prompt.endsWith("…"));
 
 	const toolItem = activity.tasks[0]!.thread.items.at(-1) as { kind: string; name: string; args: string; running: boolean; isError: boolean; output: string };
 	assert.equal(toolItem.kind, "tool");
@@ -290,6 +300,26 @@ test("encodeActivityLines halves thread items per task when only halving can hel
 	assert.equal(shrunk.tasks.length, 1);
 	assert.ok(shrunk.tasks[0]!.thread.items.length < 16, "items must have been halved down");
 	assert.ok(shrunk.tasks[0]!.thread.items.length >= 1, "halving never removes the last item on a running task");
+});
+
+test("encodeActivityLines shortens prompts to a preview before emptying any thread", () => {
+	const longPrompt = "q".repeat(20_000);
+	const activity: RpcActivity = {
+		schema: ACTIVITY_SCHEMA,
+		summary: { running: 1, queued: 0, waiting: 0, finished: 1 },
+		tasks: [rpcTask("r1", TASK_STATUS.RUNNING, null), rpcTask("f1", TASK_STATUS.COMPLETED, 100)].map((entry) => ({ ...entry, summary: { ...entry.summary, prompt: longPrompt } })),
+	};
+	const maxBytes = byteLength(JSON.stringify(activity)) - 10_000;
+
+	const [line] = encodeActivityLines(activity, maxBytes);
+	const shrunk = JSON.parse(line!) as RpcActivity;
+
+	assert.ok(byteLength(line!) <= maxBytes);
+	for (const entry of shrunk.tasks) {
+		assert.equal(entry.summary.prompt.length, 200);
+		assert.ok(entry.summary.prompt.endsWith("…"));
+		assert.equal(entry.thread.items.length, 1, "prompts shrink before any thread item is dropped");
+	}
 });
 
 test("encodeActivityLines drops a finished task's thread items before dropping the task itself", () => {
