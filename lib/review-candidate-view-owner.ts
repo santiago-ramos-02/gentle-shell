@@ -511,6 +511,10 @@ export function removeCandidateOwner(owner: CandidateViewOwner, git: Git, makeWr
 }
 
 export function sweepCandidateOwners(commonDir: string, git: Git, makeWritable: (root: string) => void, platform: NodeJS.Platform = process.platform): void {
+	// Without local boot provenance no owner can be proven dead, so the sweep could
+	// never reclaim anything (Windows always lands here). Validating each marker
+	// costs several PowerShell spawns, which stalled every session start.
+	if (localHost() === null) return;
 	try {
 		const parent = assertCandidateOwnerParent(commonDir, platform);
 		for (const name of readdirSync(parent)) {

@@ -16,6 +16,8 @@ const MANAGED_ASSETS_LOCK = "managed-assets.lock";
 const MANAGED_ASSETS_SCHEMA_VERSION = 1;
 const MANAGED_ASSETS_LOCK_TIMEOUT_MS = 5_000;
 const MANAGED_ASSETS_LOCK_RETRY_MS = 25;
+// The critical section lasts milliseconds, so a lock this old was left by a process that died.
+const MANAGED_ASSETS_LOCK_STALE_MS = 60_000;
 const LEGACY_MANAGED_ASSET_MANIFESTS = Object.freeze([
 	{ path: join(ASSETS_DIR, "migrations", "managed-assets-v0.10.7.json"), version: "0.10.7" },
 	{ path: join(ASSETS_DIR, "migrations", "managed-assets-v0.13.json"), version: "0.13.0" },
@@ -127,6 +129,36 @@ function waitForManagedAssetsLock(milliseconds        )       {
 	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
+function processIsAlive(pid        )          {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return isRecord(error) && error.code === "EPERM";
+	}
+}
+
+/**
+ * A process killed while holding the lock (for example by a host that aborts a
+ * slow session start) leaves it behind, and every later session would then spin
+ * for the whole timeout. Remove only a lock whose owner is gone or that is far
+ * older than any critical section.
+ */
+function reclaimStaleManagedAssetsLock(lockPath        )          {
+	const owner = readManagedAssetsLockOwner(lockPath);
+	try {
+		const ageMs = Date.now() - (owner?.createdAtMs ?? lstatSync(lockPath).mtimeMs);
+		if (owner !== undefined && processIsAlive(owner.pid) && ageMs <= MANAGED_ASSETS_LOCK_STALE_MS) return false;
+		if (owner === undefined && ageMs <= MANAGED_ASSETS_LOCK_STALE_MS) return false;
+		// Re-read so a lock replaced since the check is never removed.
+		if (owner !== undefined && readManagedAssetsLockOwner(lockPath)?.token !== owner.token) return false;
+		unlinkSync(lockPath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function normalizedLockDuration(value                    , fallback        )         {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0
 		? Math.floor(value)
@@ -163,6 +195,7 @@ function acquireManagedAssetsLock(
 				if (isRecord(inspectionError) && inspectionError.code === "ENOENT") continue;
 				throw inspectionError;
 			}
+			if (reclaimStaleManagedAssetsLock(lockPath)) continue;
 			if (Date.now() >= deadline) {
 				throw new Error(`Timed out acquiring managed-assets lock file ${lockPath}. Verify no installer is active before removing this exact lock file.`);
 			}
