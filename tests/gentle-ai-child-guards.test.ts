@@ -208,6 +208,23 @@ for (const child of [false, true]) {
 	});
 }
 
+// Native review tools hung when called from a codemode script (a nested call with
+// parentToolCallId), while direct calls returned at once. The runtime refuses the
+// nested form so a review never stalls the session.
+test("review tools called from inside another tool are refused; direct calls and other nested tools are not", async (t) => {
+	const { cwd } = isolate(t);
+	const h = harness(false, cwd);
+	await h.handlers.get("session_start")!({ reason: "startup" }, h.ctx);
+	const call = (toolName: string, parentToolCallId?: string) => h.handlers.get("tool_call")!({ toolName, toolCallId: "call-1", input: { operation: "status" }, ...(parentToolCallId ? { parentToolCallId } : {}) }, h.ctx) as Promise<{ block?: boolean; reason?: string } | undefined>;
+	for (const tool of ["gentle_review", "gentle_review_capture", "gentle_review_capture_group", "gentle_review_scope"]) {
+		const nested = await call(tool, "codemode-1");
+		assert.equal(nested?.block, true, tool);
+		assert.match(nested?.reason ?? "", /call it directly, never from codemode or another tool/, tool);
+	}
+	assert.equal((await call("gentle_review_scope"))?.block, undefined, "a direct review call is not refused by this guard");
+	assert.equal((await call("read", "codemode-1"))?.block, undefined, "other nested tools still run");
+});
+
 async function writeToolResult(child: boolean, t: TestContext) {
 	const { cwd } = isolate(t);
 	mkdirSync(join(cwd, "src"), { recursive: true });

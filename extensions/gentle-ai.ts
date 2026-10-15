@@ -10348,6 +10348,11 @@ function createGentleAiExtensionForTesting(
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
+		// Native review tools stalled the session when a codemode script called them
+		// (a nested call, which carries parentToolCallId); direct calls return at once.
+		if (event.toolName.startsWith("gentle_review") && typeof (event as { parentToolCallId?: unknown }).parentToolCallId === "string") {
+			return { block: true, reason: `${event.toolName} runs only as a direct tool call: call it directly, never from codemode or another tool.` };
+		}
 		const primaryToolCall = permissionEnvironment.GENTLE_PI_AGENTS_CHILD !== "1" && (processAgentEndSubagentDepth.get(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey)) ?? 0) === 0;
 		const yoloActive = primaryToolCall && await yolo.active(ctx);
 		const sensitivePathDenied = evaluateSensitivePathTool(
