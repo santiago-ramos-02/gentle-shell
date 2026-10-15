@@ -138,6 +138,16 @@ test("headless, child, empty-session, and non-Git contexts cannot offer or consu
 	assert.equal(await captureReviewSessionIdentity(context(tmpdir(), manager, "session"), {}), undefined);
 });
 
+test("an interactive RPC host, such as T3 Code, can offer and consume standing permission", async (t) => {
+	const root = repository(t);
+	const manager = {};
+	const host = { GENTLE_SHELL_INTERACTIVE_HOST: "1" };
+	assert.ok(await captureReviewSessionIdentity(context(root, manager, "session", { mode: "rpc" }), host), "the host answers Pi's RPC dialogs, so the consent dialog can reach the human");
+	assert.equal(await captureReviewSessionIdentity(context(root, manager, "session", { mode: "rpc" }), { GENTLE_SHELL_INTERACTIVE_HOST: "0" }), undefined);
+	assert.equal(await captureReviewSessionIdentity(context(root, manager, "session", { mode: "rpc" }), { ...host, GENTLE_PI_AGENTS_CHILD: "1" }), undefined);
+	assert.equal(await captureReviewSessionIdentity(context(root, manager, "session", { mode: "rpc", hasUI: false }), host), undefined);
+});
+
 test("revocation advances an epoch that prevents an older awaited UI from re-granting", async (t) => {
 	const root = repository(t);
 	const identity = await captureReviewSessionIdentity(context(root, {}, "session"), {});

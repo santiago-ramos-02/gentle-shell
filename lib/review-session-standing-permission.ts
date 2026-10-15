@@ -4,6 +4,7 @@ import { realpath } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
+import { isInteractiveMode } from "./rpc-host.ts";
 
 export const REVIEW_SESSION_PERMISSION_REGISTRY_SCHEMA = "gentle-pi.review-session-standing-permission/v1";
 export const REVIEW_SESSION_PERMISSION_REGISTRY_SYMBOL = Symbol.for(REVIEW_SESSION_PERMISSION_REGISTRY_SCHEMA);
@@ -143,8 +144,9 @@ export function resolveCanonicalGitRepositoryIdentitySync(
 	}
 }
 
-function hasInteractiveTui(context: ReviewSessionContext): boolean {
-	if (context.mode !== undefined) return context.mode === "tui";
+// The TUI, or an RPC host that answers Pi's dialogs (lib/rpc-host.ts), such as T3 Code.
+function hasInteractiveSurface(context: ReviewSessionContext, processEnv: NodeJS.ProcessEnv): boolean {
+	if (context.mode !== undefined) return isInteractiveMode(context.mode, processEnv);
 	try {
 		// Pi 0.85 exposes ctx.mode in the documented SDK surface, while its
 		// compatibility runner omits that property. In the latter, the real TUI
@@ -161,7 +163,7 @@ export async function captureReviewSessionIdentity(
 	resolveRoot: (cwd: string) => Promise<string | undefined> = resolveCanonicalGitWorktreeRoot,
 	resolveRepositoryIdentity: (cwd: string) => Promise<string | undefined> = resolveCanonicalGitRepositoryIdentity,
 ): Promise<ReviewSessionIdentity | undefined> {
-	if (processEnv.GENTLE_PI_AGENTS_CHILD === "1" || context.hasUI !== true || !hasInteractiveTui(context)) return undefined;
+	if (processEnv.GENTLE_PI_AGENTS_CHILD === "1" || context.hasUI !== true || !hasInteractiveSurface(context, processEnv)) return undefined;
 	const sessionManager = context.sessionManager;
 	if (typeof sessionManager !== "object" || sessionManager === null) return undefined;
 	const sessionId = exactSessionId(sessionManager);
