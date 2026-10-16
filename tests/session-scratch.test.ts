@@ -6,6 +6,7 @@ import { basename, dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createSessionScratchExtension, SCRATCH_COMMAND_USAGE } from "../extensions/session-scratch.ts";
+import * as scratchLib from "../lib/session-scratch.ts";
 import { gitArtifactTargets, LEDGER_VERSION, type ScratchLedger } from "../lib/session-scratch.ts";
 
 // Session scratch and artifact ledger (odd/tasks/session-scratch-ledger.md):
@@ -30,6 +31,7 @@ type ExtensionFactory = typeof createSessionScratchExtension;
 
 interface Options {
 	sessionId?: string; child?: boolean; hasUI?: boolean; confirm?: boolean; isProcessAlive?: (pid: number) => boolean; now?: () => number; platform?: NodeJS.Platform; tmp?: string;
+	processStartToken?: (pid: number) => string | undefined;
 	/** A shared process environment, as a reload re-runs the extension against the same `process.env`. */
 	env?: NodeJS.ProcessEnv;
 	/** The factory of a separately loaded module instance. */
@@ -52,7 +54,7 @@ function session(fx: Fixture, options: Options = {}) {
 		on: (name: string, handler: Handler) => { handlers.set(name, handler); },
 		registerCommand: (name: string, command: Command) => { commands.set(name, command); },
 	} as unknown as ExtensionAPI;
-	(options.factory ?? createSessionScratchExtension)({ env, isProcessAlive: options.isProcessAlive, now: options.now, platform: options.platform })(pi);
+	(options.factory ?? createSessionScratchExtension)({ env, isProcessAlive: options.isProcessAlive, processStartToken: options.processStartToken, now: options.now, platform: options.platform })(pi);
 	const ctx = {
 		cwd: fx.cwd,
 		hasUI: options.hasUI ?? true,
@@ -102,6 +104,8 @@ function writeForeignLedger(fx: Fixture, ledger: Partial<ScratchLedger> & { sess
 }
 
 const later = () => Date.now() + 2 * 3_600_000;
+// clean keeps the live scratch's entries changed in the last minute (advisories S5).
+const minutesLater = () => Date.now() + 2 * 60_000;
 
 // S2
 
@@ -574,7 +578,7 @@ test("S6: list shows the session scratch with its size and the artifacts of this
 test("S6: clean removes scratch without asking and, after one confirmation, only clean recorded worktrees and pushed clones", async (t) => {
 	const fx = fixture(t);
 	const source = origin(fx);
-	const s = session(fx);
+	const s = session(fx, { now: minutesLater });
 	await s.start();
 	const scratch = s.env.TMPDIR!;
 	writeFileSync(join(scratch, "junk.txt"), "x");
@@ -621,7 +625,7 @@ test("S6: a declined confirmation keeps every artifact; without UI clean removes
 	await declined.run("clean");
 	assert.ok(existsSync(join(fx.work, "pushed", "a.txt")));
 	await declined.shutdown();
-	const headless = session(fx, { hasUI: false, sessionId: "headless" });
+	const headless = session(fx, { hasUI: false, sessionId: "headless", now: minutesLater });
 	await headless.start();
 	writeFileSync(join(headless.env.TMPDIR!, "junk.txt"), "x");
 	await headless.bash(`cd ${fx.work} && git clone ${source} headless-pushed`, () => git(fx.work, "clone", "-q", source, "headless-pushed"));
@@ -751,7 +755,7 @@ test("S8: the reference documents the scratch dir, ledger, automatic cleanup, sw
 	const section = reference.split("### Session scratch and artifact ledger\n")[1]?.split("\n### ")[0] ?? "";
 	for (const term of [
 		"`gpXXXXXX`", "never its real path", "`TMPDIR`", "`<config home>/scratch/<session id>.json`", "atomically",
-		"`version`", "`sessionId`", "`pid`", "`processStartedAt`", "`cwd`", "`tempRoot`", "`inherited`", "`scratchDir`", "`artifacts`", "`git clone ... [<dir>]`", "`git worktree add ... <path>`",
+		"`version`", "`sessionId`", "`pid`", "`processStartedAt`", "`processStartToken`", "`cwd`", "`tempRoot`", "`inherited`", "`scratchDir`", "`artifacts`", "`git clone ... [<dir>]`", "`git worktree add ... <path>`",
 		"did not exist before the command", "recovers the live scratch from the ledger", "never removes a scratch of its own process",
 		"At session shutdown", "older than one hour", "never follows symlinks", "directly under the temp root its ledger recorded", "the ledger of a live session",
 		"`/gentle:scratch list`", "`/gentle:scratch clean`", "no uncommitted changes and no unpushed commits", "ignored files inside them are deleted too", "`git worktree remove`", "Without a UI",
@@ -761,4 +765,181 @@ test("S8: the reference documents the scratch dir, ledger, automatic cleanup, sw
 		const [action] = line.trim().split(/\s+/);
 		assert.ok(section.includes(`\`/gentle:scratch ${action}\``), `reference missing the ${action} action from the help`);
 	}
+});
+
+// Native review advisories of gentle-shell#2300 (odd/tasks/scratch-review-advisories.md).
+
+// R3-pid-reuse-liveness: a pid the system reused for another process made an
+// ended session look live, so its scratch was never swept. The comparison uses
+// the OS's own start token, never the wall clock: a clock step must not make a
+// live session look ended (review-e6f96fb8f1a7b6c5 R1-start-time-mismatch).
+test("advisories S3: a ledger counts as live only when its pid has the start token the ledger recorded; an unreadable or missing token keeps it", async (t) => {
+	const fx = fixture(t);
+	const current = new Map([[5_555_550, "linux:900"], [5_555_551, "linux:100"], [5_555_553, "linux:900"]]);
+	const cases = [
+		{ name: "gpReuseA", token: "linux:100" },
+		{ name: "gpMatchA", token: "linux:100", startedAt: "2020-01-01T00:00:00.000Z" },
+		{ name: "gpNoTime", token: "linux:100" },
+		{ name: "gpOldLed", token: undefined },
+	];
+	const dirs = cases.map(({ name }) => join(fx.base, name));
+	for (const [index, { token, startedAt }] of cases.entries()) {
+		mkdirSync(dirs[index]);
+		writeForeignLedger(fx, { sessionId: `pid-${index}`, pid: 5_555_550 + index, scratchDir: dirs[index], ...(startedAt ? { processStartedAt: startedAt } : {}), ...(token ? { processStartToken: token } : {}) });
+	}
+	const s = session(fx, { sessionId: "sweeper", isProcessAlive: () => true, processStartToken: (pid) => current.get(pid), now: later });
+	await s.start();
+	assert.equal(existsSync(dirs[0]), false, "a reused pid has another start token: the session ended and its scratch is swept");
+	assert.ok(existsSync(dirs[1]), "the same start token is the same process, whatever the wall clock says");
+	assert.ok(existsSync(dirs[2]), "a start token that cannot be read keeps the ledger live");
+	assert.ok(existsSync(dirs[3]), "a ledger without a start token keeps pid liveness");
+	const listed = await s.run("list");
+	assert.doesNotMatch(listed, /pid-[123]/, "live ledgers are not listed as ended");
+	await s.shutdown();
+});
+
+test("advisories S3: the process start token is read from the OS, stable for a process, and skipped on Windows", () => {
+	const read = (scratchLib as { processStartToken?: (pid: number, platform?: NodeJS.Platform) => string | undefined }).processStartToken;
+	assert.equal(typeof read, "function", "lib/session-scratch.ts exports processStartToken");
+	assert.equal(read!(process.pid, "win32"), undefined, "Windows checks pid liveness only");
+	assert.equal(read!(2 ** 22 + 12_345), undefined, "a pid that does not exist has no start token");
+	if (process.platform === "linux" || process.platform === "darwin") {
+		const own = read!(process.pid);
+		assert.ok(typeof own === "string" && own.length > 0, `own start token ${own}`);
+		assert.equal(read!(process.pid), own, "the token of one process never changes");
+		assert.notEqual(read!(process.ppid), own, "another process has another token");
+	}
+});
+
+test("advisories S3: the ledger records the owning process's start token", async (t) => {
+	const fx = fixture(t);
+	const s = session(fx);
+	await s.start();
+	const ledger = readLedger(fx, "s-1") as ScratchLedger & { processStartToken?: string };
+	const own = (scratchLib as { processStartToken?: (pid: number) => string | undefined }).processStartToken?.(process.pid);
+	if (process.platform === "linux") assert.match(own ?? "", /^linux:\d+$/);
+	assert.equal(ledger.processStartToken, own);
+	await s.shutdown();
+});
+
+// R1-clone-removal-orphans-linked-worktrees: removing a clone left the worktrees
+// linked to it without a repository.
+test("advisories S4: clean keeps a recorded clone with linked worktrees; a prunable one does not count", async (t) => {
+	const fx = fixture(t);
+	const source = origin(fx);
+	const s = session(fx);
+	await s.start();
+	await s.bash(`cd ${fx.work} && git clone ${source} host`, () => git(fx.work, "clone", "-q", source, "host"));
+	const host = join(fx.work, "host");
+	git(host, "worktree", "add", "-q", "--detach", join(fx.work, "linked"));
+	const out = await s.run("clean");
+	assert.equal(s.confirms.length, 0, "nothing is offered for removal");
+	assert.ok(existsSync(join(host, "a.txt")));
+	assert.ok(existsSync(join(fx.work, "linked", "a.txt")));
+	assert.match(out, /host: has linked worktrees/);
+	// Control: once the linked worktree's directory is gone it is prunable, and the clone is removable.
+	rmSync(join(fx.work, "linked"), { recursive: true, force: true });
+	await s.run("clean");
+	assert.equal(s.confirms.length, 1);
+	assert.equal(existsSync(host), false);
+	await s.shutdown();
+});
+
+// R3-clean-empties-live-tmpdir: clean emptied the live TMPDIR while a running
+// command could still be using what it had just created there.
+test("advisories S5: clean keeps the live scratch's entries changed within the minute before it started", async (t) => {
+	const fx = fixture(t);
+	let offset = 0;
+	const s = session(fx, { now: () => Date.now() + offset });
+	await s.start();
+	const scratch = s.env.TMPDIR!;
+	writeFileSync(join(scratch, "fresh.txt"), "x");
+	mkdirSync(join(scratch, "tree", "deep"), { recursive: true });
+	writeFileSync(join(scratch, "tree", "deep", "f.txt"), "x");
+	mkdirSync(join(scratch, "gaChildA"));
+	offset = 30_000;
+	const out = await s.run("clean");
+	assert.ok(existsSync(join(scratch, "fresh.txt")), "an entry changed 30 s before clean stays");
+	assert.ok(existsSync(join(scratch, "tree", "deep", "f.txt")));
+	assert.match(out, /Emptied scratch .* except .*changed in the last minute/);
+	offset = 120_000;
+	await s.run("clean");
+	assert.deepEqual(readdirSync(scratch), ["gaChildA"], "entries older than a minute go; subagent scratch stays");
+	await s.shutdown();
+});
+
+// R3-reload-fallback-inherits-scratch: a reload that could not recover the scratch
+// recorded the old scratch as the inherited TMPDIR and nested the new one in it.
+test("advisories S6: a reload that cannot recover the scratch restores the ledger's inherited TMPDIR", async (t) => {
+	const fx = fixture(t);
+	const env: NodeJS.ProcessEnv = { TMPDIR: fx.base, GENTLE_PI_CONFIG_HOME: fx.configHome };
+	const first = session(fx, { env, factory: await loadInstance("fallback-a") });
+	await first.start();
+	const old = env.TMPDIR!;
+	await first.shutdown("reload");
+	rmSync(old, { recursive: true, force: true });
+	const second = session(fx, { env, factory: await loadInstance("fallback-b") });
+	await second.start("reload");
+	assert.equal(dirname(env.TMPDIR!), fx.base, "the new scratch nests under the inherited TMPDIR, not the old scratch");
+	assert.match(basename(env.TMPDIR!), SCRATCH_NAME);
+	assert.deepEqual(readLedger(fx, "s-1").inherited, { TMPDIR: fx.base });
+	await second.shutdown("quit");
+	assert.equal(env.TMPDIR, fx.base);
+});
+
+test("advisories S6: a reload fallback whose ledger recorded TMPDIR unset creates the new scratch in the system temp dir, not the old scratch", async (t) => {
+	if (process.platform === "win32") { t.skip("os.tmpdir() reads TMP/TEMP differently on Windows"); return; }
+	const fx = fixture(t);
+	// os.tmpdir() falls back to TMP when TMPDIR is unset, which keeps the fixture under its root.
+	const saved = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, GENTLE_PI_CONFIG_HOME: process.env.GENTLE_PI_CONFIG_HOME, GENTLE_PI_AGENTS_CHILD: process.env.GENTLE_PI_AGENTS_CHILD };
+	t.after(() => { for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+	delete process.env.TMPDIR;
+	delete process.env.GENTLE_PI_AGENTS_CHILD; // The test runner may itself run inside a subagent.
+	process.env.TMP = fx.base;
+	process.env.GENTLE_PI_CONFIG_HOME = fx.configHome;
+	const first = session(fx, { env: process.env, factory: await loadInstance("unset-a") });
+	await first.start();
+	const old = process.env.TMPDIR!;
+	assert.equal(dirname(old), fx.base);
+	assert.deepEqual(readLedger(fx, "s-1").inherited, { TMPDIR: null });
+	await first.shutdown("reload");
+	rmSync(old, { recursive: true, force: true });
+	const second = session(fx, { env: process.env, factory: await loadInstance("unset-b") });
+	await second.start("reload");
+	assert.equal(dirname(process.env.TMPDIR ?? ""), fx.base, "tmpdir() is asked with the old scratch no longer in TMPDIR");
+	assert.deepEqual(readLedger(fx, "s-1").inherited, { TMPDIR: null });
+	await second.shutdown("quit");
+	assert.equal(process.env.TMPDIR, undefined);
+});
+
+test("advisories S6: a reload without a readable ledger never inherits a gpXXXXXX TMPDIR", async (t) => {
+	const fx = fixture(t);
+	const env: NodeJS.ProcessEnv = { TMPDIR: fx.base, GENTLE_PI_CONFIG_HOME: fx.configHome };
+	const first = session(fx, { env, factory: await loadInstance("lost-a") });
+	await first.start();
+	const old = env.TMPDIR!;
+	await first.shutdown("reload");
+	writeFileSync(ledgerFile(fx, "s-1"), "{}");
+	const second = session(fx, { env, factory: await loadInstance("lost-b") });
+	await second.start("reload");
+	assert.equal(dirname(env.TMPDIR!), fx.base, "the new scratch is not nested in the old one");
+	assert.notEqual(env.TMPDIR, old);
+	assert.deepEqual(readLedger(fx, "s-1").inherited, { TMPDIR: fx.base });
+	await second.shutdown("quit");
+	assert.equal(env.TMPDIR, fx.base);
+	// Control: at startup a gpXXXXXX TMPDIR (a Pi started inside another session) is inherited as it is.
+	const nested = session(fx, { sessionId: "nested", tmp: old });
+	await nested.start();
+	assert.equal(dirname(nested.env.TMPDIR!), old);
+	await nested.shutdown();
+	assert.equal(nested.env.TMPDIR, old);
+});
+
+test("advisories S7: the reference documents the advisory rules", () => {
+	const reference = readFileSync(new URL("../docs/readme-reference.md", import.meta.url), "utf8");
+	const section = reference.split("### Session scratch and artifact ledger\n")[1]?.split("\n### ")[0] ?? "";
+	for (const term of [
+		"live or quarantined subagent", "a later startup sweep", "has a start token other than the one its ledger recorded", "never through the wall clock", "cannot be read", "has linked worktrees",
+		"changed in the last minute", "recorded `inherited` values", "not a `gpXXXXXX` directory",
+	]) assert.ok(section.includes(term), `scratch reference missing ${term}`);
 });

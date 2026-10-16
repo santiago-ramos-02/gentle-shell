@@ -12,7 +12,7 @@ import { CHILD_QUERY_MAX_INFLIGHT, CHILD_QUERY_TIMEOUT_MS, parseChildFrame, vali
 import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
 import { isFinished, normalizeRpcEvent, ToolArgumentProgress, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type ChildResponseObservation, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
 import { WriterSurfaceRegistry, writerSurfaceConflictMessage } from "./writer-surfaces.ts";
-import { SUBAGENT_SCRATCH_PREFIX } from "./session-scratch.ts";
+import { holdSubagentScratch, releaseSubagentScratch, SUBAGENT_SCRATCH_PREFIX } from "./session-scratch.ts";
 
 // Gentle Agents runner. Every subagent is its own `pi --mode rpc` process:
 // the host never runs subagent work on the TUI thread. It writes JSON
@@ -583,6 +583,8 @@ export class AgentRunner {
 			// A relative TMPDIR would resolve against this process, not the child cwd.
 			// A short name and no real path: socket paths under TMPDIR are capped near 104 bytes.
 			scratchDir = mkdtempSync(join(inherited && isAbsolute(inherited) ? inherited : tmpdir(), SUBAGENT_SCRATCH_PREFIX));
+			// Session shutdown keeps it while it is held (extensions/session-scratch.ts).
+			holdSubagentScratch(scratchDir);
 			try { chmodSync(scratchDir, DIR_MODE); } catch { /* best effort */ }
 			env.TMPDIR = scratchDir;
 			if (this.processControl.platform === "win32") { env.TMP = scratchDir; env.TEMP = scratchDir; }
@@ -601,6 +603,7 @@ export class AgentRunner {
 			for (const dir of [instructionsTransportDir, scratchDir]) {
 				if (dir) try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
 			}
+			if (scratchDir) releaseSubagentScratch(scratchDir);
 			this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
 			this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error instanceof Error ? error.message : String(error)}`);
 			return;
@@ -1036,6 +1039,7 @@ export class AgentRunner {
 		// hold files there, so its scratch stays until the exit is proven.
 		if (live.scratchDir && (!live.quarantined || exitProven)) {
 			try { rmSync(live.scratchDir, { recursive: true, force: true }); } catch { /* best effort */ }
+			releaseSubagentScratch(live.scratchDir);
 			live.scratchDir = undefined;
 		}
 	}

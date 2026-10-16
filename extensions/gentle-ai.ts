@@ -274,6 +274,7 @@ import {
 	type ReviewSessionIdentity,
 } from "../lib/review-session-standing-permission.ts";
 import { herdrSetupHint } from "../lib/herdr-activity.ts";
+import { isInteractiveMode } from "../lib/rpc-host.ts";
 
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -1471,7 +1472,17 @@ Harness principles:
 - Protect the human reviewer: avoid oversized changes, surface review workload risk, and ask before turning one task into a large multi-area change.
 - Never claim persistent memory is available because of this package. Memory is provided by separate packages or MCP tools when installed and callable.
 
-${getOrchestratorPrompt(cwd, activeTools, rddStatusLine, hostMode)}`;
+${getOrchestratorPrompt(cwd, activeTools, rddStatusLine, hostMode)}${headlessDeliveryNote(hostMode)}`;
+}
+
+// Bench gate-p53-r1-BS40 x6 run 3: in a headless RPC session the ask-on-risk
+// delivery question ran before any code was written, ask_user_question was
+// unavailable, and the orchestrator printed the menu and stopped. Hosts where
+// no human can answer (the same rule ask_user_question applies) resolve that
+// question to the recommended chain. Interactive sessions render nothing here.
+function headlessDeliveryNote(hostMode: string | undefined): string {
+	if (hostMode === undefined || isInteractiveMode(hostMode)) return "";
+	return "\n\nNo human can answer questions in this session. For the ask-on-risk delivery question, do not ask: use `feature-branch-chain`, record that choice in the feature document's `## Log`, and continue. Consent, maintenance, and opaque-token prompts keep their own rules.";
 }
 
 // Matches `git [global-flags] push` — tolerates flags like -C /repo or --work-tree=/tmp

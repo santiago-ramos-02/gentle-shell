@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -20,7 +20,24 @@ export const SUBAGENT_SCRATCH_PREFIX = "ga";
 // mkdtemp appends six alphanumeric characters to the prefix.
 const SCRATCH_NAME = new RegExp(`^${SCRATCH_PREFIX}[A-Za-z0-9]{6}$`);
 const SUBAGENT_SCRATCH_NAME = new RegExp(`^${SUBAGENT_SCRATCH_PREFIX}[A-Za-z0-9]{6}$`);
+/** Whether a path's last component is named as the runtime names a session scratch. */
+export const isSessionScratchName = (path: string): boolean => SCRATCH_NAME.test(basename(path));
 export const SWEEP_GRACE_MS = 60 * 60 * 1000;
+/** `/gentle:scratch clean` keeps the live scratch's entries changed this long before it started. */
+export const CLEAN_RECENT_MS = 60_000;
+
+// The TMPDIRs of this process's live and quarantined subagents. On globalThis
+// because Pi loads every extension as its own module instance, again on /reload,
+// and a runner of an earlier instance may still hold a quarantined child.
+const LIVE_SUBAGENT_SCRATCH = Symbol.for("gentle-pi.live-subagent-scratch");
+const liveSubagentRegistry = (): Set<string> => {
+	const holder = globalThis as { [LIVE_SUBAGENT_SCRATCH]?: Set<string> };
+	return (holder[LIVE_SUBAGENT_SCRATCH] ??= new Set());
+};
+/** The runner holds a subagent TMPDIR from its creation until it removes it. */
+export const holdSubagentScratch = (dir: string): void => { liveSubagentRegistry().add(dir); };
+export const releaseSubagentScratch = (dir: string): void => { liveSubagentRegistry().delete(dir); };
+export const liveSubagentScratch = (): string[] => [...liveSubagentRegistry()];
 
 export type ArtifactKind = "clone" | "worktree";
 
@@ -36,6 +53,8 @@ export interface ScratchLedger {
 	sessionId: string;
 	pid: number;
 	processStartedAt: string;
+	/** The OS's opaque start token of the owning process (`processStartToken`); absent when it could not be read. */
+	processStartToken?: string;
 	cwd: string;
 	/** The real temp root the scratch was created directly under (the inherited TMPDIR or os.tmpdir()). */
 	tempRoot: string | null;
@@ -69,7 +88,8 @@ function isArtifact(value: unknown): value is ScratchArtifact {
 function isLedger(value: unknown): value is ScratchLedger {
 	const ledger = value as Partial<ScratchLedger> | null;
 	return typeof ledger === "object" && ledger !== null && ledger.version === LEDGER_VERSION && typeof ledger.sessionId === "string" &&
-		typeof ledger.pid === "number" && typeof ledger.processStartedAt === "string" && typeof ledger.cwd === "string" &&
+		typeof ledger.pid === "number" && typeof ledger.processStartedAt === "string" &&
+		(ledger.processStartToken === undefined || typeof ledger.processStartToken === "string") && typeof ledger.cwd === "string" &&
 		(ledger.tempRoot === null || typeof ledger.tempRoot === "string") && typeof ledger.inherited === "object" && ledger.inherited !== null &&
 		Object.values(ledger.inherited).every((value) => value === null || typeof value === "string") &&
 		(ledger.scratchDir === null || typeof ledger.scratchDir === "string") && Array.isArray(ledger.artifacts) && ledger.artifacts.every(isArtifact);
@@ -130,6 +150,30 @@ export function isProcessAlive(pid: number): boolean {
 }
 
 /**
+ * An opaque token for when the process `pid` started, as the OS reports it, or
+ * undefined when it cannot be read: always on Windows, where only pid liveness
+ * is checked. Tokens are compared for equality only, never converted to wall
+ * clock time, so a clock step cannot make a live process look like another one.
+ */
+export function processStartToken(pid: number, platform: NodeJS.Platform = process.platform): string | undefined {
+	if (!Number.isInteger(pid) || pid <= 0) return undefined;
+	try {
+		if (platform === "linux") {
+			// Field 22 counts clock ticks since boot; the command name (field 2) may hold spaces and parentheses.
+			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+			const ticks = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+			return ticks && /^\d+$/.test(ticks) ? `linux:${ticks}` : undefined;
+		}
+		if (platform === "win32") return undefined;
+		// macOS and the BSDs: the start time text as ps prints it, in a fixed locale.
+		const started = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000, env: { ...process.env, LC_ALL: "C", TZ: "UTC" }, stdio: ["ignore", "pipe", "ignore"] }).trim();
+		return started ? `ps:${started}` : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * A private `gpXXXXXX` under `base`, or undefined when it cannot be created.
  * `path` joins `base` as given, for TMPDIR (a real path can be longer, as
  * macOS `/private/var/...`); `realPath` is what the ledger and checks use.
@@ -179,28 +223,63 @@ export function scratchRefusal(ledger: ScratchLedger, ownRoot: string | undefine
 
 export type ScratchRemoval = "removed" | "absent" | "kept" | "refused";
 
+/** The latest mtime or ctime under `path`, without following symlinks; Infinity when it cannot be told. */
+function latestChange(path: string): number {
+	let latest = -Infinity;
+	const stack = [path];
+	for (let visited = 0; stack.length > 0; visited++) {
+		if (visited >= 200_000) return Infinity;
+		const current = stack.pop()!;
+		let stat;
+		try { stat = lstatSync(current); } catch (error) {
+			if (current !== path && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			return Infinity;
+		}
+		latest = Math.max(latest, stat.mtimeMs, stat.ctimeMs);
+		if (stat.isDirectory()) {
+			try { for (const name of readdirSync(current)) stack.push(join(current, name)); } catch { return Infinity; }
+		}
+	}
+	return latest;
+}
+
+export interface ScratchRemovalOptions {
+	/** Remove the entries and keep the directory, as for the live session's own scratch. */
+	contentsOnly?: boolean;
+	ownRoot: string | undefined;
+	/** Real paths of this process's live and quarantined subagent TMPDIRs: kept, and the rest of the scratch removed. */
+	liveSubagentDirs?: readonly string[];
+	/** With `contentsOnly`, an entry with anything changed at or after this time (epoch ms) is kept. */
+	keepChangedSince?: number;
+}
+
 /**
- * Removes a ledger's scratch dir, or with `contentsOnly` its entries except live
+ * Removes a ledger's scratch dir, or with `contentsOnly` its entries except
  * subagent TMPDIRs. A dir or entry holding one of `heldPaths` is kept: a
  * recorded artifact is removed only through its own checks, and the scratch dir
- * of a live session only through that session's ledger. Symlinks are never followed.
+ * of a live session only through that session's ledger. A scratch holding a
+ * live subagent TMPDIR loses its other entries only. Symlinks are never followed.
  */
-export function removeSessionScratch(ledger: ScratchLedger, heldPaths: readonly string[], options: { contentsOnly?: boolean; ownRoot: string | undefined }): ScratchRemoval {
+export function removeSessionScratch(ledger: ScratchLedger, heldPaths: readonly string[], options: ScratchRemovalOptions): ScratchRemoval {
 	const refusal = scratchRefusal(ledger, options.ownRoot);
 	if (refusal === "absent") return "absent";
 	if (refusal) return "refused";
 	const dir = ledger.scratchDir!;
 	const holdsArtifact = (path: string) => heldPaths.some((held) => isWithin(held, path));
+	const holdsSubagent = (path: string) => (options.liveSubagentDirs ?? []).some((held) => isWithin(held, path));
 	try {
 		if (!options.contentsOnly) {
 			if (holdsArtifact(dir)) return "kept";
-			rmSync(dir, { recursive: true, force: true });
-			return "removed";
+			if (!holdsSubagent(dir)) {
+				rmSync(dir, { recursive: true, force: true });
+				return "removed";
+			}
 		}
 		let kept = false;
 		for (const name of readdirSync(dir)) {
 			const path = join(dir, name);
-			if (SUBAGENT_SCRATCH_NAME.test(name) || holdsArtifact(path)) { kept = true; continue; }
+			const recent = options.contentsOnly && options.keepChangedSince !== undefined && latestChange(path) >= options.keepChangedSince;
+			if (SUBAGENT_SCRATCH_NAME.test(name) || holdsArtifact(path) || holdsSubagent(path) || recent) { kept = true; continue; }
 			rmSync(path, { recursive: true, force: true });
 		}
 		return kept ? "kept" : "removed";
@@ -358,6 +437,11 @@ export async function checkArtifact(artifact: ScratchArtifact, keep: readonly st
 	if (status === undefined) return { state: "kept", reason: "Git status unavailable" };
 	if (status !== "") return { state: "kept", reason: "uncommitted changes" };
 	if (kind === "clone") {
+		// Removing the clone would orphan its linked worktrees; a prunable one has lost its directory already.
+		const worktrees = await git(["worktree", "list", "--porcelain"], path);
+		const present = worktrees?.split(/\n\s*\n/).filter((entry) => /^worktree /m.test(entry) && !/^prunable\b/m.test(entry));
+		if (!present?.length) return { state: "kept", reason: "Git worktrees unavailable" };
+		if (present.length > 1) return { state: "kept", reason: "has linked worktrees" };
 		// Every ref, stashes included, must already be on a remote.
 		const local = await git(["rev-list", "-n", "1", "--all", "--not", "--remotes"], path);
 		if (local === undefined) return { state: "kept", reason: "Git history unavailable" };

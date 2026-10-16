@@ -1965,3 +1965,73 @@ test("S9: under a 48-byte inherited TMPDIR, a subagent TMPDIR leaves room for a 
 	fake.exit(0);
 	await runner.waitFor(task.id);
 });
+
+// odd/tasks/scratch-review-advisories.md S2 (native review advisories of #2300):
+// session shutdown removed the whole scratch, including the TMPDIR of a child
+// still running or quarantined, whose descendants may still hold files there.
+test("advisories S2: session shutdown keeps a running or quarantined subagent's TMPDIR, removes the rest, and leaves the scratch to the sweep", async (t) => {
+	const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "gentle-pi-advisories-s2-")));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const base = join(root, "tmp");
+	fs.mkdirSync(base);
+	const configHome = join(root, "config");
+	const env: NodeJS.ProcessEnv = { TMPDIR: base, GENTLE_PI_CONFIG_HOME: configHome };
+	const scratchSession = (sessionId: string, options: { isProcessAlive?: (pid: number) => boolean; now?: () => number } = {}) => {
+		const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+		createSessionScratchExtension({ env, ...options })({ on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, handler); }, registerCommand: () => {} } as unknown as ExtensionAPI);
+		const ctx = { cwd: root, hasUI: false, sessionManager: { getSessionId: () => sessionId } };
+		return {
+			start: () => handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx),
+			shutdown: () => handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx),
+		};
+	};
+	const parent = scratchSession("s-1");
+	parent.start();
+	const scratch = env.TMPDIR!;
+	assert.equal(dirname(scratch), base);
+	const timers: Array<{ fn: () => void; ms: number }> = [];
+	let now = 1_000;
+	const fakes: FakeChild[] = [];
+	const childTmps: string[] = [];
+	const store = new TaskStore();
+	const runner = new AgentRunner(store, { maxConcurrency: 2, stallTimeoutMs: 10_000 }, {
+		spawn: (_command, _args, options) => {
+			childTmps.push((options as { env: NodeJS.ProcessEnv }).env.TMPDIR ?? "");
+			const fake = fakeChild({ exitOnKill: false, pid: 80 + fakes.length });
+			fakes.push(fake);
+			return fake.child;
+		},
+		now: () => now,
+		schedule: (fn, ms) => { timers.push({ fn, ms }); return () => {}; },
+		pi: { command: "pi", args: [] },
+		process: { platform: "win32", kill: () => {} },
+	}, { askUser: async () => ({ value: "yes" }) });
+	const quarantined = runner.run(request({ env: { TMPDIR: scratch } }));
+	const running = runner.run(request({ prompt: "running", env: { TMPDIR: scratch } }));
+	await tick();
+	runner.cancel(quarantined.id);
+	timers.find((timer) => timer.ms === 250)!.fn();
+	now = 5_000;
+	timers.filter((timer) => timer.ms === 25).at(-1)!.fn();
+	await tick();
+	assert.match(store.get(quarantined.id)?.error ?? "", /capacity quarantined/);
+	assert.deepEqual(childTmps.map((dir) => dirname(dir)), [scratch, scratch]);
+	fs.writeFileSync(join(childTmps[0], "held.txt"), "x");
+	fs.writeFileSync(join(scratch, "junk.txt"), "x");
+	parent.shutdown();
+	assert.ok(existsSync(join(childTmps[0], "held.txt")), "a quarantined child's TMPDIR stays");
+	assert.ok(existsSync(childTmps[1]), "a running child's TMPDIR stays");
+	assert.equal(existsSync(join(scratch, "junk.txt")), false, "the rest of the scratch is removed");
+	assert.equal(env.TMPDIR, base, "the inherited TMPDIR is restored");
+	const ledger = JSON.parse(readFileSync(join(configHome, "scratch", "s-1.json"), "utf8")) as { scratchDir: string | null };
+	assert.equal(ledger.scratchDir, scratch, "the ledger keeps the scratch for a later sweep");
+	fakes[0].exit(0);
+	runner.cancel(running.id);
+	fakes[1].exit(0);
+	await tick();
+	assert.ok(childTmps.every((dir) => !existsSync(dir)), "each proven exit removes its TMPDIR");
+	const next = scratchSession("next", { isProcessAlive: () => false, now: () => Date.now() + 2 * 3_600_000 });
+	next.start();
+	assert.equal(existsSync(scratch), false, "the startup sweep removes the kept scratch once its owner ended");
+	next.shutdown();
+});
