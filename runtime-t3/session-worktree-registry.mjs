@@ -31,6 +31,13 @@ function canonicalDirectory(path        , cwd        )         {
 	return statSync(canonical).isDirectory() ? canonical : dirname(canonical);
 }
 
+// Windows accepts `/` as its separator and Git prints roots that way, while
+// realpath answers with `\`. Only the separator is translated, so any other
+// non-canonical spelling (dot segments, trailing separators) still differs.
+export function nativeRootSpelling(path        , platform                  = process.platform)         {
+	return platform === "win32" ? path.replaceAll("/", "\\") : path;
+}
+
 export function resolveSessionWorktreeWithGit(path        , cwd        , run                      = execFileSync)                               {
 	try {
 		const directory = canonicalDirectory(path, cwd);
