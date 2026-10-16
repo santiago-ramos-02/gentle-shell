@@ -5,6 +5,8 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createSessionScratchExtension } from "../extensions/session-scratch.ts";
 import { AGENT_MODE, parseAgentsConfig, resolveAgentProfile, type AgentDefinition } from "../lib/agents-config.ts";
 import { MISSING_TOOLS_NOTE_PREFIX, TASK_STATUS, TaskStore, THREAD_ITEM, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, childArguments, JsonLines, piCommand, abortReasonText, REQUESTED_TOOLS_ENV, type ChildLike, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
@@ -1046,7 +1048,7 @@ for (const [platform, detached] of [["win32", false], ["linux", true]] as const)
 	const ownedIpc = launches[0]?.options.env.GENTLE_PI_AGENTS_OWNED_IPC;
 	assert.match(ownedIpc ?? "", /^\d+-[a-z0-9]+$/, "the runner creates an opaque owned-IPC marker");
 	const scratch = launches[0]?.options.env.TMPDIR;
-	assert.match(scratch ?? "", /gentle-pi-subagent-tmp-/, "the child gets its own TMPDIR");
+	assert.match(basename(scratch ?? ""), /^ga[A-Za-z0-9]{6}$/, "the child gets its own TMPDIR");
 	const scratchEnv = platform === "win32" ? { TMPDIR: scratch, TMP: scratch, TEMP: scratch } : { TMPDIR: scratch };
 	assert.deepEqual(launches, [{
 		command: "pi-fixture",
@@ -1135,7 +1137,7 @@ test("AgentRunner retains permission broker fd3 and assigns messaging IPC to fd4
 	const permissionChannelStdio = process.platform === "win32" ? "overlapped" : "pipe";
 	assert.match(launch?.env.GENTLE_PI_AGENTS_OWNED_IPC ?? "", /^\d+-[a-z0-9]+$/, "the owned-IPC marker has the runner's opaque shape");
 	assert.deepEqual(launch?.env, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: launch?.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3", [REQUESTED_TOOLS_ENV]: "read,grep,subagent_parent_message", TMPDIR: launch?.env.TMPDIR });
-	assert.match(launch?.env.TMPDIR ?? "", /gentle-pi-subagent-tmp-/);
+	assert.match(basename(launch?.env.TMPDIR ?? ""), /^ga[A-Za-z0-9]{6}$/);
 	assert.deepEqual(launch?.stdio, ["pipe", "pipe", "pipe", permissionChannelStdio, "ipc"]);
 	assert.equal(launch?.stdio?.length, 5);
 	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "channel checked" }], stopReason: "stop" }] });
@@ -1925,8 +1927,41 @@ test("a relative inherited TMPDIR falls back to the system temp dir, so the chil
 	const runner = scratchRunner((env) => { childTmp = env.TMPDIR ?? ""; return fake.child; });
 	const task = runner.run(request({ env: { TMPDIR: "reltmp" } }));
 	await tick();
-	assert.ok(childTmp.startsWith(join(tmpdir(), "gentle-pi-subagent-tmp-")), childTmp);
+	assert.ok(childTmp.startsWith(join(tmpdir(), "ga")), childTmp);
 	fake.exit(0);
 	await runner.waitFor(task.id);
 	assert.equal(existsSync(childTmp), false);
+});
+
+// odd/tasks/session-scratch-ledger.md S9: TMPDIR nests the session scratch and the
+// subagent's own TMPDIR, and a Unix socket path (104 bytes with the NUL on macOS)
+// under it must still fit, as Python's `pymp-XXXXXXXX/listener-XXXXXXXX` (32 bytes).
+test("S9: under a 48-byte inherited TMPDIR, a subagent TMPDIR leaves room for a 32-byte socket name", async (t) => {
+	const INHERITED_BYTES = 48;
+	const SOCKET_NAME = "/pymp-XXXXXXXX/listener-XXXXXXXX";
+	// An unresolved parent, like macOS `/var/folders/xx/<30 chars>/T`, padded to 48 bytes.
+	const parent = [tmpdir(), "/tmp"].map((root) => { try { return fs.mkdtempSync(join(root, "b")); } catch { return undefined; } })
+		.find((dir): dir is string => dir !== undefined && Buffer.byteLength(dir) + 2 <= INHERITED_BYTES);
+	if (!parent) { t.skip("no temp directory short enough to build a 48-byte path"); return; }
+	t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+	const inherited = join(parent, "x".repeat(INHERITED_BYTES - Buffer.byteLength(parent) - 1));
+	fs.mkdirSync(inherited);
+	assert.equal(Buffer.byteLength(inherited), INHERITED_BYTES);
+	const env: NodeJS.ProcessEnv = { TMPDIR: inherited, GENTLE_PI_CONFIG_HOME: join(parent, "config") };
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+	createSessionScratchExtension({ env })({ on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => { handlers.set(name, handler); }, registerCommand: () => {} } as unknown as ExtensionAPI);
+	const ctx = { cwd: parent, hasUI: false, sessionManager: { getSessionId: () => "a-session-id-much-longer-than-the-scratch-name" } };
+	handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+	t.after(() => handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx));
+	assert.equal(dirname(env.TMPDIR!), inherited, "the session scratch keeps the inherited spelling");
+	const fake = fakeChild();
+	let childTmp = "";
+	const runner = scratchRunner((childEnv) => { childTmp = childEnv.TMPDIR ?? ""; return fake.child; });
+	const task = runner.run(request({ env: { TMPDIR: env.TMPDIR } }));
+	await tick();
+	assert.equal(dirname(childTmp), env.TMPDIR, "the subagent TMPDIR nests under the session scratch");
+	const socketPath = Buffer.byteLength(`${childTmp}${SOCKET_NAME}`);
+	assert.ok(socketPath <= 103, `${childTmp}${SOCKET_NAME} is ${socketPath} bytes`);
+	fake.exit(0);
+	await runner.waitFor(task.id);
 });

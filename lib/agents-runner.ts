@@ -12,6 +12,7 @@ import { CHILD_QUERY_MAX_INFLIGHT, CHILD_QUERY_TIMEOUT_MS, parseChildFrame, vali
 import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
 import { isFinished, normalizeRpcEvent, ToolArgumentProgress, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type ChildResponseObservation, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
 import { WriterSurfaceRegistry, writerSurfaceConflictMessage } from "./writer-surfaces.ts";
+import { SUBAGENT_SCRATCH_PREFIX } from "./session-scratch.ts";
 
 // Gentle Agents runner. Every subagent is its own `pi --mode rpc` process:
 // the host never runs subagent work on the TUI thread. It writes JSON
@@ -580,7 +581,8 @@ export class AgentRunner {
 		try {
 			const inherited = request.env.TMPDIR?.trim();
 			// A relative TMPDIR would resolve against this process, not the child cwd.
-			scratchDir = mkdtempSync(join(inherited && isAbsolute(inherited) ? inherited : tmpdir(), "gentle-pi-subagent-tmp-"));
+			// A short name and no real path: socket paths under TMPDIR are capped near 104 bytes.
+			scratchDir = mkdtempSync(join(inherited && isAbsolute(inherited) ? inherited : tmpdir(), SUBAGENT_SCRATCH_PREFIX));
 			try { chmodSync(scratchDir, DIR_MODE); } catch { /* best effort */ }
 			env.TMPDIR = scratchDir;
 			if (this.processControl.platform === "win32") { env.TMP = scratchDir; env.TEMP = scratchDir; }

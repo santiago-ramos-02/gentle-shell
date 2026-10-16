@@ -2302,7 +2302,7 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 			assert.deepEqual(captured[index]?.args, args);
 			assert.equal(captured[index]?.options.cwd, permissionChannel ? canonicalGitCwd : nonGitCwd);
 			const scratch = captured[index]?.options.env.TMPDIR;
-			assert.match(scratch ?? "", /gentle-pi-subagent-tmp-/, "each child receives its own TMPDIR");
+			assert.match(scratch ?? "", /[\\/]ga[A-Za-z0-9]{6}$/, "each child receives its own TMPDIR");
 			const scratchEnv = process.platform === "win32" ? { TMPDIR: scratch, TMP: scratch, TEMP: scratch } : { TMPDIR: scratch };
 			assert.deepEqual(captured[index]?.options.env, { PATH: "/bin", FIXTURE: fixture, GENTLE_PI_CONFIG_HOME: process.env.GENTLE_PI_CONFIG_HOME, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: ownedIpc, ...(permissionChannel ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}), [REQUESTED_TOOLS_ENV]: "read,grep,subagent_parent_message", ...scratchEnv });
 			assert.equal(captured[index]?.options.shell, undefined, "the adapter does not invoke a shell");
@@ -4757,6 +4757,39 @@ test("registered orchestrator_list joins peer metadata without child launches or
 		assert.equal(runtime.spawned.length, 0);
 		assert.equal(h.sent.length, 0);
 		assert.equal(h.userMessages.length, 0);
+		await h.fire("session_shutdown", ctx);
+	} finally { publisher.dispose(); }
+});
+
+test("orchestrator_list labels a live peer that predates discovery publication (#2305)", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	const profile = realpathSync(mkdtempSync(join(root, "discovery-legacy-")));
+	const peer = { version: 1 as const, sessionId: "peer", endpoint: "/fixture/peer.sock", createdAt: 1 };
+	// A peer running pre-publication code heartbeats its schema-1 header only.
+	const publisher = PresencePublisher.start({ profile, sessionId: "peer", label: "gentle-shell", activity: [] });
+	try {
+		let ready = false;
+		const registry = { list: async () => [], listActivations: async () => [peer] };
+		runtime.deps.agentHome = profile;
+		runtime.deps.sessionTransport = {
+			createRegistry: async () => registry,
+			createListener: () => ({ registry, start: async () => { ready = true; }, close: async () => {} }),
+			createClient: () => ({ close() {}, sendNotification: async () => { throw new Error("no messages expected"); } }),
+		};
+		gentleAgents(h.pi, {}, runtime.deps);
+		const { ctx } = fakeContext();
+		await h.fire("session_start", ctx);
+		await eventually(() => ready, "discovery transport ready");
+		const result = await h.tools.get("orchestrator_list")!.execute("list", {}, undefined, undefined, ctx);
+		assert.equal(result.content[0].text, "Advertised sessions (reachability is unknown):\n"
+			+ "- peer · gentle-shell · context: legacy (this session predates discovery publication; restart it to publish its workspace and repository)"
+			+ " · repository: not published · metadata: legacy\n  recorded catalog: unknown");
+		// Consultation stays fail-closed: a legacy label is display-only.
+		const consult = await h.tools.get("orchestrator_consult")!.execute("consult", { recipient_session_id: "peer" }, undefined, undefined, ctx);
+		assert.equal(JSON.parse(consult.content[0].text).status, "unavailable");
+		assert.equal(runtime.spawned.length, 0);
+		assert.equal(h.sent.length, 0);
 		await h.fire("session_shutdown", ctx);
 	} finally { publisher.dispose(); }
 });
