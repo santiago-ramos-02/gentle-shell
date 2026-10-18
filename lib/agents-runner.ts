@@ -10,7 +10,7 @@ import { childPackageExtensionArgs } from "./child-package-injection.ts";
 import { AGENT_MODE, formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
 import { CHILD_QUERY_MAX_INFLIGHT, CHILD_QUERY_TIMEOUT_MS, parseChildFrame, validChildMessage, validChildQueryId } from "./agents-messaging.ts";
 import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
-import { isFinished, normalizeRpcEvent, ToolArgumentProgress, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type ChildResponseObservation, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
+import { childPromptText, isFinished, normalizeRpcEvent, ToolArgumentProgress, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type ChildResponseObservation, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
 import { WriterSurfaceRegistry, writerSurfaceConflictMessage } from "./writer-surfaces.ts";
 import { holdSubagentScratch, releaseSubagentScratch, SUBAGENT_SCRATCH_PREFIX } from "./session-scratch.ts";
 
@@ -375,7 +375,7 @@ export class JsonLines {
 }
 
 export function promptText(request: TaskRequest): string {
-	return request.context ? `${request.prompt}\n\n## Context\n${request.context}` : request.prompt;
+	return childPromptText(request.prompt, request.context);
 }
 
 export class AgentRunner {
@@ -408,6 +408,7 @@ export class AgentRunner {
 			agent: request.agent.name,
 			mode: request.mode,
 			prompt: request.prompt,
+			...(request.context ? { context: request.context } : {}),
 			label: taskLabel(request.prompt, request.label),
 			cwd: request.cwd,
 			parentSessionId: request.parentSessionId,

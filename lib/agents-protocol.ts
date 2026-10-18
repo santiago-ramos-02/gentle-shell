@@ -118,6 +118,8 @@ export interface TaskRecord {
 	agent: string;
 	mode: string;
 	prompt: string;
+	/** Extra context the parent appended; the child receives it after the prompt. */
+	context?: string;
 	/** One line for the card: what the subagent is doing. */
 	label: string;
 	cwd: string;
@@ -458,6 +460,11 @@ function recordPatch(task: TaskRecord, event: TaskEvent): Partial<TaskRecord> {
 		default:
 			return resumed;
 	}
+}
+
+/** The message a child is started with: the prompt, then any context the parent appended. */
+export function childPromptText(prompt: string, context: string | undefined): string {
+	return context ? `${prompt}\n\n## Context\n${context}` : prompt;
 }
 
 export function summarize(tasks: Iterable<TaskRecord>): TaskSummary {

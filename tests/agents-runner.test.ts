@@ -12,6 +12,7 @@ import { MISSING_TOOLS_NOTE_PREFIX, TASK_STATUS, TaskStore, THREAD_ITEM, type Ta
 import { AgentRunner, childArguments, JsonLines, piCommand, abortReasonText, REQUESTED_TOOLS_ENV, type ChildLike, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 import { INTERACTIVE_HOST_ENV } from "../lib/rpc-host.ts";
+import { projectRpcActivity } from "../lib/agents-rpc-publisher.ts";
 
 // Gentle Agents runner: every subagent is a child `pi --mode rpc` process.
 // The host only parses JSON lines, applies deltas to the store, answers
@@ -105,6 +106,21 @@ function beginArguments(child: FakeChild, timestamp = 1000): void {
 	child.emit({ type: "message_start", message: { role: "assistant", timestamp, content: [] } });
 	child.emit(argumentUpdate("toolcall_start", { id: "call-1", toolName: "write" }));
 }
+
+test("an RPC host is shown the same prompt the child receives, context included", async () => {
+	const h = harness();
+	const withContext = h.runner.run(request({ prompt: "Read the brief", context: "The brief is in brief.md" }));
+	const plain = h.runner.run(request({ prompt: "Map the repo" }));
+	await tick();
+	const published = new Map(projectRpcActivity(h.store).tasks.map(entry => [entry.summary.id, entry.summary.prompt]));
+	const received = h.children[0].written.find(command => command.type === "prompt")?.message;
+	assert.equal(received, "Read the brief\n\n## Context\nThe brief is in brief.md");
+	assert.equal(published.get(withContext.id), received);
+	assert.equal(published.get(plain.id), "Map the repo");
+	h.runner.cancel(withContext.id);
+	h.runner.cancel(plain.id);
+	await tick();
+});
 
 test("parent source passages reach the economical explorer through the existing context handoff", async () => {
 	const h = harness();

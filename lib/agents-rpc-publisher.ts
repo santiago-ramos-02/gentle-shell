@@ -1,4 +1,4 @@
-import { isFinished, THREAD_ITEM, TASK_STATUS, type TaskRecord, type TaskStatus, type TaskStore, type TaskSummary, type ThreadItem } from "./agents-protocol.ts";
+import { childPromptText, isFinished, THREAD_ITEM, TASK_STATUS, type TaskRecord, type TaskStatus, type TaskStore, type TaskSummary, type ThreadItem } from "./agents-protocol.ts";
 
 // Publishes live Gentle Agents subagent state to an interactive RPC host
 // (the desktop app), the RPC equivalent of the above-editor TUI card. Pi's
@@ -128,7 +128,7 @@ function projectTaskSummary(task: TaskRecord): RpcTaskSummary {
 		model: truncate(task.model, SUMMARY_FIELD_LIMIT),
 		thinking: task.thinking ?? null,
 		label: truncate(task.label, SUMMARY_FIELD_LIMIT),
-		prompt: truncate(task.prompt, PROMPT_LIMIT),
+		prompt: truncate(childPromptText(task.prompt, task.context), PROMPT_LIMIT),
 		status: task.status,
 		createdAt: task.createdAt,
 		startedAt: task.startedAt,
