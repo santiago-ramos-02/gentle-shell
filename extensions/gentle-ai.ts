@@ -5702,21 +5702,18 @@ const REVIEW_MODE_DISABLED_OUTCOME = "review-mode-disabled";
 // to make the global opt-in first when needed, then clear this clone override.
 // Pi never mutates the operator's global gentle-ai state automatically.
 //
-// The default branch changed with the pinned v2.4.0 runtime, which made
-// receipt-driven development opt-in. It used to be unreachable as a reason for
-// reviews being off — an all-sources-unset install resolved to ON with source
-// `default` — so naming a continuation for it would have been a guess, and
-// gentle-ai returned an empty scope to say exactly that. v2.4.0 resolves the
-// same install to OFF with source `default`, which makes it the most common
-// refusal there is: every install that never opted in. gentle-ai answers
-// `global` for it now, not because default is a global opinion but because
-// global is the only scope that can turn reviews on at all, and Pi answers the
-// same. Leaving this undefined would hand the single most common state a dead
-// end.
+// Receipt-driven development is on by default (gentle-ai v4.0.0, #4803): an
+// all-sources-unset install resolves to ON with source `default`. The pinned
+// v2.4.0 runtime had briefly made it opt-in, which is why this branch exists.
+// Today `default` only reaches here as gentle-ai's fail-closed projection: the
+// mode could not be resolved, so it reports OFF with source `default`. The
+// continuation says so instead of claiming the install never opted in, and
+// still names `global`, the only scope that can turn reviews on explicitly.
+// Leaving this undefined would hand that state a dead end.
 function reviewModeContinuation(source: NativeReviewModeSource): string | undefined {
 	if (source === NATIVE_REVIEW_MODE_SOURCE.CLONE_LOCAL) return "Run `gentle-ai review mode enable --scope=global` if global RDD is still off, then run /gentle:review-mode enable to clear this clone-local override.";
 	if (source === NATIVE_REVIEW_MODE_SOURCE.GLOBAL) return "Run `gentle-ai review mode enable --scope=global` to turn reviews back on; /gentle:review-mode enable only clears the clone-local setting, which cannot override a global off.";
-	return "Run `gentle-ai review mode enable --scope=global` to opt in; RDD is off by default until explicitly enabled. /gentle:review-mode enable only clears a clone-local override and cannot enable global RDD.";
+	return "RDD is on by default, but this install could not resolve the review mode and failed closed to off. Run `gentle-ai review mode status` to see why, or `gentle-ai review mode enable --scope=global` to turn reviews on explicitly. /gentle:review-mode enable only clears a clone-local override and cannot enable global RDD.";
 }
 
 // Names the situation before the mechanism, then the mechanism, mirroring
