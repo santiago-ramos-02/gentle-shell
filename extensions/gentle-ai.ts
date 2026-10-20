@@ -37,7 +37,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { discoverAgents } from "../lib/agents-config.ts";
+import { discoverAgents, loadAgentsConfig, unmatchedProfileKeys } from "../lib/agents-config.ts";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -3978,6 +3978,7 @@ class ProfilesPanel implements OverlayComponent {
 	private readonly pinStatus: ProfilePinStatus | undefined;
 	private readonly sessionBoundName: string | undefined;
 	private readonly discoveredAgentNames: string[];
+	private readonly unmatchedKeys: string[];
 	private readonly liveOrchestrator: (() => AgentRoutingEntry | undefined) | undefined;
 
 	constructor(
@@ -3994,6 +3995,7 @@ class ProfilesPanel implements OverlayComponent {
 		pinStatus: () => ProfilePinStatus | undefined,
 		sessionBound: () => string | undefined,
 		discoveredAgentNames: string[],
+		unmatchedKeys: string[],
 		liveOrchestrator?: () => AgentRoutingEntry | undefined,
 		feedback?: string,
 	) {
@@ -4009,6 +4011,7 @@ class ProfilesPanel implements OverlayComponent {
 		this.pinStatus = pinStatus();
 		this.sessionBoundName = sessionBound();
 		this.discoveredAgentNames = discoveredAgentNames;
+		this.unmatchedKeys = unmatchedKeys;
 		this.liveOrchestrator = liveOrchestrator;
 		const items = buildProfileListItems(file, evaluateProfilePin(this.pinStatus, file.profiles).winner?.profile, this.sessionBoundName);
 		this.listItems = items;
@@ -4248,6 +4251,26 @@ class ProfilesPanel implements OverlayComponent {
 			"",
 			this.renderLine("Current routing (effective)", width, "accent"),
 			...this.indentLines(this.routingLines(currentRows, widths, width), width),
+			...this.unmatchedKeyLines(currentRows, width),
+		];
+	}
+
+	private unmatchedKeyLines(currentRows: ProfileRoutingRow[], width: number): string[] {
+		// Issue #2400: a model_profiles key that matches no discovered agent and
+		// suggests none never becomes a routing row, so it is listed here, one key
+		// per line, with the same inline-or-↳ note rule as the routing rows. A key
+		// already shown as a current row carries its note there instead.
+		const shown = new Set(currentRows.map((row) => row.agent));
+		const keys = this.unmatchedKeys.filter((key) => !shown.has(key));
+		if (keys.length === 0) return [];
+		const note = "no matching agent";
+		return [
+			"",
+			this.renderLine("Unmatched keys (ignored)", width, "accent"),
+			...this.indentLines(keys.flatMap((key) => {
+				const inline = `${key}  ← ${note}`;
+				return visibleWidth(inline) + 2 <= width ? [inline] : [key, `  ↳ ${note}`];
+			}), width),
 		];
 	}
 
@@ -4335,11 +4358,22 @@ async function showProfilesPanel(
 	// Issue #2196: the panel flags routing keys that name no discovered agent, so
 	// it needs one discovery snapshot per visit; a failed or partial discovery is
 	// not an error here, it just renders without notes.
-	const discoveredAgentNames = discoverAgents({
+	const discoveryRoots = {
 		cwd: ctx.sessionManager.getCwd?.() ?? ctx.cwd,
 		home: homedir(),
 		agentHome: resolveGentlePiAgentHome(),
-	}).agents.map((agent) => agent.name);
+	};
+	const discoveredAgents = discoverAgents(discoveryRoots).agents;
+	const discoveredAgentNames = discoveredAgents.map((agent) => agent.name);
+	// Issue #2400: launches resolve from the subagents.json model_profiles, which
+	// the effective table only reads per discovered agent, so a key with no match
+	// and no suggestion never appeared. When a session binding or a pin wins, the
+	// table already shows that snapshot's own keys with their notes.
+	const unmatchedKeys = sessionBoundName !== undefined || pinnedEffectiveModelConfig(ctx.cwd) !== undefined
+		? []
+		: unmatchedProfileKeys(loadAgentsConfig(discoveryRoots).modelProfiles, discoveredAgents)
+			.filter((entry) => entry.suggestion === undefined)
+			.map((entry) => entry.key);
 	return ctx.ui.custom<ProfilesPanelResult>(
 		(tui, theme, keybindings, done) => {
 			const panel = new ProfilesPanel(
@@ -4356,6 +4390,7 @@ async function showProfilesPanel(
 				() => readProfilePinStatus(ctx.cwd),
 				() => sessionBoundName,
 				discoveredAgentNames,
+				unmatchedKeys,
 				() => liveOrchestratorSnapshot(ctx, live)?.entry,
 				status,
 			);
@@ -5228,7 +5263,7 @@ const REVIEW_CONTROLLER_PARAMETER_FIELDS = {
 		},
 		input: {
 			type: "string",
-			description: "A JSON object or serialized object string for START/ASSESS/answer-consent only; every other operation requires a serialized object string. New native ordinary START uses {\"mode\":\"ordinary\"}, plus the agent lens selection {\"lenses\":[\"risk\",...],\"lensesReason\":\"<what you touched and how>\"} (both or neither, 1-4 of risk, resilience, readability, reliability; never with focus; providers that predate it keep the tier default); answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. Ordinary provider capture belongs only to gentle_review_capture. An explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. baseRef must be HEAD, a full 40- or 64-character commit id, or a ref name; abbreviated commit ids are rejected as base-ref-unresolvable. ASSESS accepts an optional object with baseRef, committedOnly, writerModelId, writerEffort, and nativeReviewOutcome (gentle-pi#662/#668/#1175). The writer profile comes from the runtime-recorded model and effort of the pending mutations for this root (writerProfileSource runtime); writerModelId and writerEffort are only a fallback when no runtime evidence exists (caller), and with neither the profile fails closed to small (fallback). The writer profile is reported but never adds a verifier: the plan adds the independent verifier only when escalate names a Task Size high-risk item. ASSESS derives `closed` only from the native candidate.consumed fact for this exact candidate, which native records only when the approved review for that candidate is acknowledged; a caller-supplied closed is not authority and, without that fact, resolves to unknown. Every outcome yields the exact risk-gated plan ASSESS returns when RDD is off: a closed review never removes the separate verifier the tier requires (verify-always-rdd-high S1), unknown is never treated as closed, and a decline is candidate-scoped and never lowers the bar below the RDD-off path. A declined or unavailable outcome, stated explicitly or recorded by this process for this exact candidate (never a different one, and never from repository state alone), wins over closure. The returned outcome_source (explicit|derived|unknown) says which of these produced the value. Legacy controller input remains separate.",
+			description: "A JSON object or serialized object string for START/ASSESS/answer-consent; every other operation requires a serialized object string. New native ordinary START uses {\"mode\":\"ordinary\"}, plus the agent lens selection {\"lenses\":[\"risk\",...],\"lensesReason\":\"<what you touched and how>\"} (both or neither, 1-4 of risk, resilience, readability, reliability; never with focus; providers that predate it keep the tier default); answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. Ordinary provider capture belongs only to gentle_review_capture. An explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. baseRef must be HEAD, a full 40- or 64-character commit id, or a ref name; abbreviated commit ids are rejected as base-ref-unresolvable. ASSESS accepts an optional object with baseRef, committedOnly, writerModelId, writerEffort, and nativeReviewOutcome (gentle-pi#662/#668/#1175). The writer profile comes from the runtime-recorded model and effort of the pending mutations for this root (writerProfileSource runtime); writerModelId and writerEffort are only a fallback when no runtime evidence exists (caller), and with neither the profile fails closed to small (fallback). The writer profile is reported but never adds a verifier: the plan adds the independent verifier only when escalate names a Task Size high-risk item. ASSESS derives `closed` only from the native candidate.consumed fact for this exact candidate, which native records only when the approved review for that candidate is acknowledged; a caller-supplied closed is not authority and, without that fact, resolves to unknown. Every outcome yields the exact risk-gated plan ASSESS returns when RDD is off: a closed review never removes the separate verifier the tier requires (verify-always-rdd-high S1), unknown is never treated as closed, and a decline is candidate-scoped and never lowers the bar below the RDD-off path. A declined or unavailable outcome, stated explicitly or recorded by this process for this exact candidate (never a different one, and never from repository state alone), wins over closure. The returned outcome_source (explicit|derived|unknown) says which of these produced the value. Legacy controller input remains separate.",
 		},
 		outputPath: { type: "string", description: "Retired with legacy bundle export; ignored. Export returns legacy-operation-retired." },
 		inputPath: { type: "string", description: "Repository-local JSON input file for the separate legacy controller flow (alternative to input). Legacy bundle import is retired." },
@@ -5499,8 +5534,6 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 	};
 	for (const key of ["changeName", "idempotencyKey", "transition", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource", "workspaceRoot"] as const) {
 		const optional = value[key];
-		// answer-consent takes an object too: models send {consentBinding, answer}
-		// as an object, and its exact shape is still checked before any native call.
 		if (key === "input" && key in value && (value.operation === REVIEW_CONTROLLER_OPERATION.START || value.operation === REVIEW_CONTROLLER_OPERATION.ASSESS || value.operation === REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT)) {
 			parameters.input = serializeReviewJsonArgument(optional);
 			continue;

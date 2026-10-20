@@ -53,7 +53,7 @@ test("public Anthropic non-strict adapter preserves the complete review tool dec
 	assert.deepEqual(controller.required, ["operation"]);
 	assert.deepEqual(Object.keys(controller.properties).sort(), ["operation", "lineageId", "selectionBinding", "intendedUntracked", "untrackedScope", "changeName", "idempotencyKey", "transition", "input", "outputPath", "inputPath", "operationId", "lineageIds", "workspaceRoot"].sort());
 	assert.ok(controller.properties.input.anyOf.some((schema: any) => schema.type === "object"));
-	assert.match(controller.properties.input.description, /START\/ASSESS\/answer-consent only/);
+	assert.match(controller.properties.input.description, /START\/ASSESS\/answer-consent/);
 	assert.deepEqual(controller.properties.operation.enum, tools.get("gentle_review").parameters.properties.operation.enum);
 	for (const name of ["gentle_review_capture", "gentle_review_capture_group"]) {
 		const schema = emitted.get(name);
@@ -87,6 +87,23 @@ test("registered review schemas admit START/ASSESS objects and ordered capture o
 	const ordered = [binding, ' { "name": "second", "arguments": [] } '];
 	const args = validate("gentle_review_capture_group", { lineageId: "l", collectBindings: ordered });
 	assert.deepEqual(__testing.parseReviewCaptureGroupParameters(args).collectBindings, [JSON.stringify(binding), ordered[1]]);
+});
+
+test("answer-consent admits JSON object input and coerces it cleanly (#2375)", async () => {
+	const input = { consentBinding: "bound-1", answer: "granted" };
+	assert.deepEqual(validate("gentle_review", { operation: "answer-consent", input }).input, input);
+	assert.equal(
+		__testing.parseReviewControllerParameters(validate("gentle_review", { operation: "answer-consent", input })).input,
+		JSON.stringify(input),
+	);
+	const native = { targetStatus: async () => ({ targetIdentity: "t1" }) } as unknown as NativeReviewCli;
+	const outcome = await __testing.executeReviewControllerOperation(
+		validate("gentle_review", { operation: "answer-consent", input }),
+		process.cwd(),
+		native,
+	);
+	assert.equal(outcome.operation, "answer-consent");
+	assert.match(String(outcome.outcome), /consent-binding-stale/);
 });
 
 test("validated ASSESS objects reach the mocked native facade with parsed fields", async () => {
