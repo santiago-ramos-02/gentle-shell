@@ -355,6 +355,7 @@ Save `/gentle:mode default auto` or `/gentle:mode default yolo` to use either op
 | Gentle Todo | A plan card that turns amber when the model lets it go stale. |
 | Subscription usage | Per-window meters and resets for supported provider accounts. |
 | Gentle Stats | `/gentle:stats` shows local usage history: activity heatmap, tokens, cost, streaks, and per-model share. |
+| Gentle Voice | Optional local dictation: `/gentle:voice` downloads Parakeet once, then pastes what you say into the draft without sending it. [Details](docs/voice.md). |
 | Gentle notices | Gentle AI calls and review reminders as cards in the transcript. |
 
 Cross-orchestrator messages appear as compact `🤖 Sender → 🤖 Recipient` cards with single-row headings. Expand a card to inspect available identifiers and reasons. **Message queued** means queued, not delivered or read; long names are clipped to fit narrow terminals.
