@@ -21,6 +21,7 @@ const sources = [
 	"model-routing",
 	"model-routing-authority",
 	"agent-profiles",
+	"agents-config",
 	"agent-profile-pin",
 	"profiles-orchestrator",
 	"agent-assets",

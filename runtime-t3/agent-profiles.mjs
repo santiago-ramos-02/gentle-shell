@@ -10,6 +10,9 @@ import { randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import {
+	unmatchedProfileKeys,
+} from "./agents-config.mjs";
+import {
 	normalizeModelConfig,
 
 
@@ -363,6 +366,29 @@ export function profileRoutingRows(config                  )                    
 			thinking: entry?.thinking ?? INHERIT_MODEL_LABEL,
 		}))
 		.sort((left, right) => left.agent.localeCompare(right.agent));
+}
+
+/**
+ * Issue #2196 (PR #2233 maintainer decision): a routing row whose key names no
+ * discovered agent was rendered as a valid-looking row while its setting was
+ * silently ignored at launch. Each unmatched row gets one note: a did-you-mean
+ * suggestion when the packaged short name maps to a discovered agent, and a
+ * plain "no matching agent" otherwise. Matched rows get no note.
+ */
+export function unmatchedRoutingNotes(
+	rows                     ,
+	agentNames          ,
+)                      {
+	const unmatched = unmatchedProfileKeys(
+		Object.fromEntries(rows.map((row) => [row.agent, { model: undefined, thinking: undefined }])),
+		agentNames.map((name) => ({ name })),
+	);
+	return new Map(
+		unmatched.map(({ key, suggestion }) => [
+			key,
+			suggestion === undefined ? "no matching agent" : `did you mean ${suggestion}?`,
+		]),
+	);
 }
 
 /**
