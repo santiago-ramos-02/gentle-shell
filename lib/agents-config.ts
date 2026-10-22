@@ -327,6 +327,14 @@ export interface UnmatchedProfileKey {
 // profile to a user-owned same-short-name agent is the exact silence the
 // prefix exists to prevent; reporting the unmatched key keeps resolution
 // exact-match and makes the misconfiguration visible instead.
+// The review relay routes these keys through `subagents.json` profiles without
+// any agent file, so they never match a discovered agent yet are never ignored.
+export const PROVIDER_REVIEW_ROLES = ["review-refuter", "review-validator"] as const;
+
+export function isProviderReviewRole(name: string): boolean {
+	return PROVIDER_REVIEW_ROLES.some((role) => role === name);
+}
+
 export function unmatchedProfileKeys(
 	modelProfiles: Record<string, ModelProfile>,
 	agents: ReadonlyArray<{ name: string }>,
@@ -347,7 +355,7 @@ export function unmatchedProfileKeys(
 		return undefined;
 	};
 	return Object.keys(modelProfiles)
-		.filter((key) => !names.has(key))
+		.filter((key) => !names.has(key) && !isProviderReviewRole(key))
 		.map((key) => ({ key, suggestion: suggestionFor(key) }));
 }
 

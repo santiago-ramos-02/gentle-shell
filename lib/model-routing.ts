@@ -11,6 +11,7 @@ import { updatePackageManagedSddAgentOwnership } from "./agent-assets.ts";
 import { gentlePiConfigHome, resolveGentlePiAgentHome } from "./agent-home.ts";
 import { resolveProfilePin } from "./agent-profile-pin.ts";
 import { isProfileOrchestratorKey } from "./agent-profiles.ts";
+import { PROVIDER_REVIEW_ROLES, isProviderReviewRole } from "./agents-config.ts";
 import {
 	normalizeModelConfig,
 	normalizeRoutingEntry,
@@ -708,11 +709,7 @@ export function isValidJsonObjectFileOrMissing(path: string): boolean {
 	}
 }
 
-export const PROVIDER_REVIEW_ROLES = ["review-refuter", "review-validator"] as const;
-
-export function isProviderReviewRole(name: string): boolean {
-	return PROVIDER_REVIEW_ROLES.some((role) => role === name);
-}
+export { PROVIDER_REVIEW_ROLES, isProviderReviewRole };
 
 export function modelAssignmentNames(cwd: string): string[] {
 	return [...new Set([

@@ -283,6 +283,26 @@ test("unmatchedProfileKeys reports profile keys that match no discovered agent",
 	assert.deepEqual(unmatchedProfileKeys({}, [worker]), []);
 });
 
+test("unmatchedProfileKeys never reports the provider review roles, which route without an agent file", () => {
+	const worker = {
+		name: "gentle-ai-worker",
+		description: "",
+		filePath: "/x/worker.md",
+		scope: "global" as const,
+		instructions: "",
+		model: undefined,
+		thinking: undefined,
+		mode: undefined,
+		tools: [],
+	};
+	const profiles = {
+		"review-refuter": { model: { provider: "claude-bridge", id: "claude-opus-5-5" }, thinking: undefined },
+		"review-validator": { model: { provider: "claude-bridge", id: "claude-opus-5-5" }, thinking: undefined },
+		explor: { model: undefined, thinking: undefined },
+	};
+	assert.deepEqual(unmatchedProfileKeys(profiles, [worker]), [{ key: "explor", suggestion: undefined }]);
+});
+
 // Cortex QA adversarial follow-up (R5 pin): the did-you-mean mapping exists to
 // make a misconfiguration visible, never to resolve; a short key must keep
 // yielding an unresolved profile so the role inherits frontmatter and default
