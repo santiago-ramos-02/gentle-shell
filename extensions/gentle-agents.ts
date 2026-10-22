@@ -39,6 +39,7 @@ import { ActiveSessionClient, ActiveSessionListener, SessionPresenceError, Sessi
 import { WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, type WindowsSessionRegistryPhaseObserver } from "../lib/windows-session-transport.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
 import { inheritedUnsafeGitEnvironmentKeys } from "../lib/review-repository.ts";
+import { applyReviewReviewerActivity, isReviewReviewerActivity, REVIEW_REVIEWER_ACTIVITY_EVENT } from "../lib/review-reviewer-activity.ts";
 import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
 import { AgentsView } from "../lib/agents-view.ts";
@@ -659,6 +660,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		unsubscribeMetrics();
 		unsubscribeScope();
 		unsubscribeTodoProgress();
+		unsubscribeReviewers();
 		scopeCache.clear();
 	});
 	let stopAllConfirmation: Promise<void> | undefined;
@@ -803,6 +805,17 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			.then(() => pruneHistory(tasksDir, loadAgentsConfig({ cwd: task.cwd, home: deps.home, agentHome }).historyMaxTasks))
 			.catch(() => {});
 	};
+
+	// Review reviewers run inside gentle-ai's review tool, not as children here;
+	// recording them in the store shows them like any foreground subagent.
+	const unsubscribeReviewers = pi.events.on(REVIEW_REVIEWER_ACTIVITY_EVENT, (event) => {
+		if (!isReviewReviewerActivity(event)) return;
+		const finished = applyReviewReviewerActivity(store, event);
+		if (event.type === "started" && store.get(event.id)) store.subscribe(event.id, () => { publishActivity(); requestRender(); });
+		publishActivity();
+		requestRender();
+		if (finished) persist(finished);
+	});
 
 	// A background result used to be handed straight to the host as a followUp
 	// message, but the host only drains that queue when the parent agent stops

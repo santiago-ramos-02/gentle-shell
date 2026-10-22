@@ -30,6 +30,7 @@ import {
 } from "../lib/review-host-relay.ts";
 import * as reviewHostRelayModule from "../lib/review-host-relay.ts";
 import { GENTLE_PI_REVIEW_RELAY_CONTRACT, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV } from "../lib/review-relay-contract.ts";
+import type { ReviewReviewerRun } from "../lib/review-reviewer-activity.ts";
 import { decodeReviewNextTransitionV3, type ReviewCaptureSubmissionV1, type ReviewCollectInputV3 } from "../lib/review-integration-v2.ts";
 
 // gentle-pi#311 P2: the reviewer transport this file exercises no longer
@@ -1090,3 +1091,35 @@ for (const transport of ["sse", "websocket", "websocket-cached", "auto", undefin
 		assert.equal(readLog(fixture.logPath).length, requests.length, "group preparation only materializes, never submits");
 	});
 }
+
+test("a reviewer run reports its start and its result to the activity listener", async (t) => {
+	const fixture = harness(t);
+	const runs: ReviewReviewerRun[] = [];
+	await prepareReviewHostRelaySlot(relayRequest(fixture, { onActivity: (run: ReviewReviewerRun) => runs.push(run) }), textReviewer(REVIEWER_TEXT).runReviewer);
+	assert.deepEqual(runs.map((run) => run.type), ["started", "finished"]);
+	const [started, finished] = runs;
+	assert.equal(started?.type === "started" && started.agent, "review-reliability");
+	assert.equal(started?.type === "started" && started.model, "openai/gpt-5");
+	assert.equal(finished?.id, started?.id);
+	assert.equal(finished?.type === "finished" && finished.text, REVIEWER_TEXT);
+});
+
+test("a refused reviewer run reports its failure and still rejects", async (t) => {
+	const fixture = harness(t);
+	const runs: ReviewReviewerRun[] = [];
+	await assert.rejects(prepareReviewHostRelaySlot(
+		relayRequest(fixture, { onActivity: (run: ReviewReviewerRun) => runs.push(run) }),
+		refusingReviewer(INPROCESS_REVIEWER_FAILURE.PROVIDER_FAILED, "provider exploded"),
+	), ReviewHostRelayError);
+	assert.deepEqual(runs.map((run) => run.type), ["started", "failed"]);
+	const failed = runs[1];
+	assert.equal(failed?.type === "failed" && failed.cancelled, false);
+	assert.match(failed?.type === "failed" ? failed.error : "", /provider exploded/);
+});
+
+test("a throwing activity listener never changes the reviewer result", async (t) => {
+	const fixture = harness(t);
+	const prepared = await prepareReviewHostRelaySlot(relayRequest(fixture, { onActivity: () => { throw new Error("display broke"); } }), textReviewer(REVIEWER_TEXT).runReviewer);
+	await submitReviewHostRelayPreparedResult(prepared);
+	assert.deepEqual(readFileSync(fixture.submitCapturePath), Buffer.from(REVIEWER_TEXT, "utf8"));
+});

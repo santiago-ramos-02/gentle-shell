@@ -33,6 +33,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { gentleAiIsolationEnv, resolveGentleAiBinary } from "./gentle-ai-binary.ts";
 import {
@@ -45,6 +46,7 @@ import {
 } from "./inprocess-reviewer.ts";
 import { REVIEW_PROVIDER_ROLE_CAPTURE_OPERATION, REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS, type ReviewCaptureSubmissionV1, type ReviewCollectInputV3 } from "./review-integration-v2.ts";
 import { GENTLE_PI_REVIEW_RELAY_CONTRACT, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV } from "./review-relay-contract.ts";
+import type { ReviewReviewerRun } from "./review-reviewer-activity.ts";
 
 export const REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE =
 	"provider relay requires a gentle-ai build with the pi host relay surface";
@@ -407,6 +409,8 @@ export interface ReviewHostRelayRequest {
 	 */
 	readonly piTimeoutMs?: number;
 	readonly signal?: AbortSignal;
+	/** Hears the reviewer run start and settle, so a host can show it as an agent. Display only. */
+	readonly onActivity?: (run: ReviewReviewerRun) => void;
 }
 
 export interface ReviewHostRelayResult {
@@ -672,7 +676,28 @@ export async function prepareReviewHostRelaySlot(
 	// supplied AbortSignal intentionally stays live across materialize, reviewer,
 	// and submit, preserving the established cancellation behavior.
 	const preparedRequest = snapshotReviewHostRelayRequest(request);
+	const report = preparedRequest.onActivity;
+	if (report === undefined) return await prepareSnapshotReviewHostRelaySlot(preparedRequest, runReviewer);
+	const id = `review-${randomUUID()}`;
+	// A display listener never changes the review's outcome.
+	const notify = (run: ReviewReviewerRun) => {
+		try { report(run); } catch { /* Display only. */ }
+	};
+	notify({ type: "started", id, agent: preparedRequest.routingKey!, model: preparedRequest.selection!, thinking: preparedRequest.thinking, at: Date.now() });
+	try {
+		const prepared = await prepareSnapshotReviewHostRelaySlot(preparedRequest, runReviewer);
+		notify({ type: "finished", id, text: preparedResultBytes.get(prepared)?.toString("utf8") ?? "", at: Date.now() });
+		return prepared;
+	} catch (error) {
+		notify({ type: "failed", id, error: error instanceof Error ? error.message : String(error), cancelled: preparedRequest.signal?.aborted === true, at: Date.now() });
+		throw error;
+	}
+}
 
+async function prepareSnapshotReviewHostRelaySlot(
+	preparedRequest: ReviewHostRelayRequest,
+	runReviewer: typeof runInProcessReviewer,
+): Promise<ReviewHostRelayPreparedResult> {
 	// The provider materializes the opaque prompt and detects whether this relay
 	// surface is available. No version sniffing or prompt reconstruction occurs.
 	// The materialize subcommand is the provider's own submission operation

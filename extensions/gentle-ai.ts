@@ -11,6 +11,7 @@ import { allowedEditSurfaces as hasTaskScopedAllowedEditSurfaces, bindSessionRep
 import { rejectUnriskedVerifierLaunch } from "../lib/verifier-admission.ts";
 import { consumeReviewMutation, pendingReviewMutation, pendingReviewMutationProfiles, recordReviewMutation, type ReceiptSession } from "../lib/review-reminder-receipt.ts";
 import { createReviewSidebarPublisher } from "../lib/review-sidebar-state.ts";
+import { reviewReviewerActivityReporter } from "../lib/review-reviewer-activity.ts";
 import { StatusTimingDiagnostics } from "../lib/status-timing-diagnostics.ts";
 import { isOddPhase, oddPhaseRegistry, ODD_PHASES } from "../lib/odd-phase.ts";
 import { shellEnabled } from "../lib/shell-bar.ts";
@@ -7608,6 +7609,7 @@ async function executeReviewHostRelayCapture(
 	reviewerSessionId?: string,
 	implicitWorkspaceRoot?: string,
 	getReviewerTransport?: () => ReviewHostRelayRequest["reviewerTransport"],
+	onReviewerActivity?: ReviewHostRelayRequest["onActivity"],
 ): Promise<Record<string, unknown>> {
 	try {
 		if (slot.submission === undefined) {
@@ -7640,6 +7642,7 @@ async function executeReviewHostRelayCapture(
 				...(reviewerSessionId === undefined ? {} : { reviewerSessionId }),
 				...(reviewerTransport === undefined ? {} : { reviewerTransport }),
 				...(signal === undefined ? {} : { signal }),
+				...(onReviewerActivity === undefined ? {} : { onActivity: onReviewerActivity }),
 			};
 		})());
 		const closure = decodeRelayLastEventClosure(result.submission);
@@ -8281,6 +8284,7 @@ async function executeReviewCaptureOperation(
 	reviewerSessionId?: string,
 	// Read effective settings only when the acknowledged capture actually runs.
 	getReviewerTransport?: () => ReviewHostRelayRequest["reviewerTransport"],
+	onReviewerActivity?: ReviewHostRelayRequest["onActivity"],
 ): Promise<Record<string, unknown>> {
 	const parameters = parseReviewCaptureParameters(parametersValue);
 	if (nativeReviewCli === null || nativeReviewCli.targetStatus === undefined) {
@@ -8345,7 +8349,7 @@ async function executeReviewCaptureOperation(
 				mutation_outcome: "none",
 			};
 		}
-		return withCorrectionTarget(await executeReviewHostRelayCapture(hostRelaySlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal, modelRegistry, reviewerSessionId, implicitWorkspaceRoot, getReviewerTransport));
+		return withCorrectionTarget(await executeReviewHostRelayCapture(hostRelaySlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal, modelRegistry, reviewerSessionId, implicitWorkspaceRoot, getReviewerTransport, onReviewerActivity));
 	}
 
 	// gentle-pi#311 P3: gentle-ai's v9 contract renders the refuter and
@@ -8371,7 +8375,7 @@ async function executeReviewCaptureOperation(
 				mutation_outcome: "none",
 			};
 		}
-		return withCorrectionTarget(await executeReviewHostRelayCapture(hostMediatedRoleSlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal, modelRegistry, reviewerSessionId, implicitWorkspaceRoot, getReviewerTransport));
+		return withCorrectionTarget(await executeReviewHostRelayCapture(hostMediatedRoleSlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal, modelRegistry, reviewerSessionId, implicitWorkspaceRoot, getReviewerTransport, onReviewerActivity));
 	}
 
 	if (selected.input.captureOperation === "review.capture-correction-plan") {
@@ -8457,6 +8461,7 @@ async function executeReviewCaptureGroupOperation(
 	// header. Appended last for the same positional-call-site reason as above.
 	reviewerSessionId?: string,
 	getReviewerTransport?: () => ReviewHostRelayRequest["reviewerTransport"],
+	onReviewerActivity?: ReviewHostRelayRequest["onActivity"],
 ): Promise<Record<string, unknown>> {
 	const parameters = parseReviewCaptureGroupParameters(parametersValue);
 	if (nativeReviewCli === null || nativeReviewCli.targetStatus === undefined) return { ...captureGroupRejected("native target STATUS is unavailable"), outcome: "native-status-unsupported" };
@@ -8509,6 +8514,7 @@ async function executeReviewCaptureGroupOperation(
 		...(reviewerSessionId === undefined ? {} : { reviewerSessionId }),
 		...(reviewerTransport === undefined ? {} : { reviewerTransport }),
 		...(signal === undefined ? {} : { signal }),
+		...(onReviewerActivity === undefined ? {} : { onActivity: onReviewerActivity }),
 	}));
 	let prepared: readonly ReviewHostRelayPreparedResult[];
 	try {
@@ -9985,6 +9991,7 @@ function createGentleAiExtensionForTesting(
 				// (pi adds those inside the main agent loop; this is not that loop).
 				reviewSessionManagerAndId(ctx)?.sessionId,
 				() => pi.getSettings?.().transport,
+				reviewReviewerActivityReporter(pi.events, reviewSessionManagerAndId(ctx)?.sessionId, ctx.cwd),
 			);
 			return { content: [{ type: "text", text: JSON.stringify(details) }], details };
 		},
@@ -10029,6 +10036,7 @@ function createGentleAiExtensionForTesting(
 				// (pi adds those inside the main agent loop; this is not that loop).
 				reviewSessionManagerAndId(ctx)?.sessionId,
 				() => pi.getSettings?.().transport,
+				reviewReviewerActivityReporter(pi.events, reviewSessionManagerAndId(ctx)?.sessionId, ctx.cwd),
 			);
 			return {
 				content: [{ type: "text", text: JSON.stringify(details) }],
