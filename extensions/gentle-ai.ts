@@ -1980,6 +1980,21 @@ function yoloConfiguredRestriction(cwd: string, keys: readonly GuardedCommandKey
 	return restriction;
 }
 
+/** Super Yolo ignores every configurable guardrail: only code-level denies survive. */
+const SUPER_YOLO_GUARDRAILS: RuntimeGuardrailsConfig = {
+	autonomousMode: true,
+	guardedCommands: { gitPush: "allow", gitRebase: "allow", gitBranchDeleteForce: "allow", npmPublish: "allow", piRemove: "allow" },
+};
+
+/**
+ * Super Yolo command decision: run everything without confirmation except the
+ * code-level catastrophic denies (root/home recursive removal, --no-preserve-root,
+ * hard-denied patterns). Configured guardrails are deliberately not consulted.
+ */
+function evaluateSuperYoloCommand(command: string): GuardAction {
+	return evaluateGuardedCommand(command, SUPER_YOLO_GUARDRAILS).action === "block" ? "block" : "allow";
+}
+
 async function confirmCommand(
 	command: string,
 	ctx: ExtensionContext,
@@ -1987,7 +2002,19 @@ async function confirmCommand(
 	herdrLifecycle: HerdrConfirmationLifecycle,
 	yoloActive = false,
 	autoGate?: () => Promise<ToolCallEventResult | undefined>,
+	superActive = false,
 ): Promise<ToolCallEventResult | undefined> {
+	if (superActive) {
+		// Sensitive-path and delivered-test guards already ran before this call;
+		// here only the code-level catastrophic denies remain.
+		if (evaluateSuperYoloCommand(command) === "block") {
+			return {
+				block: true,
+				reason: "Gentle AI safety policy blocked a catastrophic destructive shell command. Ask the user for an explicit safer plan.",
+			};
+		}
+		return autoGate?.();
+	}
 	const guardrailsConfig = loadRuntimeGuardrailsConfig(ctx.cwd);
 	const evaluation = evaluateGuardedCommand(command, guardrailsConfig);
 	// Configuration provenance is distinct from legacy autonomy resolution, which
@@ -9619,6 +9646,7 @@ export const __testing = {
 	guardedCommandTitle,
 	loadRuntimeGuardrailsConfig,
 	isReversibleYoloCommand,
+	evaluateSuperYoloCommand,
 	yoloConfiguredRestriction,
 	buildGentlePrompt,
 	nativeStatusUnsupported,
@@ -10347,7 +10375,7 @@ function createGentleAiExtensionForTesting(
 		// and forwards only systemPromptOptions, so the harness is delivered
 		// through the mutable appendSystemPrompt section instead of a replacement.
 		appendSystemPromptOnce(event.systemPromptOptions, `${gentlePrompt}${reviewContractPrompt}`);
-		updateYoloPrompt(event.systemPromptOptions, isPrimarySession && await yolo.active(ctx));
+		updateYoloPrompt(event.systemPromptOptions, isPrimarySession && await yolo.active(ctx), isPrimarySession && await yolo.superActive(ctx));
 		updateAutoPrompt(event.systemPromptOptions, isPrimarySession && await yolo.mode(ctx) === "auto");
 		return undefined;
 	});
@@ -10444,7 +10472,11 @@ function createGentleAiExtensionForTesting(
 			return { block: true, reason: `${event.toolName} runs only as a direct tool call: call it directly, never from codemode or another tool.` };
 		}
 		const primaryToolCall = permissionEnvironment.GENTLE_PI_AGENTS_CHILD !== "1" && (processAgentEndSubagentDepth.get(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey)) ?? 0) === 0;
-		const yoloActive = primaryToolCall && await yolo.active(ctx);
+		// One early mode read settles the session binding (and its one-time epoch
+		// bump) before the guarded region below captures its own epoch.
+		const settledMode = primaryToolCall ? await yolo.mode(ctx) : "normal";
+		const yoloActive = primaryToolCall && settledMode === "yolo";
+		const superYoloActive = primaryToolCall && settledMode === "super-yolo";
 		const sensitivePathDenied = evaluateSensitivePathTool(
 			event.toolName,
 			event.input,
@@ -10496,7 +10528,7 @@ function createGentleAiExtensionForTesting(
 			return { block: true, reason: "Permission mode changed during tool admission. This action was not run; retry under the current mode." };
 		}
 		const autoGate = permissionMode === "auto" ? gate : undefined;
-		return await confirmCommand(command, ctx, pi.events, herdrLifecycle, yoloActive, autoGate);
+		return await confirmCommand(command, ctx, pi.events, herdrLifecycle, yoloActive, autoGate, superYoloActive);
 	});
 
 	for (const owner of ["delegation", "review"] as const) {
