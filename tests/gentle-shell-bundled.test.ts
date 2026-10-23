@@ -16,12 +16,16 @@ import {
 	bundledUpdatePlan,
 	parseBundledUpgradeArgs,
 	withBundledNpmCommand,
+	withoutBundledNpmCommand,
+	withoutMissingBundledNpmCommand,
 	resolveBundledInstall,
 	setBundledInstallForTesting,
 	type BundledFs,
+	isBundledNpmCommand,
 	type BundledPi,
 } from "../lib/gentle-shell-bundled.ts";
 import { artifactFor, engramPinVersion } from "../scripts/installer-downloads.mjs";
+import { bundledNpmCommand, prefixLayout } from "../scripts/bundled-install.mjs";
 import { gentlePiConfigHome } from "../lib/agent-home.ts";
 import { resolveBackgroundSubagentsPolicy } from "../lib/background-subagents-policy.ts";
 
@@ -172,6 +176,83 @@ test("withBundledNpmCommand sets only npmCommand and leaves an already bundled s
 	assert.deepEqual(JSON.parse(replaced.status === "write" ? replaced.text : "{}"), { npmCommand: command });
 	assert.deepEqual(JSON.parse((withBundledNpmCommand(undefined, command) as { text: string }).text), { npmCommand: command });
 	for (const malformed of ["{", "[]", "null"]) assert.deepEqual(withBundledNpmCommand(malformed, command), { status: "malformed" });
+});
+
+// #2469: the npmCommand a bundled self-uninstall left behind names a node.exe
+// the uninstall removed, so Pi package installs fail with ENOENT until it is
+// gone; a command naming nothing inside the removed prefix stays.
+test("withoutBundledNpmCommand removes the key when an entry names the removed prefix and keeps the rest", () => {
+	const text = '{\n    "theme": "gentle",\n    "npmCommand": ["/p/runtime/node.exe", "--update-notifier=false"]\n}\n';
+	const removed = withoutBundledNpmCommand(text, (path) => path === "/p/runtime/node.exe");
+	assert.ok(removed.status === "removed", removed.status);
+	assert.deepEqual(JSON.parse(removed.text), { theme: "gentle" });
+	assert.match(removed.text, /^\{\n {4}"theme"/);
+	assert.ok(removed.text.endsWith("}\n"));
+	assert.deepEqual(withoutBundledNpmCommand(undefined, () => true), { status: "unchanged" });
+	assert.deepEqual(withoutBundledNpmCommand('{"npmCommand":"npm"}', () => true), { status: "unchanged" });
+	assert.deepEqual(withoutBundledNpmCommand('{"npmCommand":["node"]}', () => true), { status: "unchanged" });
+	assert.deepEqual(withoutBundledNpmCommand('{"npmCommand":["/other/node"]}', () => false), { status: "unchanged" });
+	assert.deepEqual(withoutBundledNpmCommand('{"theme":"gentle"}', () => true), { status: "unchanged" });
+	for (const malformed of ["{", "[]", "null"]) assert.deepEqual(withoutBundledNpmCommand(malformed, () => true), { status: "malformed" });
+});
+
+test("withoutMissingBundledNpmCommand removes only a bundled npmCommand whose executable is an absolute path that is gone", () => {
+	const text = '{\n    "theme": "gentle",\n    "npmCommand": ["/p/runtime/node-24.21.0/bin/node", "--userconfig=/p/pnpm/config/npmrc", "--globalconfig=/p/npm/npmrc", "--cache=/p/npm/cache", "--update-notifier=false"]\n}\n';
+	const removed = withoutMissingBundledNpmCommand(text, (path) => path !== "/p/runtime/node-24.21.0/bin/node");
+	assert.ok(removed.status === "removed", removed.status);
+	assert.deepEqual(JSON.parse(removed.text), { theme: "gentle" });
+	// An executable that exists, a PATH command, a non-array value, no key, no file.
+	assert.deepEqual(withoutMissingBundledNpmCommand(text, () => true), { status: "unchanged" });
+	assert.deepEqual(withoutMissingBundledNpmCommand('{"npmCommand":["npm"]}', () => false), { status: "unchanged" });
+	assert.deepEqual(withoutMissingBundledNpmCommand('{"npmCommand":"npm"}', () => false), { status: "unchanged" });
+	assert.deepEqual(withoutMissingBundledNpmCommand('{"theme":"gentle"}', () => false), { status: "unchanged" });
+	assert.deepEqual(withoutMissingBundledNpmCommand(undefined, () => false), { status: "unchanged" });
+	for (const malformed of ["{", "[]", "null"]) assert.deepEqual(withoutMissingBundledNpmCommand(malformed, () => false), { status: "malformed" });
+});
+
+// A missing program alone is not proof the command is ours: a user's
+// npmCommand on an offline drive must survive the launcher repair, so only the
+// shape a bundled install writes is ever dropped (PR #2472 review).
+test("withoutMissingBundledNpmCommand never drops a user's npmCommand, even with a missing program", () => {
+	// The posix form the launcher sees on this platform is dropped. The Windows
+	// form is covered by isBundledNpmCommand: the launcher's isAbsolute is
+	// platform-specific, so a C:\ path is only absolute on Windows.
+	const posix = "/home/ana/.gentle-shell";
+	const flags = (root: string, sep: string) => [`--userconfig=${root}${sep}pnpm${sep}config${sep}npmrc`, `--globalconfig=${root}${sep}npm${sep}npmrc`, `--cache=${root}${sep}npm${sep}cache`];
+	const bundledForm = [`${posix}/runtime/node-24.21.0/bin/node`, `${posix}/runtime/node-24.21.0/lib/node_modules/npm/bin/npm-cli.js`, ...flags(posix, "/"), `--prefix=${posix}/npm/prefix`, "--update-notifier=false"];
+	{
+		const command = bundledForm;
+		const text = JSON.stringify({ theme: "gentle", npmCommand: command });
+		const removed = withoutMissingBundledNpmCommand(text, () => false);
+		assert.ok(removed.status === "removed", `${command[0]}: ${removed.status}`);
+	}
+	// What a user writes is never ours, even with a missing program.
+	const userCommands: unknown[][] = [
+		["npm"],
+		["C:\\tools\\node.exe", "C:\\tools\\npm-cli.js"],
+		["C:\\Users\\ana\\AppData\\Local\\gentle-shell\\runtime\\node-24.21.0\\node.exe", "npm-cli.js"],
+		["/opt/runtime/node-20.0.0/bin/node", "/opt/npm-cli.js", "--update-notifier=false"],
+	];
+	for (const command of userCommands) {
+		const text = JSON.stringify({ theme: "gentle", npmCommand: command });
+		assert.deepEqual(withoutMissingBundledNpmCommand(text, () => false), { status: "unchanged" }, JSON.stringify(command));
+	}
+});
+
+test("isBundledNpmCommand recognizes only the npmCommand a bundled install writes, in every released form", () => {
+	const win = "C:\\Users\\ana\\AppData\\Local\\gentle-shell";
+	const posix = "/home/ana/.gentle-shell";
+	const flags = (root: string, sep: string) => [`--userconfig=${root}${sep}pnpm${sep}config${sep}npmrc`, `--globalconfig=${root}${sep}npm${sep}npmrc`, `--cache=${root}${sep}npm${sep}cache`];
+	// What the installer writes today on each platform, and its two released forms.
+	assert.equal(isBundledNpmCommand(bundledNpmCommand(prefixLayout({ platform: "win32", home: "C:\\Users\\ana", root: win }))), true);
+	assert.equal(isBundledNpmCommand(bundledNpmCommand(prefixLayout({ platform: "darwin", home: "/home/ana" }))), true);
+	assert.equal(isBundledNpmCommand([`${win}\\runtime\\node-24.21.0\\node.exe`, `${win}\\runtime\\node-24.21.0\\gentle-shell\\npm`, ...flags(win, "\\"), "--update-notifier=false"]), true);
+	assert.equal(isBundledNpmCommand([`${posix}/runtime/node-24.21.0/bin/node`, `${posix}/runtime/node-24.21.0/lib/node_modules/npm/bin/npm-cli.js`, ...flags(posix, "/"), `--prefix=${posix}/npm/prefix`, "--update-notifier=false"]), true);
+	// What a user writes is never ours, even with a missing program.
+	for (const command of [["npm"], ["C:\\tools\\node.exe", "C:\\tools\\npm-cli.js"], [`${win}\\runtime\\node-24.21.0\\node.exe`, "npm-cli.js"],
+		["/opt/runtime/node-20.0.0/bin/node", "/opt/npm-cli.js", "--update-notifier=false"]]) {
+		assert.equal(isBundledNpmCommand(command), false, JSON.stringify(command));
+	}
 });
 
 test("bundledUpdatePlan redirects Pi's own update and keeps the extension updates", () => {

@@ -96,6 +96,7 @@ import {
 	parseBundledUpgradeArgs,
 	resolveBundledInstall,
 	withBundledNpmCommand,
+	withoutMissingBundledNpmCommand,
 } from "../runtime/gentle-shell-bundled.mjs";
 import {
 	parseResumeHandoff,
@@ -1822,6 +1823,26 @@ async function ensureBundledNpmCommand(bundled, home, homeHadContentBeforeBootst
 	}
 }
 
+// The npmCommand a bundled install wrote into a home it owns must not outlive
+// it (#2469): Pi runs it for every package install, so a key naming a deleted
+// node.exe fails them all with ENOENT. A main-channel bootstrap drops the key
+// when it has the shape a bundled install writes and its node is gone; a
+// command the user set is never touched, and neither are an existing
+// executable, a link home and a foreign home.
+async function removeMissingNpmCommand(home, homeHadContentBeforeBootstrap) {
+	if (home.mode === "link") return;
+	const previous = provisionedEntry(readRawConfig(resolveConfigPath()), safeRealpath(home.dir));
+	if (homeIsForeign(home, previous, homeHadContentBeforeBootstrap) || !isDirectory(home.dir)) return;
+	const settingsPath = join(home.dir, "settings.json");
+	const edit = withoutMissingBundledNpmCommand(readJsonIfExists(settingsPath), (path) => existsSync(path));
+	if (edit.status === "malformed") {
+		process.stderr.write(`gentle-shell: ${settingsPath} is not a JSON object, so a stale npmCommand in it is not repaired\n`);
+	} else if (edit.status === "removed") {
+		writeFileAtomically(settingsPath, edit.text);
+		process.stderr.write(`gentle-shell: removed the bundled npmCommand naming a missing executable from ${settingsPath}; Pi installs packages with the npm on your PATH\n`);
+	}
+}
+
 // `gentle-shell self-uninstall` in a bundled install (S6, S7): the prefix's own
 // folders and exactly the PATH entry its receipt records; on Windows the running
 // node.exe and launcher are removed by a detached process after this one exits.
@@ -2078,6 +2099,12 @@ async function main() {
 			await ensureBundledNpmCommand(bundled, home, homeHadContentBeforeBootstrap);
 		} catch (error) {
 			process.stderr.write(`gentle-shell: could not give Pi the bundled npm in ${join(home.dir, "settings.json")} (${error.message}); continuing\n`);
+		}
+	} else {
+		try {
+			await removeMissingNpmCommand(home, homeHadContentBeforeBootstrap);
+		} catch (error) {
+			process.stderr.write(`gentle-shell: could not repair the npmCommand in ${join(home.dir, "settings.json")} (${error.message}); continuing\n`);
 		}
 	}
 

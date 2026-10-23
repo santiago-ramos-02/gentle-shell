@@ -1,7 +1,7 @@
 import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { createConnection } from "node:net";
-import { dirname, posix, win32 } from "node:path";
+import { dirname, isAbsolute, posix, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // The launcher in a bundled install (S5, S8): pure decisions over an injected
@@ -489,6 +489,58 @@ export function withBundledNpmCommand(settingsText: string | undefined, command:
 	const indent = settingsText?.match(/\{\r?\n([ \t]+)/)?.[1] ?? "  ";
 	const serialized = JSON.stringify({ ...settings, npmCommand: command }, null, indent);
 	return { status: "write", text: settingsText === undefined || settingsText.endsWith("\n") ? `${serialized}\n` : serialized };
+}
+
+export type BundledNpmCommandRemoval = { status: "unchanged" } | { status: "malformed" } | { status: "removed"; text: string };
+
+// settings.json without `npmCommand`: every other key kept in order and the
+// file's indentation and final newline kept.
+function settingsWithoutNpmCommand(settingsText: string, settings: Record<string, unknown>): string {
+	const indent = settingsText.match(/\{\r?\n([ \t]+)/)?.[1] ?? "  ";
+	const { npmCommand: _removed, ...rest } = settings;
+	const serialized = JSON.stringify(rest, null, indent);
+	return settingsText.endsWith("\n") ? `${serialized}\n` : serialized;
+}
+
+// The agent home's settings.json without a `npmCommand` naming the prefix a
+// bundled self-uninstall removed (gentle-shell-uninstall.ts): one absolute
+// entry inside `withinRemoved` drops the whole key, every other key kept in
+// order and the file's indentation and final newline kept. A file that is not
+// a JSON object is never rewritten; a command naming nothing inside it stays.
+export function withoutBundledNpmCommand(settingsText: string | undefined, withinRemoved: (path: string) => boolean): BundledNpmCommandRemoval {
+	if (settingsText === undefined) return { status: "unchanged" };
+	const settings = parseJson(settingsText);
+	if (typeof settings !== "object" || settings === null || Array.isArray(settings)) return { status: "malformed" };
+	const current = settings.npmCommand;
+	if (!Array.isArray(current) || !current.some((part) => typeof part === "string" && isAbsolute(part) && withinRemoved(part))) return { status: "unchanged" };
+	return { status: "removed", text: settingsWithoutNpmCommand(settingsText, settings) };
+}
+
+// An `npmCommand` a bundled install wrote (scripts/bundled-install.mjs
+// bundledNpmCommand, with npm-cli.js and --prefix in earlier releases): our
+// node in runtime/node-<v>, then npm's settings and cache flags, and
+// --update-notifier=false last. A command the user chose never matches, even
+// when its program is missing.
+export function isBundledNpmCommand(command: readonly unknown[]): boolean {
+	const [node] = command;
+	return typeof node === "string" && /[\\/]runtime[\\/]node-[^\\/]+[\\/](node\.exe|bin[\\/]node)$/.test(node)
+		&& ["--userconfig=", "--globalconfig=", "--cache="].every((flag) => command.some((part) => typeof part === "string" && part.startsWith(flag)))
+		&& command[command.length - 1] === "--update-notifier=false";
+}
+
+// The agent home's settings.json without an `npmCommand` a bundled install
+// wrote whose executable (its first entry) no longer exists, as after a
+// bundled self-uninstall that kept the home (#2469): Pi runs that command for
+// every package install, so a key naming a deleted node.exe fails them all
+// with ENOENT. A command whose executable exists, that names no absolute
+// path, or that the user set themselves is never touched.
+export function withoutMissingBundledNpmCommand(settingsText: string | undefined, exists: (path: string) => boolean): BundledNpmCommandRemoval {
+	if (settingsText === undefined) return { status: "unchanged" };
+	const settings = parseJson(settingsText);
+	if (typeof settings !== "object" || settings === null || Array.isArray(settings)) return { status: "malformed" };
+	const executable = Array.isArray(settings.npmCommand) ? settings.npmCommand[0] : undefined;
+	if (typeof executable !== "string" || !isAbsolute(executable) || exists(executable) || !isBundledNpmCommand(settings.npmCommand as unknown[])) return { status: "unchanged" };
+	return { status: "removed", text: settingsWithoutNpmCommand(settingsText, settings) };
 }
 
 export interface BundledUpdatePlan {
