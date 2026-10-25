@@ -12,7 +12,7 @@ import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellSidebarBar, keepNativeWorkingRow, shellEnabled, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
+import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
@@ -31,7 +31,7 @@ import { DEFAULT_VISUAL_SETTINGS, DENSITY, HEADER_PLACEMENT, STATUS_PLACEMENT, V
 import { BANNER_COLORS, DEFAULT_BANNER_CONFIG, readBannerConfig, readBannerConfigForEdit, writeBannerConfig } from "./startup-banner.ts";
 import { agentsViewKey } from "../lib/agents-keys.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
-import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_WATCHDOG_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { inferOddPhase } from "../lib/odd-phase-inference.ts";
 import { isInteractiveMode } from "../lib/rpc-host.ts";
@@ -278,33 +278,38 @@ function sessionCost(ctx: ExtensionContext): number {
 }
 
 type ShellSessionStats = { costTotal: number; usage: ReturnType<ExtensionContext["getContextUsage"]> };
-const shellSessionStats = new WeakMap<object, {
-	sessionId: string | undefined;
-	leafId: string | null;
-	entryCount: number | undefined;
-	model: ExtensionContext["model"];
-	contextWindow: number | undefined;
-	stats: ShellSessionStats;
-}>();
+// The exact identity sessionStats' memo keys on: when any element differs the
+// stats are recomputed. Undefined means the host lacks the leaf identity and
+// the stats must be computed fresh on every call. Callers that digest live
+// state per frame (issue #1681) reuse this key so their own memos can never
+// disagree with sessionStats about what is still current.
+type SessionStatsKey = readonly [
+	sessionId: string | undefined,
+	leafId: string | null,
+	entryCount: number | undefined,
+	model: ExtensionContext["model"],
+	contextWindow: number | undefined,
+];
+const shellSessionStats = new WeakMap<object, { key: SessionStatsKey; stats: ShellSessionStats }>();
 
-function sessionStats(ctx: ExtensionContext): ShellSessionStats {
+function sessionStatsKey(ctx: ExtensionContext): SessionStatsKey | undefined {
 	const manager = ctx.sessionManager as ExtensionContext["sessionManager"] & { getEntryCount?(): number };
-	const compute = (): ShellSessionStats => ({ costTotal: sessionCost(ctx), usage: ctx.getContextUsage() });
 	// Append-only session entries move the leaf, including compaction and branch
 	// switches. A virtual model's routed physical model comes from the latest
 	// response, which is appended as an entry, so the leaf covers it as well.
 	// Older/test hosts without that identity must stay uncached.
-	if (typeof manager.getLeafId !== "function") return compute();
-	const sessionId = manager.getSessionId();
-	const leafId = manager.getLeafId();
-	const entryCount = manager.getEntryCount?.();
-	const model = ctx.model;
-	const contextWindow = model?.contextWindow;
-	const cached = shellSessionStats.get(manager);
-	if (cached && cached.sessionId === sessionId && cached.leafId === leafId &&
-		cached.entryCount === entryCount && cached.model === model && cached.contextWindow === contextWindow) return cached.stats;
+	if (typeof manager.getLeafId !== "function") return undefined;
+	return [manager.getSessionId(), manager.getLeafId(), manager.getEntryCount?.(), ctx.model, ctx.model?.contextWindow] as const;
+}
+
+function sessionStats(ctx: ExtensionContext): ShellSessionStats {
+	const compute = (): ShellSessionStats => ({ costTotal: sessionCost(ctx), usage: ctx.getContextUsage() });
+	const key = sessionStatsKey(ctx);
+	if (!key) return compute();
+	const cached = shellSessionStats.get(ctx.sessionManager);
+	if (cached && cached.key.every((value, index) => value === key[index])) return cached.stats;
 	const stats = compute();
-	shellSessionStats.set(manager, { sessionId, leafId, entryCount, model, contextWindow, stats });
+	shellSessionStats.set(ctx.sessionManager, { key, stats });
 	return stats;
 }
 
@@ -338,6 +343,75 @@ export function buildShellBarModel(
 		...(options.jobs !== undefined ? { jobs: options.jobs } : {}),
 		statuses,
 	};
+}
+
+export interface FooterStatusMemoDeps {
+	pi: ExtensionAPI;
+	ctx: ExtensionContext;
+	footerData: ShellFooterData;
+	usage: () => ProviderUsage | undefined;
+	profile: () => string | undefined;
+	jobs: () => RunningJobDisplay[] | undefined;
+	review: () => ReviewSidebarSnapshot | undefined;
+	tracker: () => Pick<WorktreeChangesTracker, "model" | "unbornRoots">;
+	visualSettings: () => unknown;
+	cardStyle: () => unknown;
+}
+
+// Issue #1681: railDigest evaluates every rail's digest before the fullscreen
+// layout's prepared cache can answer, so both Status rails digest per
+// keystroke and a cache hit still paid for building and serializing the whole
+// bar model. The memo keys on the cheap live inputs the model reads instead:
+// the digest serializes only this key, and the model is rebuilt just when one
+// of those inputs moved. On hosts without leaf identity the session stats
+// stay uncached and ride the key by value, so those hosts keep exactly the
+// pre-memo digest honesty.
+export function createFooterStatusMemo(deps: FooterStatusMemoDeps): { key(): string; model(): ShellBarModel } {
+	const { pi, ctx, footerData } = deps;
+	let cache: { key: string; model: ShellBarModel } | undefined;
+	const key = (): string => {
+		const statsKey = sessionStatsKey(ctx);
+		const model = ctx.model;
+		return JSON.stringify([
+			// Session statistics identity by value: without leaf identity the
+			// computed stats ride the key, so those hosts keep exactly the pre-memo
+			// digest honesty. The model rides its value pieces (id, contextWindow,
+			// effort lookup, OAuth state) because that is all buildShellBarModel
+			// reads — serializing the model object itself would bloat every digest.
+			statsKey ? [statsKey[0], statsKey[1], statsKey[2]] : sessionStats(ctx),
+			model?.id ?? null,
+			model?.contextWindow ?? null,
+			model?.reasoning ? (isNanAdaptiveReasoningModel(model) ? "auto" : pi.getThinkingLevel()) : undefined,
+			model ? ctx.modelRegistry.isUsingOAuth(model) : false,
+			footerData.getGitBranch(),
+			deps.profile(),
+			ctx.sessionManager.getSessionName(),
+			ctx.sessionManager.getCwd(),
+			[...footerData.getExtensionStatuses()].sort(([a], [b]) => a.localeCompare(b)),
+			deps.usage(),
+			deps.jobs(),
+			deps.review(),
+			(() => {
+				const { model: changes, unbornRoots } = deps.tracker();
+				return { fingerprint: changesFingerprint(changes), files: changes.files.length, added: changes.added, deleted: changes.deleted, unbornRoots: unbornRoots.length };
+			})(),
+			deps.visualSettings(),
+			deps.cardStyle(),
+		]);
+	};
+	const model = (): ShellBarModel => {
+		const k = key();
+		if (cache?.key === k) return cache.model;
+		const tracker = deps.tracker();
+		const built: ShellBarModel = {
+			...buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: deps.usage(), profile: deps.profile(), jobs: deps.jobs() }),
+			changes: { files: tracker.model.files.length, added: tracker.model.added, deleted: tracker.model.deleted },
+			review: deps.review(),
+		};
+		cache = { key: k, model: built };
+		return built;
+	};
+	return { key, model };
 }
 
 // Gauge-specific theme roles (issue #2222): resolved from the installed theme
@@ -399,6 +473,8 @@ interface PromptEditorDeps {
 	/** Pasted images become atomic `[Image#N]` chips; absent, Pi's paste handler runs unchanged. */
 	attachments?: ImageAttachments;
 	readClipboardImage?: () => Promise<ClipboardImage | null>;
+	/** Injectable silence-watchdog window; production and tests default to SHELL_PULSE_WATCHDOG_MS. */
+	watchdogMs?: number;
 }
 
 const PROMPT_FRAME_ROLE = "border";
@@ -453,7 +529,10 @@ export class GentlePromptEditor extends CustomEditor {
 	private visualReplacePending = false;
 	private visualObjectPending: "i" | "a" | undefined;
 	private visualAnchor: { line: number; col: number } | undefined;
-	private pulse: NodeJS.Timeout | undefined;
+	private watchdog: NodeJS.Timeout | undefined;
+	// Last time a frame painted (or the watchdog forced one) while working; the
+	// quality watchdog repaints only when now() drifts past its window.
+	private lastRenderAt = 0;
 	private readonly deps: PromptEditorDeps;
 	private floatMouseLayout?: ReturnType<typeof resolvePromptLayout>;
 	// Native selection engine (shift+home/end, alt+a, replace-on-key): ported
@@ -560,8 +639,8 @@ export class GentlePromptEditor extends CustomEditor {
 	setAnimationPolicy(policy: AnimationPolicy): void {
 		if (this.animationPolicy === policy) return;
 		this.animationPolicy = policy;
-		this.stopPulse();
-		if (this.promptState === PROMPT_STATE.WORKING) this.startPulse();
+		this.stopWatchdog();
+		if (this.promptState === PROMPT_STATE.WORKING) this.startWatchdog();
 		this.deps.requestRender();
 	}
 
@@ -646,24 +725,32 @@ export class GentlePromptEditor extends CustomEditor {
 		this.deps.requestRender();
 	}
 
-	private startPulse(): void {
+	private startWatchdog(): void {
 		if (this.animationPolicy === "potato") return;
-		this.pulse = setInterval(() => {
+		const windowMs = this.deps.watchdogMs ?? SHELL_PULSE_WATCHDOG_MS;
+		this.lastRenderAt = this.deps.now();
+		this.watchdog = setInterval(() => {
+			// Render-driven petal (gentle-shell#994): streaming frames already
+			// advance the animation in render(), so under quality the watchdog
+			// stays silent unless no frame painted within its window. performance
+			// keeps its coarse cadence regardless of render traffic.
+			if (this.animationPolicy === "quality" && this.deps.now() - this.lastRenderAt < windowMs) return;
 			this.tick += 1;
+			this.lastRenderAt = this.deps.now();
 			this.deps.requestRender();
-		}, this.animationPolicy === "performance" ? 1000 : SHELL_PULSE_MS);
-		this.pulse.unref();
+		}, windowMs);
+		this.watchdog.unref();
 	}
 
 	setWorking(working: boolean): void {
 		this.promptState = working ? PROMPT_STATE.WORKING : PROMPT_STATE.IDLE;
-		this.stopPulse();
+		this.stopWatchdog();
 		if (!working) {
 			this.pendingEscapeCancelDeadline = undefined;
 		} else {
 			this.pendingIdleClearDeadline = undefined;
 			this.pendingIdleClearText = undefined;
-			this.startPulse();
+			this.startWatchdog();
 		}
 		this.deps.requestRender();
 	}
@@ -1150,6 +1237,13 @@ export class GentlePromptEditor extends CustomEditor {
 	}
 
 	render(width: number): string[] {
+		// Render-driven petal (gentle-shell#994): every frame the host already
+		// paints while working advances the animation for free, so no fast
+		// timer forces renders during streaming.
+		if (this.promptState === PROMPT_STATE.WORKING && this.animationPolicy === "quality") {
+			this.tick += 1;
+			this.lastRenderAt = this.deps.now();
+		}
 		const layout = resolvePromptLayout(width, cardStyle(), this.deps.bg);
 		this.floatMouseLayout = layout.background ? layout : undefined;
 		const inner = layout.nativeWidth;
@@ -1214,7 +1308,7 @@ export class GentlePromptEditor extends CustomEditor {
 
 	dispose(): void {
 		this.disposed = true;
-		this.stopPulse();
+		this.stopWatchdog();
 	}
 
 	private isPendingEscapeCancel(): boolean {
@@ -1229,9 +1323,9 @@ export class GentlePromptEditor extends CustomEditor {
 		);
 	}
 
-	private stopPulse(): void {
-		if (this.pulse) clearInterval(this.pulse);
-		this.pulse = undefined;
+	private stopWatchdog(): void {
+		if (this.watchdog) clearInterval(this.watchdog);
+		this.watchdog = undefined;
 		this.tick = 0;
 	}
 }
@@ -1314,7 +1408,7 @@ function installPrompt(
 		});
 		// Pi's own docs require an explicit requestRender() after a state change
 		// (docs/tui.md: "Call tui.requestRender() after state changes"); no host
-		// re-render is implicitly guaranteed, and the WORKING pulse loop does not
+		// re-render is implicitly guaranteed, and the WORKING watchdog does not
 		// run at all under the "potato" animation policy. Register this session's
 		// redraw so a phase reported by the tool is visible immediately.
 		oddPhaseRegistry.setRenderRequest(ctx.sessionManager.getSessionId(), () => tui.requestRender());
@@ -1463,8 +1557,11 @@ function changesPollMs(env: NodeJS.ProcessEnv): number {
 const USAGE_FETCH_TIMEOUT_DEFAULT_MS = 10_000;
 const usageFetchTimeoutMs = (env: NodeJS.ProcessEnv): number => positiveMs(env.GENTLE_PI_SHELL_USAGE_TIMEOUT_MS, USAGE_FETCH_TIMEOUT_DEFAULT_MS);
 
+// The footer memo reads this every keystroke: tracker models store the
+// digest once per scan (lib/shell-changes.ts), so this is O(1); hand-built
+// models without a stored digest fall back to computing it here.
 function changesFingerprint(model: ChangesModel): string {
-	return model.files.map((file) => `${file.path}:${file.status}:${file.added}:${file.deleted}:${file.diffRevision ?? ""}:${file.countsUnavailable ?? ""}`).join("|");
+	return model.digest ?? changesDigest(model);
 }
 
 interface OverlayDeps {
@@ -2065,13 +2162,21 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			const bottom = createShellBarComponent(pi, ctx, renderHost, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""), () => visualSettings);
 			// The Status card paints live session state that no event re-registers a
 			// part for: model, effort, context, cost, session name and extension
-			// statuses. The digest is what keeps the fullscreen memo honest, and it
-			// rebuilds the model exactly as the narrow bottom bar does every frame.
-			const footerModel = (): ShellBarModel => ({
-				...buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? ""), profile: deps.activeProfile(), jobs: runningJobs }),
-				changes: { files: tracker.model.files.length, added: tracker.model.added, deleted: tracker.model.deleted },
-				review,
+			// statuses. The digest is what keeps the fullscreen memo honest. Issue
+			// #1681: railDigest evaluates every rail's digest per keystroke, so both
+			// Status rails digest a cheap key and reuse the memoized model
+			// (createFooterStatusMemo).
+			const footerStatus = createFooterStatusMemo({
+				pi, ctx, footerData,
+				usage: () => usage.get(ctx.model?.provider ?? ""),
+				profile: () => deps.activeProfile(),
+				jobs: () => runningJobs,
+				review: () => review,
+				tracker: () => tracker,
+				visualSettings: () => visualSettings,
+				cardStyle: () => cardStyle(),
 			});
+			const footerModel = footerStatus.model;
 			// At narrow fullscreen widths only one status row paints: a top header
 			// suppresses the bottom bar in the layout, and otherwise the bottom bar
 			// takes over the header's data while the below-input header steps aside.
@@ -2099,7 +2204,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				},
 			};
 			const part = sidebarPart(tui, "footer", bottomBar, {
-				digest: () => JSON.stringify([footerModel(), tracker.model, visualSettings, cardStyle()]),
+				digest: () => footerStatus.key(),
 				render: (width) => renderShellSidebarBar(footerModel(), theme, width, visualSettings),
 				invalidate() {},
 			});
@@ -2108,7 +2213,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			// when Status is absent. Opaque statuses and working state stay excluded.
 			const headerBar = (width: number) => renderShellHeaderChrome(buildShellHeaderModel(footerModel(), !statusCardVisible() && (statusOwner() === STATUS_OWNER.HEADER || visualSettings.statusPlacement === "hidden")), theme, width, usageShortcutKey, visualSettings, gaugePaint(ctx));
 			const disposeHeader = sidebarHeader(tui, {
-				digest: () => JSON.stringify([footerModel(), tracker.model, visualSettings, cardStyle()]),
+				digest: () => footerStatus.key(),
 				render: (width) => headerBar(width).rows,
 				invalidate() {},
 				handleMouse(event) {
@@ -2231,10 +2336,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		applyChanges(ctx, model);
 		// A failed root scan is unknown, never clean: say so whenever one failed.
 		const failed = tracker.failedRoots.length;
+		const unborn = tracker.unbornRoots.length;
 		const roots = tracker.scannedRootCount;
 		if (model.files.length === 0) {
 			if (failed > 0 && failed === roots) ctx.ui.notify(`Could not read Git status for ${failed} ${failed === 1 ? "root" : "roots"}; uncommitted changes are unknown.`, "error");
 			else if (failed > 0) ctx.ui.notify(`No uncommitted changes in the roots Git could read; Git status failed for ${failed} of ${roots} roots.`, "warning");
+			else if (unborn > 0) ctx.ui.notify(unborn === roots
+				? `No commits yet in ${unborn === 1 ? "this session's repository" : "any root"} — make a commit to start tracking changes.`
+				: `No uncommitted changes; ${unborn} of ${roots} roots have no commits yet, so they are not tracked.`, "info");
 			else ctx.ui.notify("No uncommitted changes in this session's repository or its subagents' worktrees.", "info");
 			return;
 		}
