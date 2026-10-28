@@ -364,6 +364,24 @@ test("non-forced regeneration invalidates cache when skill bytes change but path
 	assert.doesNotMatch(secondRegistry, /Variant one\. Body A\./);
 });
 
+test("non-forced regeneration keeps the cache when a skill is rewritten with identical bytes", async (t) => {
+	// Skill sync tools rewrite unchanged files; a new mtime alone must not refresh the registry.
+	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-rewrite-"));
+	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	const skillPath = join(cwd, "skills", "alpha", "SKILL.md");
+	mkdirSync(dirname(skillPath), { recursive: true });
+	const content = '---\nname: alpha\ndescription: "Trigger: alpha skill."\n---\n\n## Rules\n\n- Rule A.\n';
+	writeFileSync(skillPath, content);
+	utimesSync(skillPath, 1_000_000_000, 1_000_000_000);
+	assert.equal((await __testing.regenerateRegistry(cwd, false)).regenerated, true);
+
+	writeFileSync(skillPath, content);
+	utimesSync(skillPath, 1_000_000_100, 1_000_000_100);
+	const second = await __testing.regenerateRegistry(cwd, false);
+	assert.equal(second.regenerated, false);
+	assert.equal(second.reason, "cache-hit");
+});
+
 test("ensureAtlIgnored creates .atl/.gitignore with * and leaves root .gitignore untouched (#1387)", async (t) => {
 	const cwd = mkdtempSync(join(tmpdir(), `gentle-pi-git-atl-${Date.now()}-`));
 	t.after(() => rmSync(cwd, { recursive: true, force: true }));

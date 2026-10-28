@@ -293,19 +293,12 @@ function isCacheFile(value: unknown): value is { fingerprint: string } {
 
 async function fingerprint(files: string[]): Promise<string> {
 	const lines: string[] = [`schema:${REGISTRY_SCHEMA_VERSION}`];
+	// Content only: skill sync tools rewrite unchanged files, so mtime is not a change.
 	for (const file of files) {
 		try {
-			const info = await stat(file);
-			let contentHash: string;
-			try {
-				contentHash = createHash("sha1").update(await readFile(file)).digest("hex");
-			} catch {
-				lines.push(`${file}:unreadable`);
-				continue;
-			}
-			lines.push(`${file}:${info.mtimeMs}:${info.size}:${contentHash}`);
-		} catch {
-			lines.push(`${file}:missing`);
+			lines.push(`${file}:${createHash("sha1").update(await readFile(file)).digest("hex")}`);
+		} catch (error) {
+			lines.push(`${file}:${isMissingSkillFileError(error) ? "missing" : "unreadable"}`);
 		}
 	}
 	lines.sort();
