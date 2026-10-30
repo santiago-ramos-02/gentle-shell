@@ -511,10 +511,10 @@ export function removeCandidateOwner(owner: CandidateViewOwner, git: Git, makeWr
 }
 
 export function sweepCandidateOwners(commonDir: string, git: Git, makeWritable: (root: string) => void, platform: NodeJS.Platform = process.platform): void {
-	// Without local boot provenance no owner can be proven dead, so the sweep could
-	// never reclaim anything (Windows always lands here). Validating each marker
-	// costs several PowerShell spawns, which stalled every session start.
-	if (localHost() === null) return;
+	// Windows has no localHost() provenance, so dead() cannot authorize reclamation.
+	// Avoid synchronous ACL probes for a sweep that must preserve every owner anyway.
+	// Explicit creation, validation, and cleanup retain their full ownership checks.
+	if (platform === "win32") return;
 	try {
 		const parent = assertCandidateOwnerParent(commonDir, platform);
 		for (const name of readdirSync(parent)) {
