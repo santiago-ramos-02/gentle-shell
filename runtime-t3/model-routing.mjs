@@ -12,7 +12,7 @@ import { updatePackageManagedSddAgentOwnership } from "./agent-assets.mjs";
 import { gentlePiConfigHome, resolveGentlePiAgentHome } from "./agent-home.mjs";
 import { resolveProfilePin } from "./agent-profile-pin.mjs";
 import { isProfileOrchestratorKey } from "./agent-profiles.mjs";
-import { PROVIDER_REVIEW_ROLES, isProviderReviewRole } from "./agents-config.mjs";
+import { PROVIDER_REVIEW_ROLES } from "./agents-config.mjs";
 import {
 	normalizeModelConfig,
 	normalizeRoutingEntry,
@@ -710,7 +710,11 @@ export function isValidJsonObjectFileOrMissing(path        )          {
 	}
 }
 
-export { PROVIDER_REVIEW_ROLES, isProviderReviewRole };
+export function isProviderReviewRole(name        )          {
+	return PROVIDER_REVIEW_ROLES.some((role) => role === name);
+}
+
+export { PROVIDER_REVIEW_ROLES };
 
 export function modelAssignmentNames(cwd        )           {
 	return [...new Set([
