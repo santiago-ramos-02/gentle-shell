@@ -1,3 +1,4 @@
+import type { JobKind, JobRecord, JobStatus } from "./background-jobs.ts";
 import { childPromptText, isFinished, THREAD_ITEM, TASK_STATUS, type TaskRecord, type TaskStatus, type TaskStore, type TaskSummary, type ThreadItem } from "./agents-protocol.ts";
 
 // Publishes live Gentle Agents subagent state to an interactive RPC host
@@ -88,10 +89,43 @@ export interface RpcTask {
 	thread: RpcThread;
 }
 
+/** A `bash_background` command or monitor, so a host can tell a parent that waits on one from an idle one. */
+export interface RpcJob {
+	id: string;
+	kind: JobKind;
+	label: string;
+	status: JobStatus;
+	startedAt: number;
+	endedAt: number | null;
+	exitCode: number | null;
+}
+
 export interface RpcActivity {
 	schema: typeof ACTIVITY_SCHEMA;
 	summary: TaskSummary;
 	tasks: RpcTask[];
+	/** Present when the publisher was given the session's jobs. */
+	jobs?: RpcJob[];
+}
+
+/** Finished jobs kept after the running ones, so a host sees how each one ended. */
+const FINISHED_JOBS_KEPT = 3;
+
+/** Every running job, newest first, then the most recently finished ones. */
+export function projectRpcJobs(jobs: readonly JobRecord[]): RpcJob[] {
+	const project = (job: JobRecord): RpcJob => ({
+		id: job.id,
+		kind: job.kind,
+		label: truncate(job.label, SUMMARY_FIELD_LIMIT),
+		status: job.status,
+		startedAt: job.startedAt,
+		endedAt: job.endedAt ?? null,
+		exitCode: job.exitCode ?? null,
+	});
+	const running = jobs.filter((job) => job.status === "running").sort((a, b) => b.startedAt - a.startedAt);
+	const finished = jobs.filter((job) => job.status !== "running")
+		.sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).slice(0, FINISHED_JOBS_KEPT);
+	return [...running, ...finished].map(project);
 }
 
 function truncate(text: string, limit: number): string {
@@ -269,6 +303,8 @@ export interface RpcActivityPublisherDeps {
 	maxBytes?: number;
 	maxThreadItems?: number;
 	parentSessionId?: string;
+	/** The session's background jobs, published alongside its tasks. */
+	jobs?: () => readonly JobRecord[];
 	/** Never let a `setWidget` failure escape the publisher; logs go here instead. */
 	onError?: (error: unknown) => void;
 }
@@ -278,6 +314,8 @@ export interface RpcActivityPublisher {
 	stop(): void;
 	/** Publish immediately, cancelling any pending coalescing timer. */
 	flush(): void;
+	/** Publish immediately when the jobs changed since the last push. */
+	refreshJobs(): void;
 }
 
 function defaultSchedule(fn: () => void, ms: number): () => void {
@@ -300,8 +338,10 @@ export function createRpcActivityPublisher(deps: RpcActivityPublisherDeps): RpcA
 		maxBytes = DEFAULT_MAX_BYTES,
 		maxThreadItems = DEFAULT_THREAD_ITEMS,
 		parentSessionId,
+		jobs,
 		onError = () => {},
 	} = deps;
+	let publishedJobs: string | undefined;
 
 	let cancelTimer: (() => void) | undefined;
 	const taskUnsubscribes = new Map<string, () => void>();
@@ -310,12 +350,20 @@ export function createRpcActivityPublisher(deps: RpcActivityPublisherDeps): RpcA
 
 	const publish = () => {
 		try {
-			const activity = projectRpcActivity(store, { parentSessionId, maxThreadItems });
+			const rpcJobs = jobs === undefined ? undefined : projectRpcJobs(jobs());
+			publishedJobs = rpcJobs === undefined ? undefined : JSON.stringify(rpcJobs);
+			const activity = { ...projectRpcActivity(store, { parentSessionId, maxThreadItems }), ...(rpcJobs === undefined ? {} : { jobs: rpcJobs }) };
 			const lines = encodeActivityLines(activity, maxBytes);
 			ui.setWidget(ACTIVITY_WIDGET_KEY, lines);
 		} catch (error) {
 			onError(error);
 		}
+	};
+
+	const flushNow = () => {
+		cancelTimer?.();
+		cancelTimer = undefined;
+		publish();
 	};
 
 	const scheduleFlush = () => {
@@ -357,10 +405,10 @@ export function createRpcActivityPublisher(deps: RpcActivityPublisherDeps): RpcA
 			taskUnsubscribes.clear();
 			publish();
 		},
-		flush() {
-			cancelTimer?.();
-			cancelTimer = undefined;
-			publish();
+		flush: flushNow,
+		refreshJobs() {
+			if (!started || jobs === undefined) return;
+			if (JSON.stringify(projectRpcJobs(jobs())) !== publishedJobs) flushNow();
 		},
 	};
 }

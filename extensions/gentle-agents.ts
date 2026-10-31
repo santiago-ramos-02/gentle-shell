@@ -1416,6 +1416,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const finished = sessionJobs.filter((job) => (job.status === "exited" || job.status === "stopped" || job.status === "failed") && job.endedAt !== undefined && deps.now() - job.endedAt < JOBS_FINISHED_TTL_MS)
 			.sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).slice(0, 3);
 		try { parentCtx?.ui.setStatus(JOBS_STATUS_KEY, running.length === 0 ? undefined : `${JOB_GLYPH} ${running.length} job${running.length === 1 ? "" : "s"}`); } catch { /* Status is cosmetic. */ }
+		// Before any wake-up this change causes, so the host never sees the wake ahead of the exit.
+		rpcActivityPublisher?.refreshJobs();
 		if (sessionId) {
 			try {
 				pi.events.emit(JOBS_SIDEBAR_EVENT, { sessionId, snapshot: { jobs: [
@@ -2891,6 +2893,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				now: deps.now,
 				schedule: deps.schedule,
 				parentSessionId: activeSessionId(),
+				jobs: () => jobs.list(activeSessionId() ?? ""),
 				onError: (error) => {
 					const message = `Gentle Agents activity push failed: ${error instanceof Error ? error.message : String(error)}`;
 					if (notifiedRpcActivityErrors?.has(message)) return;

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord, type TaskStatus } from "../lib/agents-protocol.ts";
+import type { JobRecord } from "../lib/background-jobs.ts";
 import {
 	ACTIVITY_SCHEMA,
 	ACTIVITY_WIDGET_KEY,
@@ -526,6 +527,35 @@ test("createRpcActivityPublisher flush publishes immediately and cancels a pendi
 
 	assert.equal(calls.length, 1);
 	assert.equal(scheduler.pendingCount(), 0, "flush cancels the timer it preempted");
+});
+
+test("createRpcActivityPublisher publishes background jobs and pushes a job change at once", () => {
+	const store = new TaskStore();
+	const scheduler = fakeScheduler();
+	const calls: string[][] = [];
+	const job = (id: string, status: JobRecord["status"], endedAt?: number, exitCode?: number): JobRecord => ({
+		id, kind: "command", label: `job ${id}`, command: "bun run codegen", cwd: "/r", ownerSessionId: "s1",
+		outputPath: `/tmp/${id}.log`, startedAt: 100, status, tail: [], ...(endedAt === undefined ? {} : { endedAt, exitCode }),
+	});
+	let jobs: JobRecord[] = [job("job-1", "exited", 150, 1), job("job-3", "running")];
+	const publisher = createRpcActivityPublisher({ store, ui: { setWidget: (_key, lines) => calls.push(lines) }, schedule: scheduler.schedule, jobs: () => jobs });
+	publisher.start();
+	scheduler.flushAll();
+	const jobsIn = (index: number) => (JSON.parse(calls[index]![0]!) as RpcActivity).jobs;
+	assert.deepEqual(jobsIn(0), [
+		{ id: "job-3", kind: "command", label: "job job-3", status: "running", startedAt: 100, endedAt: null, exitCode: null },
+		{ id: "job-1", kind: "command", label: "job job-1", status: "exited", startedAt: 100, endedAt: 150, exitCode: 1 },
+	]);
+
+	publisher.refreshJobs();
+	assert.equal(calls.length, 1, "an unchanged job list publishes nothing");
+
+	jobs = [job("job-1", "exited", 150, 1), job("job-3", "exited", 200, 0)];
+	publisher.refreshJobs();
+	// A job's exit can wake the parent right after, so the host must see it first.
+	assert.equal(calls.length, 2, "a job change publishes without waiting for the coalescing timer");
+	assert.equal(jobsIn(1)?.[0]?.status, "exited");
+	assert.equal(scheduler.pendingCount(), 0);
 });
 
 test("createRpcActivityPublisher swallows setWidget errors through an injectable onError", () => {

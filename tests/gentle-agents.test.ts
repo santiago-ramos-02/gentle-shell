@@ -6853,6 +6853,34 @@ test("bash_background returns at once, and an idle parent gets one stored exit n
 	}
 });
 
+test("an RPC host sees a background job's exit before the wake it causes", async () => {
+	const { pi, tools, fire, userMessages, delivery } = fakePi();
+	const jobs = fakeJobShell();
+	const runtime = deps();
+	runtime.deps.env = { PATH: "/bin", GENTLE_SHELL_INTERACTIVE_HOST: "1", GENTLE_PI_CONFIG_HOME: process.env.GENTLE_PI_CONFIG_HOME };
+	gentleAgents(pi, {}, { ...runtime.deps, jobShell: jobs.shell, jobOutputDir: () => jobs.dir });
+	const { ctx } = fakeContext();
+	Object.assign(ctx, { mode: "rpc", hasUI: true });
+	ctx.ui.setWidget = ((key: string, content: unknown) => {
+		if (key !== "gentle-agents" || !Array.isArray(content)) return;
+		const activity = JSON.parse(String(content[0])) as { jobs?: Array<{ id: string; status: string; exitCode: number | null }> };
+		delivery.push(`widget:${(activity.jobs ?? []).map((job) => `${job.id}=${job.status}/${job.exitCode}`).join(",")}`);
+	}) as typeof ctx.ui.setWidget;
+	try {
+		await fire("session_start", ctx);
+		await tools.get("bash_background")!.execute("b1", { command: "bun run codegen", label: "sdk codegen" }, undefined, undefined, ctx);
+		assert.ok(delivery.includes("widget:job-1=running/null"), "the host sees the job as soon as it starts");
+		jobs.runs[0]!.exit(0);
+		await eventually(() => userMessages.length > 0, "the job's exit must wake the idle parent");
+		const exited = delivery.indexOf("widget:job-1=exited/0");
+		assert.ok(exited !== -1, "the host sees how the job ended");
+		assert.ok(exited < delivery.indexOf("user"), "the exit reaches the host before the wake");
+	} finally {
+		await fire("session_shutdown", ctx);
+		jobs.cleanup();
+	}
+});
+
 test("a busy parent gets the exit notice steered into its run at the next turn boundary", async () => {
 	const { pi, tools, fire, sent, userMessages } = fakePi();
 	const jobs = fakeJobShell();
