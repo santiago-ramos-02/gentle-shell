@@ -576,6 +576,39 @@ for (const scenario of [
 	});
 }
 
+test("gentle-agents shows an interactive RPC host the subscription limits from its provider responses", async (t) => {
+	const h = fakePi();
+	const runtime = deps();
+	const scheduler = fakeScheduler();
+	runtime.deps.schedule = scheduler.schedule;
+	runtime.deps.env = { PATH: "/bin", GENTLE_SHELL_INTERACTIVE_HOST: "1" };
+	const limitsFile = join(home, ".pi", "agent", "gentle-provider-limits.json");
+	rmSync(limitsFile, { force: true });
+	t.after(() => rmSync(limitsFile, { force: true }));
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	Object.assign(ctx, { mode: "rpc", hasUI: true });
+	const setWidget = t.mock.method(ctx.ui, "setWidget");
+	await h.fire("session_start", ctx);
+	scheduler.flushAll();
+	setWidget.mock.resetCalls();
+
+	await h.fire("after_provider_response", ctx, {
+		type: "after_provider_response",
+		status: 200,
+		headers: { "anthropic-ratelimit-unified-5h-utilization": "0.42", "authorization": "Bearer secret" },
+	});
+
+	// A response can be the last before the turn settles, so the push does not wait for the timer.
+	const pushes = setWidget.mock.calls.filter((call) => Array.isArray(call.arguments[1]));
+	assert.equal(pushes.length, 1);
+	const [, lines] = pushes[0]!.arguments as unknown as [string, string[]];
+	const activity = JSON.parse(lines[0]!) as { limits?: Array<{ provider: string; headers: Record<string, string> }> };
+	assert.deepEqual(activity.limits?.map(({ provider, headers }) => ({ provider, headers })), [
+		{ provider: "anthropic", headers: { "anthropic-ratelimit-unified-5h-utilization": "0.42" } },
+	]);
+});
+
 test("gentle-agents notifies once, deduplicated, when the RPC activity publisher's setWidget throws", async (t) => {
 	const h = fakePi();
 	const runtime = deps();

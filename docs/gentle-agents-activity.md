@@ -600,6 +600,10 @@ Pi's `setWidget` is the only fire-and-forget RPC push structured enough to carry
 
 Tasks are ordered `running`, `waiting`, `queued`, then finished tasks by `endedAt` descending (most recently finished first).
 
+`jobs` lists the session's `bash_background` commands and monitors as `{ id, kind, label, status, startedAt, endedAt, exitCode }`: every running job, newest first, then the three most recently finished. A host uses it to tell a parent that waits on a job from an idle one. A job's change is pushed at once, before the wake that reports it.
+
+`limits` carries each provider's latest subscription rate limits as `{ provider, checkedAt, headers }`, where `provider` is `anthropic` or `codex`, `checkedAt` is epoch milliseconds, and `headers` keeps only that response's `anthropic-ratelimit-unified-*` or `x-codex-primary-*`/`x-codex-secondary-*` headers. Limits belong to the account, not the session, so the parent and every subagent record them in `gentle-provider-limits.json` in the agent home, and a host sees limits from a subagent that runs on another provider. A newer entry is never replaced by an older response. A change is pushed at once.
+
 ## Bounds
 
 Every bound below fails closed: a value that cannot fit is truncated or dropped, and `lib/agents-rpc-publisher.ts`'s `encodeActivityLines` never throws.

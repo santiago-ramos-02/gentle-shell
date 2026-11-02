@@ -547,15 +547,36 @@ test("createRpcActivityPublisher publishes background jobs and pushes a job chan
 		{ id: "job-1", kind: "command", label: "job job-1", status: "exited", startedAt: 100, endedAt: 150, exitCode: 1 },
 	]);
 
-	publisher.refreshJobs();
+	publisher.refresh();
 	assert.equal(calls.length, 1, "an unchanged job list publishes nothing");
 
 	jobs = [job("job-1", "exited", 150, 1), job("job-3", "exited", 200, 0)];
-	publisher.refreshJobs();
+	publisher.refresh();
 	// A job's exit can wake the parent right after, so the host must see it first.
 	assert.equal(calls.length, 2, "a job change publishes without waiting for the coalescing timer");
 	assert.equal(jobsIn(1)?.[0]?.status, "exited");
 	assert.equal(scheduler.pendingCount(), 0);
+});
+
+test("createRpcActivityPublisher publishes provider limits and pushes a limits change at once", () => {
+	const store = new TaskStore();
+	const scheduler = fakeScheduler();
+	const calls: string[][] = [];
+	const codex = (used: string) => ({ provider: "codex" as const, checkedAt: Number(used), headers: { "x-codex-primary-used-percent": used } });
+	let limits = [codex("10")];
+	const publisher = createRpcActivityPublisher({ store, ui: { setWidget: (_key, lines) => calls.push(lines) }, schedule: scheduler.schedule, limits: () => limits });
+	publisher.start();
+	scheduler.flushAll();
+	const limitsIn = (index: number) => (JSON.parse(calls[index]![0]!) as RpcActivity).limits;
+	assert.deepEqual(limitsIn(0), [codex("10")]);
+
+	publisher.refresh();
+	assert.equal(calls.length, 1, "unchanged limits publish nothing");
+
+	limits = [codex("20")];
+	publisher.refresh();
+	assert.equal(calls.length, 2, "new limits publish without waiting for the coalescing timer");
+	assert.deepEqual(limitsIn(1), [codex("20")]);
 });
 
 test("createRpcActivityPublisher swallows setWidget errors through an injectable onError", () => {

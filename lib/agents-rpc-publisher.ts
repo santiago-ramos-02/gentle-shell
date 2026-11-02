@@ -1,4 +1,5 @@
 import type { JobKind, JobRecord, JobStatus } from "./background-jobs.ts";
+import type { ProviderLimits } from "./provider-limits.ts";
 import { childPromptText, isFinished, THREAD_ITEM, TASK_STATUS, type TaskRecord, type TaskStatus, type TaskStore, type TaskSummary, type ThreadItem } from "./agents-protocol.ts";
 
 // Publishes live Gentle Agents subagent state to an interactive RPC host
@@ -106,6 +107,8 @@ export interface RpcActivity {
 	tasks: RpcTask[];
 	/** Present when the publisher was given the session's jobs. */
 	jobs?: RpcJob[];
+	/** Each provider's latest subscription rate-limit headers; present when the publisher was given them. */
+	limits?: ProviderLimits[];
 }
 
 /** Finished jobs kept after the running ones, so a host sees how each one ended. */
@@ -305,6 +308,8 @@ export interface RpcActivityPublisherDeps {
 	parentSessionId?: string;
 	/** The session's background jobs, published alongside its tasks. */
 	jobs?: () => readonly JobRecord[];
+	/** The account-wide provider limits, published alongside its tasks. */
+	limits?: () => readonly ProviderLimits[];
 	/** Never let a `setWidget` failure escape the publisher; logs go here instead. */
 	onError?: (error: unknown) => void;
 }
@@ -314,8 +319,8 @@ export interface RpcActivityPublisher {
 	stop(): void;
 	/** Publish immediately, cancelling any pending coalescing timer. */
 	flush(): void;
-	/** Publish immediately when the jobs changed since the last push. */
-	refreshJobs(): void;
+	/** Publish immediately when the jobs or provider limits changed since the last push. */
+	refresh(): void;
 }
 
 function defaultSchedule(fn: () => void, ms: number): () => void {
@@ -339,9 +344,16 @@ export function createRpcActivityPublisher(deps: RpcActivityPublisherDeps): RpcA
 		maxThreadItems = DEFAULT_THREAD_ITEMS,
 		parentSessionId,
 		jobs,
+		limits,
 		onError = () => {},
 	} = deps;
-	let publishedJobs: string | undefined;
+	/** The jobs and limits of the last push, so `refresh` can skip a push that changes nothing. */
+	let publishedHostState: string | undefined;
+	const hostState = () => {
+		const rpcJobs = jobs === undefined ? undefined : projectRpcJobs(jobs());
+		const rpcLimits = limits === undefined ? undefined : [...limits()];
+		return { ...(rpcJobs === undefined ? {} : { jobs: rpcJobs }), ...(rpcLimits === undefined ? {} : { limits: rpcLimits }) };
+	};
 
 	let cancelTimer: (() => void) | undefined;
 	const taskUnsubscribes = new Map<string, () => void>();
@@ -350,9 +362,9 @@ export function createRpcActivityPublisher(deps: RpcActivityPublisherDeps): RpcA
 
 	const publish = () => {
 		try {
-			const rpcJobs = jobs === undefined ? undefined : projectRpcJobs(jobs());
-			publishedJobs = rpcJobs === undefined ? undefined : JSON.stringify(rpcJobs);
-			const activity = { ...projectRpcActivity(store, { parentSessionId, maxThreadItems }), ...(rpcJobs === undefined ? {} : { jobs: rpcJobs }) };
+			const state = hostState();
+			publishedHostState = JSON.stringify(state);
+			const activity = { ...projectRpcActivity(store, { parentSessionId, maxThreadItems }), ...state };
 			const lines = encodeActivityLines(activity, maxBytes);
 			ui.setWidget(ACTIVITY_WIDGET_KEY, lines);
 		} catch (error) {
@@ -406,9 +418,9 @@ export function createRpcActivityPublisher(deps: RpcActivityPublisherDeps): RpcA
 			publish();
 		},
 		flush: flushNow,
-		refreshJobs() {
-			if (!started || jobs === undefined) return;
-			if (JSON.stringify(projectRpcJobs(jobs())) !== publishedJobs) flushNow();
+		refresh() {
+			if (!started) return;
+			if (JSON.stringify(hostState()) !== publishedHostState) flushNow();
 		},
 	};
 }

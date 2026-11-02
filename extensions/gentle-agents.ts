@@ -67,6 +67,7 @@ import { CARD_TONE, cardAwaitingResult, cardBodyRows, cardBottom, cardInnerWidth
 import { openInExternalEditor } from "./gentle-shell.ts";
 import { gentlePiConfigHome } from "../lib/agent-home.ts";
 import { resolveAgentHomeDirectory } from "../lib/agent-model-resolution.ts";
+import { cachedProviderLimits, pickProviderLimits, providerLimitsFile, recordProviderLimits } from "../lib/provider-limits.ts";
 import { allowedEditSurfaces, inheritAllowedEditSurfaces, isBoundedWriter, isDevelopmentSurface, isGenericBoundedWriter, prepareBoundSessionRepository, rejectUnscopedBoundedWriterDispatch, safeBootstrapDirectory, sessionRepositoryAuthority } from "../lib/bounded-writer-admission.ts";
 import { CHILD_METRICS_EVENT, CHILD_METRICS_REVOKED, childEvent, launchSelection, type LaunchSelection } from "../lib/runtime-metrics-children.ts";
 import { runtimeMetricsEnvAllows, type RuntimeMetricsPolicyDeps } from "../lib/runtime-metrics-policy.ts";
@@ -310,6 +311,21 @@ function messageText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content.map((part) => part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string" ? (part as { text: string }).text : "").join("\n");
+}
+
+/** Records each provider response's subscription rate-limit headers where the RPC host's publisher reads them. */
+function registerProviderLimitsCapture(pi: ExtensionAPI, file: string, now: () => number, onRecorded: () => void = () => {}): void {
+	pi.on("after_provider_response", (event) => {
+		const limits = pickProviderLimits(event.headers, now());
+		if (limits === null) return;
+		try {
+			recordProviderLimits(file, limits);
+		} catch {
+			// Limits are best-effort display state; a failed write must never fail the response.
+			return;
+		}
+		onRecorded();
+	});
 }
 
 function ownedChildIpc(env: NodeJS.ProcessEnv, candidate: IpcEndpoint | undefined): IpcEndpoint | undefined {
@@ -675,6 +691,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		}
 		if (childIpc) registerChildMessaging(pi, childIpc);
 		registerMissingToolsCheck(pi, env);
+		registerProviderLimitsCapture(pi, providerLimitsFile(resolveAgentHomeDirectory({ env, home: os.homedir() })), Date.now);
 		return;
 	}
 	if (!agentsEnabled(env)) return;
@@ -711,6 +728,9 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const scopeCache = new OrchestratorScopeCache(deps.resolveWorktree);
 	const stateCache = new OrchestratorStateCache();
 	let rpcActivityPublisher: RpcActivityPublisher | undefined;
+	const limitsFile = providerLimitsFile(agentHome);
+	const providerLimits = cachedProviderLimits(limitsFile);
+	registerProviderLimitsCapture(pi, limitsFile, deps.now, () => rpcActivityPublisher?.refresh());
 	// Messages already surfaced to the user this session through the RPC
 	// activity publisher's `onError`, so a recurring push failure (the
 	// coalescing window retries every burst) notifies at most once per
@@ -1417,7 +1437,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			.sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).slice(0, 3);
 		try { parentCtx?.ui.setStatus(JOBS_STATUS_KEY, running.length === 0 ? undefined : `${JOB_GLYPH} ${running.length} job${running.length === 1 ? "" : "s"}`); } catch { /* Status is cosmetic. */ }
 		// Before any wake-up this change causes, so the host never sees the wake ahead of the exit.
-		rpcActivityPublisher?.refreshJobs();
+		rpcActivityPublisher?.refresh();
 		if (sessionId) {
 			try {
 				pi.events.emit(JOBS_SIDEBAR_EVENT, { sessionId, snapshot: { jobs: [
@@ -2894,6 +2914,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				schedule: deps.schedule,
 				parentSessionId: activeSessionId(),
 				jobs: () => jobs.list(activeSessionId() ?? ""),
+				limits: providerLimits,
 				onError: (error) => {
 					const message = `Gentle Agents activity push failed: ${error instanceof Error ? error.message : String(error)}`;
 					if (notifiedRpcActivityErrors?.has(message)) return;
