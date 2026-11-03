@@ -251,3 +251,51 @@ test("tool activity in the primary session drives the working label across exten
 		editor?.dispose();
 	}
 });
+
+test("an interactive RPC host receives the ODD phase as a status, cleared between turns", async () => {
+	const previousHost = process.env.GENTLE_SHELL_INTERACTIVE_HOST;
+	process.env.GENTLE_SHELL_INTERACTIVE_HOST = "1";
+	const shellLoader = createJiti(import.meta.url, { moduleCache: false });
+	const { default: shell, ODD_PHASE_STATUS_KEY } = await shellLoader.import<typeof import("../extensions/gentle-shell.ts")>("../extensions/gentle-shell.ts");
+	const registry = (await shellLoader.import<typeof import("../lib/odd-phase.ts")>("../lib/odd-phase.ts")).oddPhaseRegistry;
+	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+	const pi = {
+		on(name: string, fn: (event: unknown, ctx: unknown) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), fn]); },
+		registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, appendEntry() {},
+		events: { on: () => () => {}, emit() {} },
+		exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+	};
+	shell(pi as never, {}, { resolveWorktree: (path: string) => ({ root: path, commonDir: path }), gitRunner: () => async () => ({ stdout: "", stderr: "", code: 0, killed: false }), devBinary: () => undefined } as never);
+	const sessionId = "rpc-host-phase-status-test";
+	const statuses: Array<[string, string | undefined]> = [];
+	const ui = {
+		theme: { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+		setFooter() {}, setWidget() {}, setWorkingVisible() {}, notify() {},
+		setStatus(key: string, text: string | undefined) { statuses.push([key, text]); },
+		getEditorComponent: () => undefined, setEditorComponent() {},
+	};
+	const ctx = {
+		hasUI: true, mode: "rpc", cwd: "/repo", ui,
+		sessionManager: { getSessionId: () => sessionId, getEntries: () => [], getCwd: () => "/repo" },
+		hasPendingMessages: () => false, isIdle: () => true,
+		modelRegistry: { isUsingOAuth: () => false },
+	};
+	const fire = async (name: string, event: unknown = {}) => { for (const fn of handlers.get(name) ?? []) await fn(event, ctx); };
+	const tool = (toolName: string, args: unknown = {}) => fire("tool_execution_start", { type: "tool_execution_start", toolCallId: `call-${toolName}`, toolName, args });
+	const phases = () => statuses.filter(([key]) => key === ODD_PHASE_STATUS_KEY).map(([, text]) => text);
+	try {
+		await fire("session_start");
+		await fire("agent_start");
+		await tool("read", { path: "lib/odd-phase.ts" });
+		await tool("grep", { pattern: "x" });
+		await tool("subagent_run", { agent: "gentle-ai-worker" });
+		await tool("bash", { command: "pnpm test" });
+		await fire("agent_settled");
+		assert.deepEqual(phases(), ["exploring", "implementing", "checking", undefined], "each change is published once, and settling clears it");
+	} finally {
+		registry.clear(sessionId);
+		registry.clearRenderRequest(sessionId);
+		if (previousHost === undefined) delete process.env.GENTLE_SHELL_INTERACTIVE_HOST;
+		else process.env.GENTLE_SHELL_INTERACTIVE_HOST = previousHost;
+	}
+});

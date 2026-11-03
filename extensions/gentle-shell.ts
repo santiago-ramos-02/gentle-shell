@@ -36,7 +36,7 @@ import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from
 import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_WATCHDOG_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { inferOddPhase } from "../lib/odd-phase-inference.ts";
-import { isInteractiveMode } from "../lib/rpc-host.ts";
+import { isInteractiveMode, isInteractiveRpcHost } from "../lib/rpc-host.ts";
 import { gentlePiConfigHome } from "../lib/agent-home.ts";
 import { isNanAdaptiveReasoningModel } from "../lib/nan-provider.ts";
 import { resolveAnimationPolicy, writeAnimationPolicy, type AnimationPolicy } from "../lib/animation-policy.ts";
@@ -1364,6 +1364,8 @@ export class GentlePromptEditor extends CustomEditor {
 }
 
 const IMAGE_ATTACHMENTS_WIDGET_KEY = "gentle-shell-image-attachments";
+// An RPC host such as T3 Code has no prompt to label, so it reads the ODD phase from this status.
+export const ODD_PHASE_STATUS_KEY = "gentle-odd-phase";
 const IMAGE_PREVIEW_MAX_ROWS = 6;
 const IMAGE_PREVIEW_MAX_COLUMNS = 40;
 
@@ -2165,6 +2167,12 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		applyCardStyle();
 		applyCardContent();
 		if (!ctx.hasUI) return;
+		if (isInteractiveRpcHost(ctx.mode)) {
+			const sessionId = ctx.sessionManager.getSessionId();
+			oddPhaseRegistry.setRenderRequest(sessionId, () => {
+				try { ctx.ui.setStatus(ODD_PHASE_STATUS_KEY, oddPhaseRegistry.get(sessionId)); } catch { /* Status is cosmetic. */ }
+			});
+		}
 		visualSettings = resolveVisualSettings(animationOptions).settings;
 		if (!overrides.activeProfile) {
 			profileReader.bind(ctx.cwd, deps.resolveWorktree, ctx.sessionManager.getSessionId());
