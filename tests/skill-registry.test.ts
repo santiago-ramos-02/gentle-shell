@@ -518,6 +518,30 @@ test("registered watcher protects registry tracked after a cache hit", async (t)
 	assert.ok(!runtime.notices.some(({ message }) => message.includes("refreshed")));
 });
 
+test("registered watcher leaves a registry another writer refreshed until its own skills change", async (t) => {
+	// gentle-ai's `skill-registry refresh` (Claude Code and OpenCode hooks) shares the cache file
+	// with its own fingerprint; answering each of its writes would rewrite and notify every poll.
+	const fixture = registryFixture(false);
+	const runtime = registeredRegistry(fixture.cwd);
+	t.after(() => runtime.stop());
+	await runtime.start();
+	const cache = join(fixture.cwd, ".atl", ".skill-registry.cache.json");
+	const settled = Date.now() + 3000;
+	while (!existsSync(cache) && Date.now() < settled) await new Promise((resolve) => setTimeout(resolve, 50));
+	await new Promise((resolve) => setTimeout(resolve, 2600));
+	runtime.notices.length = 0;
+	writeFileSync(cache, '{\n  "fingerprint": "written-by-gentle-ai"\n}\n');
+	writeFileSync(fixture.registry, "Registry written by gentle-ai\n");
+	await new Promise((resolve) => setTimeout(resolve, 3000));
+	assert.deepEqual(runtime.notices, []);
+	assert.equal(readFileSync(fixture.registry, "utf8"), "Registry written by gentle-ai\n");
+
+	writeFileSync(fixture.skill, "---\nname: local\ndescription: Changed skill.\n---\n");
+	const deadline = Date.now() + 5000;
+	while (!readFileSync(fixture.registry, "utf8").includes("Changed skill") && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.match(readFileSync(fixture.registry, "utf8"), /Changed skill/);
+});
+
 for (const git of [true, false]) {
 	test(`registered startup and watcher regenerate normally in ${git ? "untracked Git" : "non-Git"} fixtures`, async (t) => {
 		const fixture = registryFixture(git);

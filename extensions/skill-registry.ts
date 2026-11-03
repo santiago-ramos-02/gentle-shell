@@ -358,6 +358,8 @@ interface RegenResult {
 	skillCount: number;
 	reason: string;
 	warning?: string;
+	/** The skill sources' fingerprint, when the registry now reflects them. */
+	fingerprint?: string;
 }
 
 const execFileAsync = promisify(execFile);
@@ -488,6 +490,8 @@ async function regenerateRegistry(
 	cwd: string,
 	force: boolean,
 	intentional = false,
+	// Sources this caller already wrote a registry for; another writer's cache does not undo that.
+	ownFingerprint?: string,
 ): Promise<RegenResult> {
 	const existingDirs = await uniqueExistingDirs([
 		...projectSkillDirs(cwd),
@@ -509,8 +513,8 @@ async function regenerateRegistry(
 			cached = undefined;
 		}
 	}
-	if (!force && cached === fp && (await pathExists(registryPath))) {
-		return { regenerated: false, skillCount: 0, reason: "cache-hit" };
+	if (!force && (cached === fp || ownFingerprint === fp) && (await pathExists(registryPath))) {
+		return { regenerated: false, skillCount: 0, reason: "cache-hit", fingerprint: fp };
 	}
 	if (!intentional) {
 		const warning = await automaticWriteWarning(cwd, [REGISTRY_REL_PATH, CACHE_REL_PATH]);
@@ -552,6 +556,7 @@ async function regenerateRegistry(
 		regenerated: true,
 		skillCount: deduped.length,
 		reason: force ? "forced" : "fingerprint-changed",
+		fingerprint: fp,
 	};
 }
 
@@ -654,13 +659,17 @@ async function startSkillRegistryWatcher(
 	// The poll re-asks a state the watchers already answered: without this,
 	// an unchanged tracked-target warning would repeat every poll interval.
 	let lastWarning: string | undefined;
+	// gentle-ai's refresh shares the cache file under its own fingerprint, so
+	// the poll answers only changes to the skills, not to that file.
+	let ownFingerprint: string | undefined;
 	const refresh = () => {
 		if (timer) clearTimeout(timer);
 		timer = setTimeout(() => {
 			void (async () => {
 				try {
 					await pendingStartups.get(cwd);
-					const result = await regenerateRegistry(cwd, false);
+					const result = await regenerateRegistry(cwd, false, false, ownFingerprint);
+					if (result.fingerprint !== undefined) ownFingerprint = result.fingerprint;
 					if (result.warning) {
 						if (result.warning !== lastWarning) notify(result.warning, "warning");
 						lastWarning = result.warning;
