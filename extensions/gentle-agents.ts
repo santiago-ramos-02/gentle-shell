@@ -1,4 +1,9 @@
+import { fallbackNotice, MODEL_FALLBACK_ENTRY, profileFallbackChain, type FallbackChange } from "../lib/model-fallback-notice.ts";
+import { sharedCooldown } from "../lib/model-fallback-policy.ts";
+import { createOrchestratorFallback } from "../lib/orchestrator-fallback.ts";
+import type { ThinkingLevel } from "../lib/model-routing-authority.ts";
 import { agentsViewKey, agentsCollapseKey, agentsStopKey } from "../lib/agents-keys.ts";
+import { CHILD_TIER_ENV } from "../lib/openai-fast-tier.ts";
 import { spawn } from "node:child_process";
 import { Type } from "typebox";
 import { recordReviewMutation } from "../lib/review-reminder-receipt.ts";
@@ -28,7 +33,7 @@ import { NativePointerRegion } from "../lib/native-pointer-region.ts";
 import { resolveVisualSettings } from "../lib/visual-customization-policy.ts";
 import { createCompletionQueue } from "../lib/agents-completion-delivery.ts";
 import { createAgentMessageQueue, type PendingAgentMessage } from "../lib/agents-message-delivery.ts";
-import { AGENT_MODE, PROFILE_SOURCE, PROVIDER_REVIEW_ROLES, discoverAgents, formatModelRef, loadAgentsConfig, resolveAgentProfile, unmatchedProfileKeys, withPinnedModelProfiles, type AgentDefinition, type AgentMode, type ProfileSource } from "../lib/agents-config.ts";
+import { parseModelRef, AGENT_MODE, PROFILE_SOURCE, PROVIDER_REVIEW_ROLES, discoverAgents, formatModelRef, loadAgentsConfig, resolveAgentProfile, unmatchedProfileKeys, withPinnedModelProfiles, type AgentDefinition, type AgentMode, type ProfileSource } from "../lib/agents-config.ts";
 import { freezeSessionProfileAtStartup, inheritedProfileDriftNotice, resolveSessionProfile, sessionProfileRoutingAt, type InheritedProfileOptions, type SessionProfileResolution } from "../lib/session-profile-freeze.ts";
 import { resolveProfilePin, resolveUnversionedProjectProfile } from "../lib/agent-profile-pin.ts";
 import { requireSessionProfileAuthority } from "../lib/session-profile-authority.ts";
@@ -105,6 +110,8 @@ const FOREGROUND_MESSAGE_POLL_MS = 250;
 const TOOL_PREFIX = "subagent_";
 // Wakes an idle parent after child content was stored as a custom message.
 // It names itself as automated so the model never attributes it to the human.
+// Persisted Bridge identities embed this exact text, so changing it would
+// unhide the wakes of existing sessions.
 const PARENT_WAKE_TEXT = "[System-generated Gentle Agents notification, not written by the user] Subagent output was delivered to this session above. Review it and continue.";
 const PARENT_WAKE_TYPE = "gentle-agents.wake";
 const BRIDGE_WAKE_IDENTITY_TYPE = "gentle-agents.wake-identity";
@@ -114,7 +121,10 @@ interface BridgeWakeIdentity {
 	text: string;
 }
 const bridgeWakeText = (nonce: string): string => `${PARENT_WAKE_TEXT} [gentle-agents wake: ${nonce}]`;
-const NATIVE_PARENT_WAKE_TEXT = "Review the delivered subagent output and continue.";
+// Pi gives the hidden native wake to the model with the user role, so an
+// unlabeled English wake read as an English human turn and switched the reply
+// language. It disowns authorship and pins the human's language.
+const NATIVE_PARENT_WAKE_TEXT = `${PARENT_WAKE_TEXT} Reply in the language of the human's own last message, not the language of this notification or of the subagent output.`;
 // How long a dispatched wake may take to start a parent run before a later
 // delivery may send another one.
 export const PARENT_WAKE_GRACE_MS = 30_000;
@@ -718,6 +728,51 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const restoredTaskIds = new Set<string>();
 	const tasksDir = historyDir(deps.home, agentHome);
 	let ui: ExtensionContext["ui"] | undefined;
+	// The catalog prices a fallback notice ("2.0x the price").
+	let modelRegistry: ExtensionContext["modelRegistry"] | undefined;
+	const announceFallback = (change: FallbackChange, parentSessionId: string | undefined, taskId?: string) => {
+		// Only the session that owns the run hears about it and records it.
+		if (parentSessionId !== undefined && activeSessionId() !== parentSessionId) return;
+		try { pi.appendEntry(MODEL_FALLBACK_ENTRY, { ...change, ...(taskId ? { taskId } : {}), at: deps.now() }); } catch { /* The switch matters more than its record. */ }
+		const prices = (model: { provider: string | undefined; id: string }) => (model.provider ? modelRegistry?.find(model.provider, model.id)?.cost : undefined);
+		ui?.notify(fallbackNotice(change, prices), "warning");
+	};
+	// One episode state per main session: a chain is walked once until a turn succeeds.
+	const orchestratorFallbacks = new Map<string, ReturnType<typeof createOrchestratorFallback>>();
+	const orchestratorFallbackFor = (ctx: ExtensionContext) => {
+		const sessionId = ctx.sessionManager.getSessionId() ?? "";
+		let fallback = orchestratorFallbacks.get(sessionId);
+		if (fallback) return fallback;
+		const find = (model: string) => {
+			const ref = parseModelRef(model);
+			return ref?.provider ? ctx.modelRegistry?.find(ref.provider, ref.id) : undefined;
+		};
+		fallback = createOrchestratorFallback({
+			chain: () => {
+				const configHome = gentlePiConfigHome(deps.env);
+				const resolution = resolveSessionProfile({ sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.sessionManager.getCwd(), configHome, resolveWorktree: deps.resolveWorktree, env: deps.env });
+				return profileFallbackChain(configHome, resolution.kind === "explicit" ? resolution.name : resolution.profile?.name, "orchestrator");
+			},
+			current: () => (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
+			available: (model) => find(model) !== undefined,
+			setModel: async (model) => {
+				const found = find(model);
+				return found ? pi.setModel(found) : false;
+			},
+			setThinking: (level) => pi.setThinkingLevel(level),
+			// Unknown effort (an older host without the call) keeps each step's own effort only.
+			thinking: () => {
+				try { return typeof pi.getThinkingLevel === "function" ? pi.getThinkingLevel() as ThinkingLevel : undefined; }
+				catch { return undefined; }
+			},
+			announce: (change) => announceFallback(change, undefined),
+			resume: (message) => pi.sendUserMessage(message, { deliverAs: "followUp" }),
+			cooldown: sharedCooldown(),
+			now: () => deps.now(),
+		});
+		orchestratorFallbacks.set(sessionId, fallback);
+		return fallback;
+	};
 	let host: { requestRender(): void } | undefined;
 	let sidebarTui: TUI | undefined;
 	const visualHome = gentlePiConfigHome(env);
@@ -1506,14 +1561,22 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		deliveryRetries = 0;
 		endPromptStart();
 	});
-	pi.on("agent_end", () => {
+	// The last attempt's messages, kept until the run settles: Pi fires agent_end
+	// on every failed attempt and decides on a retry afterwards.
+	let lastRunMessages: readonly unknown[] = [];
+	pi.on("agent_end", (event) => {
 		activeAgentRuns = Math.max(0, activeAgentRuns - 1);
 		flushAll();
+		lastRunMessages = event?.messages ?? [];
 	});
-	pi.on("agent_settled", () => {
+	pi.on("agent_settled", (event, ctx) => {
 		parentRunActive = false;
 		endPromptStart();
 		flushAll();
+		const messages = lastRunMessages;
+		lastRunMessages = [];
+		// A child's own failures are handled by the parent's runner, never by the child.
+		if (deps.env.GENTLE_PI_AGENTS_CHILD !== "1" && ctx) void orchestratorFallbackFor(ctx).onSettled(messages, { aborted: event?.aborted === true }).catch((error: unknown) => ui?.notify(`Model fallback failed: ${error instanceof Error ? error.message : String(error)}`, "error"));
 	});
 	pi.on("turn_end", () => flushAll());
 	pi.on("session_compact", scheduleBoundaryFlush);
@@ -1545,6 +1608,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			if (outcome === "replied") messages.consumeQuery(taskId, requestId);
 			else messages.expireQuery(taskId, requestId);
 		},
+		onFallback: (task, change) => announceFallback({ agent: task.agent, from: change.from, to: change.to, category: change.category, ...(change.launch ? { launch: true } : {}) }, task.parentSessionId, task.id),
 		onSuccessfulMutation: (task, tool) => {
 			// Same-clone registry attribution remains unchanged. A foreign task
 			// uses a separately bound, live-grant path only for successful tool evidence.
@@ -1859,6 +1923,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const showWidget = (ctx: ExtensionContext) => {
 		ui = ctx.hasUI ? ctx.ui : undefined;
+		modelRegistry = ctx.modelRegistry;
 		sessions = ctx.sessionManager;
 		agentsVisible = resolveVisualSettings({ gentlePiConfigHome: visualHome }).settings.visibility.agents;
 		stopVisualUpdates?.();
@@ -2115,7 +2180,17 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const parentWorktreeRoot = ctx.sessionManager.getCwd();
 		const parentRepositoryIdentity = resolveCanonicalGitRepositoryIdentitySync(parentWorktreeRoot);
 		const childEnv = { ...deps.env };
+		delete childEnv[CHILD_TIER_ENV];
+		const childModel = profile.model ?? ctx.model;
+		if (profile.tier && childModel?.provider && childModel.id) {
+			childEnv[CHILD_TIER_ENV] = JSON.stringify({ tier: profile.tier, model: `${childModel.provider}/${childModel.id}` });
+		}
 		if (foreign) for (const key of inheritedUnsafeGitEnvironmentKeys(childEnv)) delete childEnv[key];
+		const extensions = childExtensionRequest(deps.env, deps.childExtensionPaths);
+		if (profile.tier && !parseChildPackageInjection(deps.env)) {
+			const fastPath = fileURLToPath(new URL("./gentle-fast.ts", import.meta.url));
+			if (existsSync(fastPath)) extensions.extensionPaths = [...new Set([...(extensions.extensionPaths ?? []), fastPath])];
+		}
 		const request: TaskRequest = {
 			agent,
 			prompt,
@@ -2139,9 +2214,15 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			model: profile.model,
 			...(modelSource === undefined ? {} : { modelSource }),
 			thinking: profile.thinking,
+			...(() => {
+				// The chain of the profile this launch resolved, else the active profile's.
+				const name = sessionProfile.kind === "explicit" ? sessionProfile.name : sessionProfile.profile?.name;
+				const fallbacks = profileFallbackChain(profileConfigHome, name, agent.name);
+				return fallbacks.length ? { fallbacks } : {};
+			})(),
 			sessionDir,
 			resumeSessionPath: resume,
-			...childExtensionRequest(deps.env, deps.childExtensionPaths),
+			...extensions,
 			// A writer claims its surfaces in its canonical worktree root for its queued
 			// and running lifetime; a continuation is a new task and claims them again.
 			...(isBoundedWriter(agent.name) && surfaces ? { writerSurfaces: surfaces, writerRoot: canonicalWriterRoot(target ?? parentWorktreeRoot, foreign ? resolveSessionWorktree : deps.resolveWorktree) } : {}),
