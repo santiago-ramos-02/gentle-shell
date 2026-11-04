@@ -16,6 +16,13 @@ export const THINKING_LEVELS = [
 
 
 
+export function isServiceTier(value         )                       {
+	return value === "standard" || value === "fast";
+}
+
+
+
+
 
 
 
@@ -74,10 +81,11 @@ export function normalizeRoutingEntry(value         )                           
 		: isThinkingLevel(value.effort)
 			? value.effort
 			: undefined;
-	if (!model && !thinking) {
+	const tier = isServiceTier(value.tier) ? value.tier : undefined;
+	if (!model && !thinking && !tier) {
 		return Object.keys(value).length === 0 ? {} : undefined;
 	}
-	return { model, thinking };
+	return { model, thinking, ...(tier === undefined ? {} : { tier }) };
 }
 
 export function normalizeModelConfig(value         )                               {
