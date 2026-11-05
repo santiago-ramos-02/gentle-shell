@@ -24,6 +24,7 @@ import { resolveCardStyle, writeCardStyle } from "../lib/card-style-policy.ts";
 import { CARD_CONTENT, resolveCardContent, setCardContent, writeCardContent } from "../lib/card-content-policy.ts";
 import { CommandPalette, commandsKey, type CommandPaletteResult } from "../lib/command-palette.ts";
 import { buildCommandPaletteGroups } from "../lib/command-palette-catalog.ts";
+import { buildKeymapRows } from "../lib/keymaps-customize.ts";
 import { discoverYoloUiAdapter, MODE_STATUS_KEY, YOLO_DISPLAY, YOLO_STATUS_KEY, type YoloDisplay, type YoloUiAdapter } from "../lib/yolo-session-policy.ts";
 import { VisualCustomizeView, type CustomizeCategory, type CustomizeRow, type ProfileActions } from "../lib/visual-customize-view.ts";
 import { deleteVisualProfile, getVisualProfile, listVisualProfiles, resetVisualProfiles, saveVisualProfile } from "../lib/visual-profiles.ts";
@@ -32,10 +33,12 @@ import type { GaugePaint } from "../lib/shell-gauge.ts";
 import { sourcePalettePreview } from "../lib/theme-customization.ts";
 import { applyVisualPreset, DEFAULT_VISUAL_SETTINGS, DENSITY, HEADER_PLACEMENT, STATUS_PLACEMENT, VISUAL_PRESET, VISUAL_SECTION_KEYS, resolveVisualSettings, visualPresetOf, writeVisualSettings, type VisualPreset } from "../lib/visual-customization-policy.ts";
 import { BANNER_COLORS, DEFAULT_BANNER_CONFIG, readBannerConfig, readBannerConfigForEdit, writeBannerConfig } from "./startup-banner.ts";
-import { agentsViewKey } from "../lib/agents-keys.ts";
+import { commandKeymapId, commandKeymapIds, effectiveKey, keymapCommand, keymapLabel, keymapSavedNotice, loadKeymaps, prepareKeymapChange, writeKeymaps, type KeymapBindings, type PiKeybindings } from "../lib/keymaps.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
-import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, panelPromptRow, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_WATCHDOG_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, panelPromptRow, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PANEL_BUTTON, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_WATCHDOG_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { stripAnsi } from "../lib/terminal-theme.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
+import { CLAUDE_BRIDGE_PROVIDER, priceBridgeMessage } from "../lib/bridge-cost.ts";
 import { inferOddPhase } from "../lib/odd-phase-inference.ts";
 import { isInteractiveMode, isInteractiveRpcHost } from "../lib/rpc-host.ts";
 import { gentlePiConfigHome } from "../lib/agent-home.ts";
@@ -123,9 +126,9 @@ import {
 } from "../lib/double-esc-cancel-policy.ts";
 import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, NAN_PROVIDER, NAN_QUOTA_URL, parseCodexUsage, parseNanQuota, parseProviderUsage, parseUsageHeaders, parseUsageSource, usageScopeProviders, UsageSourceRegistry, UsageStore, USAGE_SOURCE_EVENT, type ProviderUsage, type UsageSource } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
-import { sidebarHeader, sidebarPart, sidebarState, sidebarStatusBar, VISUAL_SETTINGS_CHANGED, type SidebarRail } from "../lib/shell-sidebar.ts";
+import { releaseSidebarHover, setSidebarHover, sidebarHeader, sidebarPart, sidebarState, sidebarStatusBar, VISUAL_SETTINGS_CHANGED, type SidebarRail } from "../lib/shell-sidebar.ts";
 import { installSidebar, invalidateSidebar, narrowStatusOwner, SIDEBAR_BREAKPOINT, STATUS_OWNER } from "../lib/shell-sidebar-layout.ts";
-import { panelSheetBackHit, renderPanelSheet, renderWorkRow } from "../lib/shell-panel.ts";
+import { panelSheetBackHit, renderPanelSheet, renderWorkRow, workRowLead } from "../lib/shell-panel.ts";
 import { installPagePaint, type PageTheme } from "../lib/shell-page.ts";
 import { layoutSchematic } from "../lib/visual-layout-preview.ts";
 import { collectSessionStats, type SessionStats } from "../lib/shell-stats.ts";
@@ -370,7 +373,8 @@ export function buildShellBarModel(
 		contextPercent: usage?.percent ?? null,
 		contextWindow: usage?.contextWindow ?? model?.contextWindow ?? 0,
 		costTotal,
-		subscription: model ? ctx.modelRegistry.isUsingOAuth(model) : false,
+		// claude-bridge runs on a Claude subscription without a Pi OAuth credential.
+		subscription: model ? model.provider === CLAUDE_BRIDGE_PROVIDER || ctx.modelRegistry.isUsingOAuth(model) : false,
 		usage: options.usage,
 		...(options.jobs !== undefined ? { jobs: options.jobs } : {}),
 		statuses,
@@ -513,10 +517,14 @@ interface PromptEditorDeps {
 	watchdogMs?: number;
 	/** Read on every render: true while the wide IDE chrome shows, so the editor draws its panel frame. */
 	panelChrome?: () => boolean;
+	/** The Panel action is available only in the shell's narrow chrome. */
+	panelButton?: () => boolean;
 	/** Rows the editor draws right above its rule (the mobile work row, agent questions), so no widget lands between them and the input; `hovered` is the top row under the pointer. */
 	topRows?: (width: number, hovered?: number) => string[];
 	/** A left click on one of the top rows (index into topRows). */
 	onTopRowClick?: (index: number) => void;
+	/** Open the same sheet as /gentle:panel. */
+	onPanelClick?: () => void;
 }
 
 const PROMPT_FRAME_ROLE = "border";
@@ -576,9 +584,12 @@ export class GentlePromptEditor extends CustomEditor {
 	// quality watchdog repaints only when now() drifts past its window.
 	private lastRenderAt = 0;
 	private readonly deps: PromptEditorDeps;
+	private readonly pointerTui: TUI;
 	private floatMouseLayout?: ReturnType<typeof resolvePromptLayout>;
 	private topRowCount = 0;
 	private hoveredTopRow: number | undefined;
+	private hoveredPanel = false;
+	private panelStart: number | undefined;
 	// Native selection engine (shift+home/end, alt+a, replace-on-key): ported
 	// from pi-select-del so the petal prompt owns the feature without factory
 	// composition. Constructed with `this`; the internals probe degrades to
@@ -608,6 +619,7 @@ export class GentlePromptEditor extends CustomEditor {
 		super(tui, theme, keybindings);
 		this.selectionEngine = new SelectionEngine(this);
 		this.deps = deps;
+		this.pointerTui = tui;
 		this.keybindingsManager = keybindings;
 		const attachments = deps.attachments;
 		if (!attachments || !deps.readClipboardImage) return;
@@ -1300,15 +1312,53 @@ export class GentlePromptEditor extends CustomEditor {
 		this.deps.dispatchQueuedText(queued);
 	}
 
+	private clearPanelHover(): void {
+		if (!this.hoveredPanel) return;
+		this.hoveredPanel = false;
+		this.deps.requestRender();
+	}
+
+	private clearEditorHover(): void {
+		this.clearPanelHover();
+		if (this.hoveredTopRow !== undefined) {
+			this.hoveredTopRow = undefined;
+			this.deps.requestRender();
+		}
+		releaseSidebarHover(this.pointerTui, this);
+	}
+
 	handleMouse(event: Parameters<CustomEditor["handleMouse"]>[0]): ReturnType<CustomEditor["handleMouse"]> {
+		const onPanel = (this.deps.panelButton?.() ?? true) && this.panelStart !== undefined && this.floatMouseLayout?.panel && event.width === this.floatMouseLayout.width && event.y === this.topRowCount &&
+			event.x >= this.panelStart && event.x < this.panelStart + visibleWidth(PANEL_BUTTON);
+		if (event.type === "move" && event.button === "none") {
+			if (onPanel || (event.y >= 0 && event.y < this.topRowCount)) setSidebarHover(this.pointerTui, this, () => this.clearEditorHover());
+			else setSidebarHover(this.pointerTui);
+			if (onPanel) {
+				const changed = this.hoveredTopRow !== undefined || !this.hoveredPanel;
+				if (this.hoveredTopRow !== undefined) { this.hoveredTopRow = undefined; this.deps.requestRender(); }
+				if (!this.hoveredPanel) { this.hoveredPanel = true; this.deps.requestRender(); }
+				return changed ? { handled: true, render: true } : { handled: true };
+			}
+			this.clearPanelHover();
+		}
+		if (onPanel && (event.type === "press" || event.type === "click")) {
+			if (event.type === "click" && event.button === "left") {
+				this.clearEditorHover();
+				this.deps.onPanelClick?.();
+			}
+			return { handled: true, render: event.type === "click" };
+		}
 		// Rows drawn above the panel rule belong to the shell, not to Pi's editor.
 		if (this.topRowCount > 0) {
 			if (event.y < this.topRowCount) {
 				// Hovering a top row paints it as clickable, like every other control.
-				if (event.type === "move" && this.hoveredTopRow !== event.y) {
-					this.hoveredTopRow = event.y;
-					this.deps.requestRender();
-					return { handled: true, render: true };
+				if (event.type === "move" && event.button === "none") {
+					if (this.hoveredTopRow !== event.y) {
+						this.hoveredTopRow = event.y;
+						this.deps.requestRender();
+						return { handled: true, render: true };
+					}
+					return { handled: true };
 				}
 				if (event.type !== "click" || event.button !== "left") return undefined;
 				this.deps.onTopRowClick?.(event.y);
@@ -1367,6 +1417,8 @@ export class GentlePromptEditor extends CustomEditor {
 			fg: this.deps.fg,
 			bold: this.deps.bold,
 			workingLabel: this.promptState === PROMPT_STATE.WORKING ? this.deps.workingLabel?.() : undefined,
+			panelButton: Boolean(layout.panel && this.deps.onPanelClick && (this.deps.panelButton?.() ?? true)),
+			panelHovered: this.hoveredPanel,
 			escHint: [
 				this.vimPolicy === "on" ? (this.vimVisual.active ? (this.vimVisual.kind === "line" ? "VISUAL LINE" : "VISUAL") : this.vimNormal ? "NORMAL" : "INSERT") : undefined,
 				this.promptState === PROMPT_STATE.WORKING && this.isPendingEscapeCancel()
@@ -1387,6 +1439,10 @@ export class GentlePromptEditor extends CustomEditor {
 		const topRows = this.deps.topRows?.(width, this.hoveredTopRow) ?? [];
 		if (this.hoveredTopRow !== undefined && this.hoveredTopRow >= topRows.length) this.hoveredTopRow = undefined;
 		this.topRowCount = topRows.length;
+		const plainRule = stripAnsi(framed[0] ?? "");
+		const panelAt = layout.panel && this.deps.onPanelClick && (this.deps.panelButton?.() ?? true) ? plainRule.lastIndexOf(PANEL_BUTTON) : -1;
+		this.panelStart = panelAt < 0 ? undefined : visibleWidth(plainRule.slice(0, panelAt));
+		if (this.panelStart === undefined && this.hoveredPanel) this.clearEditorHover();
 		framed.unshift(...topRows);
 		// Pi places autocomplete after its bottom border. Keep those rows below
 		// Gentle's frame and preserve their terminal width and row coordinates.
@@ -1409,8 +1465,15 @@ export class GentlePromptEditor extends CustomEditor {
 		return framed;
 	}
 
+	invalidate(): void {
+		super.invalidate();
+		this.panelStart = undefined;
+		this.clearEditorHover();
+	}
+
 	dispose(): void {
 		this.disposed = true;
+		this.clearEditorHover();
 		this.stopWatchdog();
 	}
 
@@ -1491,7 +1554,7 @@ type PromptFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorCom
 function installPrompt(
 	ctx: ExtensionContext,
 	onCreated: (prompt: GentlePromptEditor) => void,
-	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; attachments?: ImageAttachments; readClipboardImage?: () => Promise<ClipboardImage | null>; panelChrome?: (tui: TUI) => boolean; topRows?: (tui: TUI, width: number, hovered?: number) => string[]; onTopRowClick?: (tui: TUI, index: number) => void },
+	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; attachments?: ImageAttachments; readClipboardImage?: () => Promise<ClipboardImage | null>; panelChrome?: (tui: TUI) => boolean; panelButton?: (tui: TUI) => boolean; topRows?: (tui: TUI, width: number, hovered?: number) => string[]; onTopRowClick?: (tui: TUI, index: number) => void; onPanelClick?: () => void },
 ): boolean {
 	const previous = ctx.ui.getEditorComponent() as PromptFactory | undefined;
 	if (previous && !previous[PROMPT_OWNER]) return false;
@@ -1511,8 +1574,10 @@ function installPrompt(
 			attachments: promptDeps.attachments,
 			readClipboardImage: promptDeps.readClipboardImage,
 			panelChrome: promptDeps.panelChrome ? () => promptDeps.panelChrome!(tui) : undefined,
+			panelButton: promptDeps.panelButton ? () => promptDeps.panelButton!(tui) : undefined,
 			topRows: promptDeps.topRows ? (width, hovered) => promptDeps.topRows!(tui, width, hovered) : undefined,
 			onTopRowClick: promptDeps.onTopRowClick ? (index) => promptDeps.onTopRowClick!(tui, index) : undefined,
+			onPanelClick: promptDeps.onPanelClick,
 		});
 		// Pi's own docs require an explicit requestRender() after a state change
 		// (docs/tui.md: "Call tui.requestRender() after state changes"); no host
@@ -1570,7 +1635,6 @@ function renderDoubleEscCancelReport(
 const CHANGES_WIDGET_KEY = "gentle-shell-changes";
 const HEADER_WIDGET_KEY = "gentle-shell-below-input-header";
 const CHANGES_COMMAND_NAME = "gentle:changes";
-const CHANGES_SHORTCUT_DEFAULT = "alt+g";
 const CHANGES_POLL_DEFAULT_MS = 2000;
 const GIT_TIMEOUT_MS = 5000;
 const COMMANDS_COMMAND_NAME = "gentle:commands";
@@ -1619,22 +1683,17 @@ const fileRevision = (root: string): FileRevision => async (path) => {
 };
 
 export { openInExternalEditor, type ExternalEditorHost } from "../lib/external-editor.ts";
-export function changesShortcut(env: NodeJS.ProcessEnv = process.env): string | undefined {
-	const value = env.GENTLE_PI_SHELL_CHANGES_KEY?.trim();
-	if (value === undefined) return CHANGES_SHORTCUT_DEFAULT;
-	return value === "" || value.toLowerCase() === "off" ? undefined : value;
+// Each key reads its environment variable, then keymaps.json, then its default (lib/keymaps.ts).
+export function changesShortcut(env: NodeJS.ProcessEnv = process.env, bindings: KeymapBindings = {}): string | undefined {
+	return effectiveKey("changes", env, bindings);
 }
 
-export function presetShortcut(env: NodeJS.ProcessEnv = process.env): string | undefined {
-	const value = env.GENTLE_PI_SHELL_PRESET_KEY?.trim();
-	if (value === undefined) return PRESET_SHORTCUT_DEFAULT;
-	return value === "" || value.toLowerCase() === "off" ? undefined : value;
+export function presetShortcut(env: NodeJS.ProcessEnv = process.env, bindings: KeymapBindings = {}): string | undefined {
+	return effectiveKey("preset", env, bindings);
 }
 
-export function usageShortcut(env: NodeJS.ProcessEnv = process.env): string | undefined {
-	const value = env.GENTLE_PI_SHELL_USAGE_KEY?.trim();
-	if (value === undefined) return USAGE_SHORTCUT_DEFAULT;
-	return value === "" || value.toLowerCase() === "off" ? undefined : value;
+export function usageShortcut(env: NodeJS.ProcessEnv = process.env, bindings: KeymapBindings = {}): string | undefined {
+	return effectiveKey("usage", env, bindings);
 }
 
 function positiveMs(value: string | undefined, fallback: number): number {
@@ -1719,21 +1778,61 @@ async function showChangesOverlay(ctx: ExtensionContext, deps: OverlayDeps): Pro
 // entries that are actually registered, so a missing extension never shows
 // a dead row. Selecting an entry runs it exactly as if the user had typed
 // the underlying slash command.
-async function showCommandPalette(pi: ExtensionAPI, ctx: ExtensionContext, env: NodeJS.ProcessEnv): Promise<void> {
+// Each row shows the key saved now; one that differs from the key Pi loaded at
+// startup is marked "(reload)", since Pi only applies it after /reload.
+function paletteShortcuts(pi: ExtensionAPI, env: NodeJS.ProcessEnv, loaded: KeymapBindings): Record<string, string | undefined> {
+	const saved = loadKeymaps(env).bindings;
+	const shortcuts: Record<string, string | undefined> = {};
+	for (const { name } of pi.getCommands()) {
+		const id = commandKeymapId(name);
+		const now = effectiveKey(id, env, saved);
+		const active = effectiveKey(id, env, loaded);
+		shortcuts[name] = now === active ? now : `${now ?? "none"} (reload)`;
+	}
+	return shortcuts;
+}
+
+/**
+ * The palette commands Customize lists under Keymaps. The command list is an
+ * extra there: when Pi cannot report it yet (before its runtime is
+ * initialized), Customize still opens with the built-in actions only.
+ */
+function paletteCommandsForKeymaps(pi: ExtensionAPI): { command: string; label: string }[] {
+	try {
+		return buildCommandPaletteGroups(pi.getCommands(), {}).flatMap((group) => group.items);
+	} catch {
+		return [];
+	}
+}
+
+/** Tab in the palette: assign the captured key to the command, through the same checks as /gentle:customize. */
+async function bindFromPalette(ctx: ExtensionContext, env: NodeJS.ProcessEnv, command: string, data: string, keybindings: PiKeybindings | undefined): Promise<void> {
+	const id = commandKeymapId(command);
+	const file = loadKeymaps(env);
+	const change = prepareKeymapChange(id, data, env, file, keybindings);
+	if (change.kind === "refused") return ctx.ui.notify(change.message, change.type);
+	if (change.confirm && !(await ctx.ui.confirm("Keymaps", change.confirm))) return;
+	writeKeymaps(gentlePiConfigHome(env), change.bindings);
+	ctx.ui.notify(keymapSavedNotice(id, keymapLabel(id), env, change.bindings), "info");
+}
+
+async function showCommandPalette(pi: ExtensionAPI, ctx: ExtensionContext, env: NodeJS.ProcessEnv, loaded: KeymapBindings = {}): Promise<void> {
 	if (!ctx.hasUI) return;
-	const groups = buildCommandPaletteGroups(pi.getCommands(), {
-		"gentle:changes": changesShortcut(env),
-		"gentle:agents": agentsViewKey(env),
-	});
+	const groups = buildCommandPaletteGroups(pi.getCommands(), paletteShortcuts(pi, env, loaded));
 	if (groups.length === 0) {
 		ctx.ui.notify("No Gentle commands are registered.", "info");
 		return;
 	}
+	let piKeybindings: PiKeybindings | undefined;
 	const result = await ctx.ui.custom<CommandPaletteResult>(
-		(tui, theme, _keybindings, done) => new CommandPalette(groups, withOverlayRepaint(tui, done), theme, () => Math.max(0, tui.terminal.rows)),
+		(tui, theme, keybindings, done) => {
+			if (typeof (keybindings as Partial<PiKeybindings> | undefined)?.getKeys === "function") piKeybindings = keybindings as PiKeybindings;
+			return new CommandPalette(groups, withOverlayRepaint(tui, done), theme, () => Math.max(0, tui.terminal.rows));
+		},
 		{ overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" } },
 	);
 	if (result?.type === "run") pi.sendUserMessage(`/${result.name}`, { expandPromptTemplates: true });
+	if (result?.type === "bind") await bindFromPalette(ctx, env, result.name, result.data, piKeybindings);
 }
 
 function showChanges(ctx: ExtensionContext, model: ChangesModel, visible = true, grouped: (width: number) => boolean = () => false): void {
@@ -1757,8 +1856,6 @@ const USAGE_COMMAND_NAME = "gentle:usage";
 const PANEL_COMMAND_NAME = "gentle:panel";
 /** Rows the panel sheet leaves free at the bottom: work row, editor rule, input, closing row, status bar and a spare. */
 const SHEET_RESERVED_ROWS = 6;
-const USAGE_SHORTCUT_DEFAULT = "alt+u";
-const PRESET_SHORTCUT_DEFAULT = "alt+l";
 const PRESET_LABEL: Record<VisualPreset, string> = { [VISUAL_PRESET.LIGHT]: "Light", [VISUAL_PRESET.NEUTRAL]: "Neutral", [VISUAL_PRESET.POWER_USER]: "Power user" };
 /** The order the preset shortcut walks; a hand-tuned mix starts it on Neutral. */
 const PRESET_CYCLE: readonly VisualPreset[] = [VISUAL_PRESET.LIGHT, VISUAL_PRESET.NEUTRAL, VISUAL_PRESET.POWER_USER];
@@ -1886,7 +1983,22 @@ export async function backgroundChangeRefreshesSettled(timeoutMs = 2000): Promis
 
 export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, overrides: Partial<ShellDeps> = {}): void {
 	installSessionChangeCapture(pi, env, overrides.resolveWorktree ?? resolveSessionWorktree);
+	// Replaced before persistence, so the footer, /gentle:stats and the session file
+	// all carry the API-equivalent cost of claude-bridge turns instead of $0. It runs
+	// in subagent children too: the parent sums their message_end cost over RPC.
+	pi.on("message_end", (event, ctx) => {
+		const priced = priceBridgeMessage(event.message, (provider, id) => ctx.modelRegistry.find(provider, id)?.cost);
+		return priced ? { message: priced } : undefined;
+	});
 	if (!shellEnabled(env)) return;
+	// Pi reads shortcuts once (startup and /reload), so the saved keymaps are read once too.
+	const keymaps = loadKeymaps(env);
+	let keymapsReported = false;
+	pi.on("session_start", (_event, ctx) => {
+		if (!keymaps.malformed || keymapsReported || !ctx.hasUI) return;
+		keymapsReported = true;
+		ctx.ui.notify(`Keymaps: ${keymaps.path} is unreadable or malformed; using the default keys.`, "warning");
+	});
 	const profileReader = createActiveProfileReader(env);
 	const deps: ShellDeps = { ...defaultShellDeps, activeProfile: profileReader, ...overrides };
 	let closeCustomize: (() => void) | undefined;
@@ -2106,9 +2218,23 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		return tui.terminal.columns < SIDEBAR_BREAKPOINT && (placement === "auto" || placement === "right") ? "narrow" : undefined;
 	};
 	// The live-work digests the mobile work row folds, honoring the Todos switch.
-	const workSummaries = (tui: TUI) => {
+	const workParts = (tui: TUI) => {
 		const state = sidebarState(tui);
-		return ["agents", "todo"].filter((key) => key !== "todo" || state.visibility?.todo !== false).map((key) => state.parts.get(key)?.summary?.()).filter((summary) => summary !== undefined);
+		return ["agents", "todo"].filter((key) => key !== "todo" || state.visibility?.todo !== false).flatMap((key) => {
+			const part = state.parts.get(key);
+			const summary = part?.summary?.();
+			return part && summary ? [{ part, summary }] : [];
+		});
+	};
+	const workSummaries = (tui: TUI) => workParts(tui).map((work) => work.summary);
+	// A tap on the work row opens the leading section's own view (an agent opens
+	// /gentle:agents); a section without one, such as Todos, opens the panel sheet.
+	const openWorkRow = (tui: TUI, ctx: ExtensionContext) => {
+		const parts = workParts(tui);
+		const lead = parts[workRowLead(parts.map((work) => work.summary))];
+		if (!lead) return;
+		if (lead.part.open) lead.part.open();
+		else void openPanelSheet(ctx);
 	};
 	// What the panel editor draws above its rule: the mobile work row, then any
 	// agent question, so nothing another widget adds can land between them and the input.
@@ -2200,8 +2326,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		description: "Show subscription usage windows for the connected providers. Press r to refetch.",
 		handler: async (_args, ctx) => openUsage(ctx),
 	});
-	const usageShortcutKey = usageShortcut(env);
-	const todoKey = todoCollapseKey(env);
+	const usageShortcutKey = usageShortcut(env, keymaps.bindings);
+	const todoKey = todoCollapseKey(env, keymaps.bindings);
 	if (usageShortcutKey) {
 		pi.registerShortcut(usageShortcutKey as Parameters<ExtensionAPI["registerShortcut"]>[0], {
 			description: "Show subscription usage windows for the connected providers",
@@ -2261,6 +2387,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	let changes: WorktreeChangesTracker | undefined;
 	let registry: SessionWorktreeRegistry | undefined;
 	let currentContext: ExtensionContext | undefined;
+	let disposeFooter: (() => void) | undefined;
 	let review: ReviewSidebarSnapshot | undefined;
 	let runningJobs: RunningJobDisplay[] | undefined;
 	let jobsCollapsed = false;
@@ -2364,6 +2491,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		changes = changesTracker(ctx);
 		const tracker = changes;
 		ctx.ui.setFooter((tui, theme, footerData) => {
+			disposeFooter?.();
 			sidebarTui = tui;
 			if (tui.terminal) sidebarState(tui).visibility = { todo: visualSettings.visibility.todo };
 			renderHost = { requestRender: () => tui.requestRender(), invalidateSidebar: () => invalidateSidebar(tui) };
@@ -2455,11 +2583,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				onHover(event) {
 					const target = targetAt(event.y, event.width);
 					const next = !target ? undefined : target.kind === "toggle" ? target.section : "open-changes";
+					if (next) setSidebarHover(tui, statusRegion, () => statusRegion.clearHover());
+					else setSidebarHover(tui);
 					if (next === statusHover) return { handled: true };
 					statusHover = next;
 					return { handled: true, render: true };
 				},
 				onLeave() {
+					releaseSidebarHover(tui, statusRegion);
 					if (!statusHover) return;
 					statusHover = undefined;
 					tui.requestRender();
@@ -2509,11 +2640,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			const jobsRegion = new NativePointerRegion(jobsRailCard, {
 				onHover(event) {
 					const next = event.y === jobsHeaderRow;
+					if (next) setSidebarHover(tui, jobsRegion, () => jobsRegion.clearHover());
+					else setSidebarHover(tui);
 					if (next === jobsHovered) return { handled: true };
 					jobsHovered = next;
 					return { handled: true, render: true };
 				},
 				onLeave() {
+					releaseSidebarHover(tui, jobsRegion);
 					if (!jobsHovered) return;
 					jobsHovered = false;
 					tui.requestRender();
@@ -2598,13 +2732,16 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			// The public widget slot follows the editor even when the rail is absent.
 			const belowHeader = () => visualSettings.headerPlacement === "below-input" && (tui as TUI & { mode?: string }).mode === "fullscreen" && statusOwner() !== STATUS_OWNER.BOTTOM;
 			const widgetChrome = (width: number) => belowFloat(width, false) ?? headerBar(width);
+			let disposed = false;
 			ctx.ui.setWidget(HEADER_WIDGET_KEY, () => ({
 				render(width: number) {
+					if (disposed) return [];
 					if (belowFloat(width, false)) return footerSuppressed() ? widgetChrome(width).rows : [];
 					return belowHeader() ? headerBar(width).rows : [];
 				},
 				invalidate() {},
 				handleMouse(event) {
+					if (disposed) return undefined;
 					const grouped = belowFloat(event.width, false);
 					if ((grouped ? !footerSuppressed() : !belowHeader()) || event.type !== "click" || event.button !== "left") return undefined;
 					if (!shellHeaderUsageHit(widgetChrome(event.width), event.x, event.y)) return undefined;
@@ -2612,8 +2749,27 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return { handled: true, render: true };
 				},
 			}), { placement: "belowEditor" });
+			// Pi still owns the footer component; shutdown releases its session-bound
+			// hooks before the old context becomes invalid, even if Pi disposes later.
+			const dispose = () => {
+				if (disposed) return;
+				disposed = true;
+				if (disposeFooter === dispose) disposeFooter = undefined;
+				clearInterval(jobsTimer);
+				jobsPart.dispose();
+				ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined);
+				disposeHeader();
+				disposeStatusBar();
+				statusRegion.dispose();
+				uninstall();
+				unpaintPage();
+				part.dispose();
+				if (sidebarTui === tui) { sidebarTui = undefined; renderHost = undefined; groupedChangesOwner = () => false; }
+			};
+			disposeFooter = dispose;
 			return { ...part,
 				render(width: number) {
+					if (disposed) return [];
 					// Running-only: a finished tail must never paint a ⧗ 0 jobs row.
 					const compactRunningJobs = runningJobs?.filter((job) => job.status === undefined);
 					if (visualSettings.statusPlacement === "hidden" && (tui as TUI & { mode?: string }).mode !== "fullscreen" && compactRunningJobs?.length) {
@@ -2624,7 +2780,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return rows.length === 0 && (tui as TUI & { mode?: string }).mode === "fullscreen"
 						&& resolvePromptLayout(width, cardStyle(), theme.bg?.bind(theme)).background ? [""] : rows;
 				},
-				dispose() { clearInterval(jobsTimer); jobsPart.dispose(); ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined); disposeHeader(); disposeStatusBar(); statusRegion.dispose(); uninstall(); unpaintPage(); part.dispose(); if (sidebarTui === tui) { sidebarTui = undefined; groupedChangesOwner = () => false; } } };
+				handleMouse(event: Parameters<NonNullable<SidebarRail["handleMouse"]>>[0]) {
+					return disposed ? undefined : part.handleMouse?.(event);
+				},
+				dispose };
 		});
 		void refreshUsage(ctx, true);
 		const ownsPrompt = installPrompt(
@@ -2638,9 +2797,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			{ now: () => deps.now(), doubleEscCancelEnabled: () => doubleEscCancelPolicy === "on", dispatchQueuedText: (text) => { pendingQueuedText = pendingQueuedText === undefined ? text : `${pendingQueuedText}\n\n${text}`; }, vimRuntimeVersion: deps.vimRuntimeVersion, attachments: imageAttachments, readClipboardImage: () => (deps.readClipboardImage ?? readClipboardImage)(),
 				// The editor joins the wide IDE chrome while the rail owns the host with the header on top.
 				panelChrome: (tui) => chromeMode(tui) !== undefined,
+				panelButton: (tui) => chromeMode(tui) === "narrow",
 				topRows: (tui, width, hovered) => panelTopRows(tui, width, ctx.ui.theme, hovered),
-				// The mobile work row is the first top row; a tap on it opens the panel sheet.
-				onTopRowClick: (tui, index) => { if (chromeMode(tui) === "narrow" && index === 0 && workSummaries(tui).length > 0) void openPanelSheet(ctx); } },
+				// The mobile work row is the first top row; a tap on it opens the leading section's view.
+				onTopRowClick: (tui, index) => { if (chromeMode(tui) === "narrow" && index === 0) openWorkRow(tui, ctx); },
+				onPanelClick: () => { void openPanelSheet(ctx); } },
 		);
 		imageAttachments.clear();
 		ctx.ui.setWidget(IMAGE_ATTACHMENTS_WIDGET_KEY, ownsPrompt
@@ -2679,6 +2840,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		return { action: "transform", text: submitted.text, images: [...(event.images ?? []), ...submitted.images] };
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
+		disposeFooter?.();
 		closeCustomize?.();
 		if (review) {
 			review = undefined;
@@ -2732,7 +2894,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		description: "Browse uncommitted Git changes (working tree vs HEAD, untracked included) in this session's repository and its subagents' worktrees. Press o to open $EDITOR.",
 		handler: async (_args, ctx) => openChanges(ctx),
 	});
-	const shortcut = changesShortcut(env);
+	const shortcut = changesShortcut(env, keymaps.bindings);
 	if (shortcut) {
 		pi.registerShortcut(shortcut as Parameters<ExtensionAPI["registerShortcut"]>[0], {
 			description: "Open the session's uncommitted Git changes",
@@ -2741,16 +2903,32 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	}
 	pi.registerCommand(COMMANDS_COMMAND_NAME, {
 		description: "Open the command palette: a curated, grouped menu of Gentle commands.",
-		handler: async (_args, ctx) => showCommandPalette(pi, ctx, env),
+		handler: async (_args, ctx) => showCommandPalette(pi, ctx, env, keymaps.bindings),
 	});
-	const commandsShortcut = commandsKey(env);
+	const commandsShortcut = commandsKey(env, keymaps.bindings);
 	if (commandsShortcut) {
 		pi.registerShortcut(commandsShortcut as Parameters<ExtensionAPI["registerShortcut"]>[0], {
 			description: "Open the command palette",
-			handler: async (ctx) => showCommandPalette(pi, ctx, env),
+			handler: async (ctx) => showCommandPalette(pi, ctx, env, keymaps.bindings),
 		});
 	}
-	const jobsKey = jobsCollapseKey(env);
+	// A palette command the user gave a key runs exactly as if typed.
+	for (const id of commandKeymapIds(keymaps.bindings)) {
+		const key = effectiveKey(id, env, keymaps.bindings);
+		const command = keymapCommand(id);
+		if (!key || !command) continue;
+		pi.registerShortcut(key as Parameters<ExtensionAPI["registerShortcut"]>[0], {
+			description: `Run /${command}`,
+			handler: async (ctx) => {
+				if (!pi.getCommands().some((registered) => registered.name === command)) {
+					ctx.ui.notify(`${key} runs /${command}, which is not available in this session.`, "warning");
+					return;
+				}
+				pi.sendUserMessage(`/${command}`, { expandPromptTemplates: true });
+			},
+		});
+	}
+	const jobsKey = jobsCollapseKey(env, keymaps.bindings);
 	if (jobsKey) {
 		pi.registerShortcut(jobsKey as Parameters<ExtensionAPI["registerShortcut"]>[0], {
 			description: "Collapse or expand the jobs card",
@@ -2761,7 +2939,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			},
 		});
 	}
-	const presetKey = presetShortcut(env);
+	const presetKey = presetShortcut(env, keymaps.bindings);
 	if (presetKey) {
 		pi.registerShortcut(presetKey as Parameters<ExtensionAPI["registerShortcut"]>[0], {
 			description: "Cycle the visual preset: Light, Neutral, Power user",
@@ -3069,6 +3247,17 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				},
 				explicitChoice(key, shown ? "shown" : "hidden", () => visual().visibility[key] === shown),
 			);
+			let piKeybindings: PiKeybindings | undefined;
+			let reloadRequested = false;
+			rows.push(...buildKeymapRows({
+				env,
+				configHome: doubleEscCancelConfigHome,
+				keybindings: () => piKeybindings,
+				commands: paletteCommandsForKeymaps(pi),
+				notify: (message, type) => ctx.ui.notify(message, type),
+				// Pi reloads after this card closes, as the command's last step.
+				reload: () => { reloadRequested = true; close(); },
+			}));
 			const catalog = () => listVisualProfiles(home).map(name => getVisualProfile(name, home)!);
 			category = "Profiles";
 			rows.push({ category, label: "Visual profiles (preview, save, apply, delete)", preview: () => {
@@ -3150,7 +3339,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				unobserve = adapter?.observe(() => { void refreshYolo(); });
 				await refreshYolo();
 				if (closed) return;
-				await ctx.ui.custom<null>((tui, theme, _keys, done) => {
+				await ctx.ui.custom<null>((tui, theme, keys, done) => {
+					if (typeof (keys as Partial<PiKeybindings> | undefined)?.getKeys === "function") piKeybindings = keys as PiKeybindings;
 					finish = () => done(null);
 					if (closed) done(null);
 					requestYoloRender = () => { if (!closed) tui.requestRender(); };
@@ -3161,12 +3351,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return {
 						render: (width) => closed ? [] : view.render(width),
 						handleInput: (data) => { if (!closed) view.handleInput(data); },
+						handleMouse: (event) => closed ? undefined : view.handleMouse(event),
 						focus: (label: string) => !closed && view.focus(label),
 						invalidate: () => { if (!closed) view.invalidate(); },
 						dispose: close,
 					};
 				}, { overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" } });
 			} finally { close(); }
+			if (reloadRequested) await ctx.reload();
 		},
 	});
 	pi.registerCommand("gentle:vim", {
