@@ -12,6 +12,7 @@ import {
 	CARD_TONE, cardAwaitingResult, cardBodyRows, cardBottom, cardLine, cardRunningLine, cardStyle, cardTop, floatRows, markCardResult,
 	type CardRowContext, type CardStyle, type CardTheme, type CardTone,
 } from "./shell-card.ts";
+import { appendSystemPromptOnce } from "./append-system-prompt.ts";
 import { sanitizeTerminalText, stripAnsi } from "./terminal-theme.ts";
 
 const CALL_STATUS = {
@@ -217,6 +218,14 @@ export function hasToolRenderers(pi: ExtensionAPI): boolean {
 export function registerCompactCodemode(pi: ExtensionAPI, factory: ExtensionFactory = createCodemodeExtension()): ReturnType<ExtensionFactory> {
 	if (hasToolRenderers(pi)) {
 		pi.registerToolRenderer((toolName, next) => (toolName === "codemode" ? compactCodemodeRenderers : next()));
+		// The built-in tool's own guidelines cannot be extended, so ours join the system prompt
+		// whenever codemode is active, as its promptGuidelines would.
+		pi.on("before_agent_start", (event) => {
+			if (pi.getActiveTools().includes("codemode")) {
+				appendSystemPromptOnce(event.systemPromptOptions, `Codemode guidelines:\n${CODEMODE_GUIDELINES.map((line) => `- ${line}`).join("\n")}`);
+			}
+			return undefined;
+		});
 		return;
 	}
 	const decoratedAPI = new Proxy(pi, {

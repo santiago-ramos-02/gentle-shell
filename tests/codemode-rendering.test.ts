@@ -73,6 +73,21 @@ test("where Pi can restyle tools, quiet tools draws its built-in codemode instea
 	for (const resolve of resolvers) assert.equal(resolve("read", () => builtIn), builtIn);
 });
 
+test("where Pi owns codemode, its guidelines reach the system prompt only while codemode is active", () => {
+	type Hook = (event: { systemPromptOptions: { appendSystemPrompt: string } }) => unknown;
+	const { hooks, pi } = registry();
+	let active: string[] = ["codemode"];
+	const host = Object.assign(pi, { registerToolRenderer() {}, getActiveTools: () => active });
+	quietTools(host);
+	const appended = () => {
+		const event = { systemPromptOptions: { appendSystemPrompt: "" } };
+		for (const [name, hook] of hooks) if (name === "before_agent_start") (hook as Hook)(event);
+		return event.systemPromptOptions.appendSystemPrompt;
+	};
+	for (const guideline of CODEMODE_GUIDELINES) assert.ok(appended().includes(`- ${guideline}`));
+	active = ["read"];
+	assert.equal(appended().includes(CODEMODE_GUIDELINES[0]!), false);
+});
 
 test("quiet tools registers an inactive upstream codemode with compact renderers", () => {
 	const tool = registeredCodemode();
