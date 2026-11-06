@@ -539,6 +539,8 @@ gentle-ai sync
 
 `pi update` keeps it on this fork's latest `main`. To stay on one release, install `git:github.com/santiago-ramos-02/gentle-shell@<tag>` from [the releases](https://github.com/santiago-ramos-02/gentle-shell/releases) instead. To go back to the official package, `pi remove git:github.com/santiago-ramos-02/gentle-shell` and `pi install npm:gentle-pi`.
 
+For a reproducible pin of the official package, use `pi install npm:gentle-pi@<version>` with a published version. Check the [published releases](https://github.com/Gentleman-Programming/gentle-shell/releases) for version-specific changes and runtime pairing; the unpinned command follows npm's `latest` dist-tag.
+
 <details>
 <summary><kbd>More</kbd> <strong>Seeing a builtin codemode warning?</strong> — why it appears and how to silence it</summary>
 

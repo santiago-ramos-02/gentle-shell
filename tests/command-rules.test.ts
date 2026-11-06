@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { __testing } from "../extensions/gentle-ai.ts";
+import { commandRuleAction, writeCommandRules } from "../lib/command-rules.ts";
 
 const { classifyGuardedCommand, evaluateGuardedCommand, guardedCommandTitle, loadRuntimeGuardrailsConfig } = __testing;
 
@@ -94,6 +95,31 @@ test("project custom commands are checked before global ones; invalid entries ar
 		assert.equal(config.guardedCommands.fileDeletion, "block");
 		assert.equal(classifyGuardedCommand("rm -rf dist", config), "confirm");
 		assert.equal(classifyGuardedCommand("rm -rf build", config), "block");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("an explicit allow is honored in normal mode for pattern rules only; autonomous mode still decides by its own rules", () => {
+	const off = { autonomousMode: false, guardedCommands: { gitPush: "allow" as const, fileDeletion: "allow" as const, npmPublish: "block" as const } };
+	assert.equal(commandRuleAction(off, "gitPush"), "allow");
+	assert.equal(commandRuleAction(off, "gitRebase"), "confirm", "unset rules keep confirming");
+	assert.equal(commandRuleAction(off, "npmPublish"), "confirm", "normal mode never turns a rule into a block");
+	assert.equal(commandRuleAction(off, "fileDeletion"), "confirm", "data loss is never waived by a stored allow");
+	const on = { autonomousMode: true, guardedCommands: { gitPush: "block" as const } };
+	assert.equal(commandRuleAction(on, "gitPush"), "block");
+	assert.equal(commandRuleAction(on, "npmPublish"), "block", "unset rules take their autonomous default");
+});
+
+test("rule files are written through a private temporary file that never lingers", () => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-command-rules-write-"));
+	try {
+		const path = join(root, "nested", "runtime-guardrails.json");
+		writeCommandRules(path, { guardedCommands: { gitPush: "allow" } });
+		writeCommandRules(path, { autonomousMode: true });
+		assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { guardedCommands: { gitPush: "allow" }, autonomousMode: true });
+		assert.deepEqual(readdirSync(join(root, "nested")), ["runtime-guardrails.json"]);
+		if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

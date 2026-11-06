@@ -2,7 +2,8 @@
 // allows, or blocks, and the runtime-guardrails.json files they live in. The
 // extension evaluates them before every shell command; the gentle-pi API reads
 // and edits the same files for hosts such as T3 Code, so both always agree.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { gentlePiConfigHome } from "./agent-home.ts";
 import { commandSegments } from "./destructive-command-guard.ts";
@@ -138,9 +139,16 @@ export function loadCommandRules(cwd: string, options: { configHome?: string } =
 	}
 }
 
-/** The action a built-in rule takes under `config`. */
+/**
+ * The action a built-in rule takes under `config`. With autonomous mode off a
+ * rule confirms, except an explicit "allow" (the "Always allow" choice writes
+ * one) on a pattern rule; data loss is never waived that way.
+ */
 export function commandRuleAction(config: CommandRulesConfig, key: CommandRuleKey): CommandRuleAction {
-	if (!config.autonomousMode) return "confirm";
+	if (!config.autonomousMode) {
+		const dataLoss = key === "fileDeletion" || key === "databaseWipe";
+		return !dataLoss && config.guardedCommands[key] === "allow" ? "allow" : "confirm";
+	}
 	return config.guardedCommands[key] ?? COMMAND_RULES[key].autonomousDefault;
 }
 
@@ -244,5 +252,13 @@ export function writeCommandRules(path: string, update: CommandRulesUpdate): voi
 		file.customCommands = update.customCommands.map((rule) => ({ pattern: normalizeCommandPattern(rule.pattern), action: rule.action }));
 	}
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`);
+	// Rename over the target so a reader never sees a half-written file.
+	const temporary = `${path}.${randomUUID()}.tmp`;
+	try {
+		writeFileSync(temporary, `${JSON.stringify(file, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+		renameSync(temporary, path);
+	} catch (error) {
+		try { unlinkSync(temporary); } catch { /* best effort cleanup */ }
+		throw error;
+	}
 }
