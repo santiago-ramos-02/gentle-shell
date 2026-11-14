@@ -46,6 +46,23 @@ export const ALWAYS_BLOCKED = [
 	"Any recognized data-loss command run by a subagent",
 ] as const;
 
+// A git push grant is the operation plus its option variant, stored as `gitPush:<variant>`.
+export const PUSH_PERMISSION_VARIANT = {
+	PLAIN: "plain",
+	DELETE: "--delete",
+	MIRROR: "--mirror",
+	FORCE: "--force",
+} as const;
+export const PUSH_PERMISSION_VARIANTS: ReadonlySet<string> = new Set(Object.values(PUSH_PERMISSION_VARIANT));
+
+export function pushPermissionKey(variant: string): string {
+	return `gitPush:${variant}`;
+}
+
+function isPushPermissionKey(key: string): boolean {
+	return key.startsWith("gitPush:") && PUSH_PERMISSION_VARIANTS.has(key.slice("gitPush:".length));
+}
+
 export interface CustomCommandRule {
 	pattern: string;
 	action: CommandRuleAction;
@@ -54,6 +71,8 @@ export interface CustomCommandRule {
 export interface CommandRulesConfig {
 	autonomousMode: boolean;
 	guardedCommands: Partial<Record<CommandRuleKey, CommandRuleAction>>;
+	/** Per-variant `gitPush:<variant>` grants; only "allow" is honored. */
+	guardedCommandVariants?: Record<string, CommandRuleAction>;
 	/** Checked in order; the first pattern matching a command segment wins. */
 	customCommands?: CustomCommandRule[];
 }
@@ -100,13 +119,22 @@ export function parseCommandRulesFile(raw: string): CommandRulesConfig | undefin
 	for (const [key, value] of Object.entries(isRecord(parsed.guardedCommands) ? parsed.guardedCommands : {})) {
 		if (isCommandRuleKey(key) && isCommandRuleAction(value)) guardedCommands[key] = value;
 	}
+	const guardedCommandVariants: Record<string, CommandRuleAction> = {};
+	for (const [key, value] of Object.entries(isRecord(parsed.guardedCommandVariants) ? parsed.guardedCommandVariants : {})) {
+		if (value === "allow" && isPushPermissionKey(key)) guardedCommandVariants[key] = value;
+	}
 	const customCommands: CustomCommandRule[] = [];
 	for (const entry of Array.isArray(parsed.customCommands) ? parsed.customCommands : []) {
 		if (!isRecord(entry) || typeof entry.pattern !== "string" || !isCommandRuleAction(entry.action)) continue;
 		const pattern = normalizeCommandPattern(entry.pattern);
 		if (isCommandPattern(pattern)) customCommands.push({ pattern, action: entry.action });
 	}
-	return { autonomousMode: parsed.autonomousMode === true, guardedCommands, customCommands };
+	return {
+		autonomousMode: parsed.autonomousMode === true,
+		guardedCommands,
+		...(Object.keys(guardedCommandVariants).length === 0 ? {} : { guardedCommandVariants }),
+		customCommands,
+	};
 }
 
 /**
@@ -130,6 +158,9 @@ export function loadCommandRules(cwd: string, options: { configHome?: string } =
 			merged = index === 0 ? layer : {
 				autonomousMode: layer.autonomousMode,
 				guardedCommands: { ...merged.guardedCommands, ...layer.guardedCommands },
+				...(merged.guardedCommandVariants || layer.guardedCommandVariants
+					? { guardedCommandVariants: { ...merged.guardedCommandVariants, ...layer.guardedCommandVariants } }
+					: {}),
 				customCommands: [...(layer.customCommands ?? []), ...(merged.customCommands ?? [])],
 			};
 		}
@@ -144,12 +175,16 @@ export function loadCommandRules(cwd: string, options: { configHome?: string } =
  * rule confirms, except an explicit "allow" (the "Always allow" choice writes
  * one) on a pattern rule; data loss is never waived that way.
  */
-export function commandRuleAction(config: CommandRulesConfig, key: CommandRuleKey): CommandRuleAction {
+export function commandRuleAction(config: CommandRulesConfig, key: CommandRuleKey, pushVariant?: string): CommandRuleAction {
+	const broad = config.guardedCommands[key];
+	const variant = key === "gitPush" && pushVariant !== undefined ? config.guardedCommandVariants?.[pushPermissionKey(pushVariant)] : undefined;
+	// An explicit broad block keeps blocking; otherwise the more specific variant grant applies.
+	const configured = broad === "block" ? broad : variant ?? broad;
 	if (!config.autonomousMode) {
 		const dataLoss = key === "fileDeletion" || key === "databaseWipe";
-		return !dataLoss && config.guardedCommands[key] === "allow" ? "allow" : "confirm";
+		return !dataLoss && configured === "allow" ? "allow" : "confirm";
 	}
-	return config.guardedCommands[key] ?? COMMAND_RULES[key].autonomousDefault;
+	return configured ?? COMMAND_RULES[key].autonomousDefault;
 }
 
 /** A usable custom command pattern names its command, so it cannot start with a wildcard. */
@@ -212,6 +247,8 @@ export interface CommandRulesUpdate {
 	autonomousMode?: boolean;
 	/** A null action removes the rule, so it takes its default again. */
 	guardedCommands?: Partial<Record<CommandRuleKey, CommandRuleAction | null>>;
+	/** Adds `gitPush:<variant>` grants. */
+	guardedCommandVariants?: Record<string, CommandRuleAction>;
 	/** Replaces every custom command. */
 	customCommands?: CustomCommandRule[];
 }
@@ -247,6 +284,9 @@ export function writeCommandRules(path: string, update: CommandRulesUpdate): voi
 			else guardedCommands[key] = action;
 		}
 		file.guardedCommands = guardedCommands;
+	}
+	if (update.guardedCommandVariants !== undefined) {
+		file.guardedCommandVariants = { ...(isRecord(file.guardedCommandVariants) ? file.guardedCommandVariants : {}), ...update.guardedCommandVariants };
 	}
 	if (update.customCommands !== undefined) {
 		file.customCommands = update.customCommands.map((rule) => ({ pattern: normalizeCommandPattern(rule.pattern), action: rule.action }));

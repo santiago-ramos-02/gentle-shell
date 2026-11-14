@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export const THINKING_LEVELS = [
 	"off",
@@ -107,6 +108,14 @@ function parseModelConfigFileValue(value: Record<string, unknown>): AgentModelCo
 	return config;
 }
 
+/** The two stores the saved global routing is read from: global first, then the legacy project file. */
+export function modelConfigPaths(configHome: string, cwd: string): { global: string; project: string } {
+	return {
+		global: join(configHome, "models.json"),
+		project: join(cwd, ".pi", "gentle-ai", "models.json"),
+	};
+}
+
 export function readModelConfigFile(path: string): ModelConfigFileResult {
 	if (!existsSync(path)) return { status: "missing" };
 	try {
@@ -131,13 +140,31 @@ export async function readModelConfigFileAsync(
 	}
 }
 
+// A present global config must merge with, not fully shadow, the legacy project
+// config: project-only entries still apply, same-name entries prefer global.
+function mergeSavedModelConfig(
+	globalResult: ModelConfigFileResult,
+	projectResult: ModelConfigFileResult,
+): ModelConfigFileResult {
+	if (globalResult.status === "invalid") return globalResult;
+	if (projectResult.status === "invalid") return projectResult;
+	if (globalResult.status === "missing" && projectResult.status === "missing") return { status: "missing" };
+	return {
+		status: "valid",
+		config: {
+			...(projectResult.status === "valid" ? projectResult.config : {}),
+			...(globalResult.status === "valid" ? globalResult.config : {}),
+		},
+	};
+}
+
 export function readSavedModelConfig(
 	globalPath: string,
 	projectPath: string,
 ): ModelConfigFileResult {
 	const globalResult = readModelConfigFile(globalPath);
-	if (globalResult.status !== "missing") return globalResult;
-	return readModelConfigFile(projectPath);
+	if (globalResult.status === "invalid") return globalResult;
+	return mergeSavedModelConfig(globalResult, readModelConfigFile(projectPath));
 }
 
 export async function readSavedModelConfigAsync(
@@ -145,6 +172,6 @@ export async function readSavedModelConfigAsync(
 	projectPath: string,
 ): Promise<ModelConfigFileResult> {
 	const globalResult = await readModelConfigFileAsync(globalPath);
-	if (globalResult.status !== "missing") return globalResult;
-	return readModelConfigFileAsync(projectPath);
+	if (globalResult.status === "invalid") return globalResult;
+	return mergeSavedModelConfig(globalResult, await readModelConfigFileAsync(projectPath));
 }

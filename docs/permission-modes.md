@@ -50,7 +50,7 @@ Changing the default does **not** change the current session. To return this ses
 
 | Mode | Behavior |
 | --- | --- |
-| **Normal** | Existing permission behavior; the default when no valid global preference exists. Guarded-command confirmations offer scoped choices: **Allow once**, **Allow for this session** (remembers the exact command until the session ends) and **Always allow <family>** (persists `guardedCommands[key]="allow"` in the user-level `runtime-guardrails.json`), besides **Deny**. Recognized data-loss commands never offer Always allow; hosts without a select dialog keep the plain yes/no confirm. |
+| **Normal** | Existing permission behavior; the default when no valid global preference exists. Guarded-command confirmations offer scoped choices: **Allow once**, **Allow for this session** (remembers the guarded identity until the session ends) and **Always allow <family>** (persists `guardedCommands[key]="allow"` for non-push guards, or a push-variant entry in the user-level `runtime-guardrails.json`), besides **Deny**. Recognized data-loss commands never offer Always allow; hosts without a select dialog keep the plain yes/no confirm. |
 | **Auto** | A separate reviewer using the current session model checks eligible actions against live user intent before execution. Local reads are classified too; locality does not exempt an action from explicit restrictions. |
 | **YOLO** | Standing permission for ordinary already-authorized work and delivery; no Auto classifier. Destructive and independent consent boundaries remain, except recursive removal of the session's own [temp scratch](yolo-mode.md#temp-scratch-removal). Destructive confirmations apply only to commands the session actually runs: destructive text quoted from issues, files or docs is not an execution. Reading and listing non-sensitive material outside the workspace (the agent's own skills, docs, configuration) needs no permission question; sensitive-path and private-credential blocks still win. [Full YOLO details](yolo-mode.md). |
 | **Super Yolo** | No permission prompts at all, including data-loss confirmations and configured guardrail actions. The only remaining line is the sensitive-path guard: read/write/edit of `.env`, `.ssh`, keychains, `*.pem/*.key/*.p12/*.pfx`, `secrets/` and cloud credential files stays hard-blocked. Code-level catastrophic denies (`rm -rf /`, `--no-preserve-root`, `git reset --hard`, forced clean, force push) also remain. |
@@ -68,6 +68,14 @@ Changing the default does **not** change the current session. To return this ses
 In `/gentle:customize` → **Editor**, use **Session permissions** to change the current mode, or **Default permissions** to save a future-session preference. The original **YOLO: ON/OFF · session only** row still toggles the live mode; it does not save a default. Browsing, previews, and closing the menu do not grant permission.
 
 Current-session selection takes precedence over the global default. Repository settings, visual profiles, and session transcript entries cannot supply a permission-mode default. Package-owned children do not inherit the parent's elevated mode; their existing bounded delegation and safety paths remain in charge.
+
+## Push permission identity
+
+A guarded push is remembered by its operation and option variant, not its operands. Approving `git push origin main` also covers `git push origin feature` and `git push upstream main:release`, but not `--delete`, `--mirror` or a force refspec (`+main`). A single leading `git -C <directory>` prefix is recognized too; the directory is ignored for identity. `-d` shares `--delete`; `-f`, `--force` and `--force-with-lease` remain hard-blocked and a normal push grant never enables them.
+
+Session and Always use the same identity (`gitPush:plain`, `gitPush:--delete`, `gitPush:--mirror`, `gitPush:--force`); only the lifetime differs. The Always choice writes `guardedCommandVariants` in the user-level config, so it survives a new session; only `allow` entries are honored there. Existing broad `guardedCommands.gitPush` entries keep their current meaning.
+
+Only one literal `git push` command (optionally with that single `-C <directory>` prefix) is recognized. Quoted, expanded, redirected or compound commands, and options this guard does not classify (for example `-u` or `--tags`), never create or inherit a push-variant grant and never offer Always. **Allow for this session** can still remember such an exact command, but that grant applies only to the same exact text.
 
 ## What Auto checks
 
@@ -92,6 +100,10 @@ An allow verdict only returns control to the original executor and remaining gua
 - User-question tools, native review/maintenance consent, opaque-token decisions and delegation-control tools retain their independent contracts. The classifier does not answer them.
 - The mode does not choose an unknown remote destination, account or credential, or authorize ambient credential discovery.
 - Calls that execute outside Pi's intercepted tool pipeline are outside this hook's coverage. A custom tool is inspected by its name and arguments, not by executing or proving its implementation.
+
+### Execution-surface guard
+
+A tool call whose input sets `openProjectPaneIfMissing` to anything but `false` is blocked before any prompt or execution, in every mode including YOLO and super-YOLO, and in child sessions. The reason carries the stable code `gentle-ai.execution-surface.external-fallback-prohibited`; run the work through `subagent_*` or the native `Agent` in the current runtime instead, or stop and tell the user.
 
 ## Failure behavior and cost
 

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -63,7 +65,7 @@ test("public Anthropic non-strict adapter preserves the complete review tool dec
 	assert.deepEqual(controller.required, ["operation"]);
 	assert.deepEqual(Object.keys(controller.properties).sort(), ["operation", "lineageId", "selectionBinding", "intendedUntracked", "untrackedScope", "changeName", "idempotencyKey", "transition", "input", "outputPath", "inputPath", "operationId", "lineageIds", "workspaceRoot"].sort());
 	assert.ok(controller.properties.input.anyOf.some((schema: any) => schema.type === "object"));
-	assert.match(controller.properties.input.description, /START\/ASSESS\/answer-consent/);
+	assert.match(controller.properties.input.description, /START\/ASSESS\/answer-consent\/abandon/);
 	assert.deepEqual(controller.properties.operation.enum, tools.get("gentle_review").parameters.properties.operation.enum);
 	for (const name of ["gentle_review_capture", "gentle_review_capture_group"]) {
 		const schema = emitted.get(name);
@@ -87,6 +89,19 @@ test("public Anthropic non-strict adapter preserves the complete review tool dec
 });
 
 const binding = { name: "reviewer_result", arguments: [] };
+
+test("STATUS accepts object selectors and rejects malformed input before native access", async () => {
+ const input = { baseRef: "HEAD", committedOnly: true };
+ assert.equal(__testing.parseReviewControllerParameters(validate("gentle_review", { operation: "status", input })).input, JSON.stringify(input));
+ let calls = 0;
+ const native = new Proxy({}, { get: () => async () => { calls++; throw new Error("invalid input reached native"); } }) as NativeReviewCli;
+ for (const malformed of [null, [], 42]) await assert.rejects(__testing.executeReviewControllerOperation({ operation: "status", input: malformed }, process.cwd(), native), /input|JSON|object/i);
+ for (const malformed of [{ baseRef: "HEAD" }, { baseRef: "HEAD", committedOnly: false }, { unexpected: true }]) {
+  const result = await __testing.executeReviewControllerOperation({ operation: "status", input: malformed }, process.cwd(), native);
+  assert.equal(result.outcome, "native-status-input-invalid");
+ }
+ assert.equal(calls, 0);
+});
 test("registered review schemas admit START/ASSESS objects and ordered capture objects", () => {
 	for (const operation of ["start", "assess"]) {
 		const input = operation === "start" ? { mode: "ordinary" } : { committedOnly: true, baseRef: "HEAD" };
@@ -116,15 +131,75 @@ test("answer-consent admits JSON object input and coerces it cleanly (#2375)", a
 	assert.match(String(outcome.outcome), /consent-binding-stale/);
 });
 
+test("abandon admits JSON object input and coerces it to a serialized string", () => {
+	const input = { actor: "loonbac", reason: "operator_disposition" };
+	const args = validate("gentle_review", { operation: "abandon", lineageId: "review-1", input });
+	assert.deepEqual(args.input, input);
+	assert.equal(__testing.parseReviewControllerParameters(args).input, JSON.stringify(input));
+});
+
+test("validated abandon objects reach the mocked native facade and still fail closed", async () => {
+	let statusCalls = 0;
+	let abandonCalls = 0;
+	const native = {
+		reviewStatus: async () => { statusCalls++; return { entries: [] }; },
+		abandon: async () => { abandonCalls++; },
+	} as unknown as NativeReviewCli;
+	const bad = await __testing.executeReviewControllerOperation(validate("gentle_review", { operation: "abandon", lineageId: "review-1", input: { actor: "loonbac", reason: "not-a-reason" } }), process.cwd(), native);
+	assert.equal(bad.outcome, "native-input-invalid");
+	assert.equal(statusCalls, 0);
+	const ineligible = await __testing.executeReviewControllerOperation(validate("gentle_review", { operation: "abandon", lineageId: "review-1", input: { actor: "loonbac", reason: "operator_disposition" } }), process.cwd(), native);
+	assert.equal(ineligible.outcome, "native-abandon-ineligible");
+	assert.equal(statusCalls, 1);
+	assert.equal(abandonCalls, 0);
+});
+
 test("validated ASSESS objects reach the mocked native facade with parsed fields", async () => {
 	const requests: unknown[] = [];
+	const baseRef = execFileSync("git", ["rev-parse", "HEAD"], { cwd: process.cwd(), encoding: "utf8" }).trim();
 	const native = { assess: async (request: unknown) => { requests.push(request); throw new Error("mock assessment unavailable"); } } as unknown as NativeReviewCli;
 	for (const input of [{ baseRef: "HEAD", committedOnly: true, nativeReviewOutcome: "unknown" }, ' { "baseRef": "HEAD", "committedOnly": true, "nativeReviewOutcome": "unknown" } ']) {
 		await __testing.executeReviewControllerOperation(validate("gentle_review", { operation: "assess", input }), process.cwd(), native);
 	}
 	assert.equal(requests.length, 2);
-	assert.deepEqual(requests[0], { cwd: process.cwd(), baseRef: "HEAD", committedOnly: true });
+	assert.deepEqual(requests[0], { cwd: process.cwd(), baseRef, committedOnly: true });
 	assert.deepEqual(requests[1], requests[0]);
+});
+
+test("ASSESS ignores empty top-level selection defaults and targets the selected child repository (#2808)", async (t) => {
+	const parent = realpathSync(mkdtempSync(join(tmpdir(), "assess-parent-")));
+	t.after(() => rmSync(parent, { recursive: true, force: true }));
+	const selected = join(parent, "selected");
+	const other = join(parent, "other");
+	for (const cwd of [selected, other]) {
+		mkdirSync(cwd);
+		execFileSync("git", ["init", "--initial-branch=fixture"], { cwd, stdio: "ignore" });
+	}
+	const requests: unknown[] = [];
+	const native = { assess: async (request: unknown) => { requests.push(request); throw new Error("fixture assessment unavailable"); } } as unknown as NativeReviewCli;
+	for (const defaults of [{}, { intendedUntracked: [] }, { untrackedScope: "select" }, { untrackedScope: "exclude" }, { intendedUntracked: [], untrackedScope: "select" }, { intendedUntracked: [], untrackedScope: "exclude" }]) {
+		const args = validate("gentle_review", { operation: "assess", workspaceRoot: selected, input: "{}", ...defaults });
+		const original = structuredClone(args);
+		const parsed = __testing.parseReviewControllerParameters(args);
+		assert.equal("intendedUntracked" in parsed, false);
+		assert.equal("untrackedScope" in parsed, false);
+		const result = await __testing.executeReviewControllerOperation(args, parent, native);
+		assert.equal(result.operation, "assess");
+		assert.deepEqual(args, original, "normalization must not mutate the caller input");
+	}
+	assert.deepEqual(requests, Array.from({ length: 6 }, () => ({ cwd: selected })), "all equivalent calls reach the selected repository; the fixture deliberately reports native unavailability");
+});
+
+test("ASSESS still rejects meaningful or malformed top-level untracked selection (#2808)", () => {
+	for (const defaults of [
+		{ intendedUntracked: ["new.ts"] },
+		{ intendedUntracked: ["new.ts"], untrackedScope: "select" },
+		{ intendedUntracked: null }, { intendedUntracked: "" }, { intendedUntracked: undefined },
+		{ intendedUntracked: [], untrackedScope: "unknown" }, { untrackedScope: null },
+	]) assert.throws(() => __testing.parseReviewControllerParameters({ operation: "assess", ...defaults }), /does not accept/);
+	for (const operation of ["status", "start", "answer-consent", "reset"]) {
+		assert.throws(() => __testing.parseReviewControllerParameters({ operation, intendedUntracked: [], untrackedScope: "select" }), /does not accept/);
+	}
 });
 
 test("serialized inputs remain byte-for-byte unchanged at validation and facade parsing", () => {
@@ -177,7 +252,7 @@ test("answer-consent accepts the consent object the same as its serialized strin
 });
 
 test("all other controller operations keep object input fail-closed at the facade boundary (#1698)", async () => {
-	const operations = (tools.get("gentle_review").parameters.properties.operation.enum as string[]).filter((operation) => operation !== "start" && operation !== "assess" && operation !== "answer-consent" && operation !== "select-intended-untracked");
+	const operations = (tools.get("gentle_review").parameters.properties.operation.enum as string[]).filter((operation) => operation !== "start" && operation !== "assess" && operation !== "answer-consent" && operation !== "abandon" && operation !== "status" && operation !== "select-intended-untracked");
 	let calls = 0;
 	const native = new Proxy({}, { get() { return async () => { calls++; throw new Error("unexpected native execution"); }; } }) as NativeReviewCli;
 	for (const operation of operations) {
