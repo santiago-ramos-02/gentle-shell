@@ -23,12 +23,36 @@ export const PROFILES_VERSION = 1;
 export const PROFILE_EXPORT_KIND = "gentle-pi.agent_model_profile";
 export const PROFILE_EXPORT_VERSION = 1;
 
+// The orchestrator workflow a profile opts into (full-delegation-mode S1).
+//
+// This deliberately does NOT live inside a profile's routing map. A profile's
+// value is an `AgentModelConfig` — `Record<string, AgentRoutingEntry>` — and
+// `normalizeModelConfig` drops every key that is not a routing entry, reporting
+// it as a broken role. A nested `workflow` key would therefore be destroyed on
+// the first read of `<configHome>/profiles.json`, so the flag travels in a
+// sibling map keyed by profile name instead: same profile, same file, same
+// live-switch semantics, unchanged routing contract.
+export const ORCHESTRATOR_MODES = ["organic", "full-delegation"]         ;
+
+/** Today's behaviour: the orchestrator may implement inline under the usual rules. */
+export const DEFAULT_ORCHESTRATOR_MODE                   = "organic";
 
 
 
 
 
 
+
+
+
+
+
+
+
+
+export function isOrchestratorMode(value         )                            {
+	return typeof value === "string" && (ORCHESTRATOR_MODES                     ).includes(value);
+}
 
 
 
@@ -111,6 +135,12 @@ export function emptyProfilesFile()                    {
 
 
 
+
+
+
+
+
+
 function isRecord(value         )                                   {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -166,7 +196,49 @@ export function normalizeProfilesFile(value         )                           
 				typeof value.active === "string" ? value.active : JSON.stringify(value.active);
 		}
 	}
-	return { file: { kind: PROFILES_KIND, version: PROFILES_VERSION, active, profiles }, drops };
+	const workflow = normalizeWorkflowMap(value.workflow, profiles, drops);
+	return {
+		file: {
+			kind: PROFILES_KIND,
+			version: PROFILES_VERSION,
+			active,
+			profiles,
+			...(workflow === undefined ? {} : { workflow }),
+		},
+		drops,
+	};
+}
+
+/**
+ * Keeps only workflow opt-ins that name a surviving profile and a declared
+ * mode. Anything else is reported through `drops.droppedWorkflow` instead of
+ * being honoured or silently erased (full-delegation-mode S6).
+ */
+function normalizeWorkflowMap(
+	value         ,
+	profiles                                  ,
+	drops                    ,
+)                                              {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) return undefined;
+	const workflow                                  = {};
+	const dropped                                           = [];
+	for (const [name, rawEntry] of Object.entries(value)) {
+		const rawMode = isRecord(rawEntry) ? rawEntry.orchestratorMode : undefined;
+		const described = rawMode === undefined ? JSON.stringify(rawEntry ?? null) : String(rawMode);
+		if (!hasOwn(profiles, name) || !isOrchestratorMode(rawMode)) {
+			dropped.push({ profile: name, mode: described });
+			continue;
+		}
+		workflow[name] = { orchestratorMode: rawMode };
+	}
+	if (dropped.length > 0) drops.droppedWorkflow = dropped;
+	// An all-organic map carries no information: keep the file identical to the
+	// pre-change shape so an opted-out file never grows a `workflow` key.
+	const meaningful = Object.fromEntries(
+		Object.entries(workflow).filter(([, entry]) => entry.orchestratorMode !== DEFAULT_ORCHESTRATOR_MODE),
+	);
+	return Object.keys(meaningful).length === 0 ? undefined : meaningful;
 }
 
 
@@ -205,7 +277,23 @@ export function serializeProfilesFile(file                   )         {
 		profiles: cloneProfiles(file.profiles),
 	};
 	if (file.active !== undefined) payload.active = file.active;
+	const workflow = meaningfulWorkflowMap(file.workflow, file.profiles);
+	if (workflow !== undefined) payload.workflow = workflow;
 	return `${JSON.stringify(payload, null, 2)}\n`;
+}
+
+/** The subset of a workflow map worth persisting: declared profiles, non-default modes. */
+function meaningfulWorkflowMap(
+	workflow                                             ,
+	profiles                                  ,
+)                                              {
+	if (workflow === undefined) return undefined;
+	const kept = Object.fromEntries(
+		Object.entries(workflow)
+			.filter(([name, entry]) => hasOwn(profiles, name) && entry.orchestratorMode !== DEFAULT_ORCHESTRATOR_MODE)
+			.map(([name, entry]) => [name, { orchestratorMode: entry.orchestratorMode }]),
+	);
+	return Object.keys(kept).length === 0 ? undefined : kept;
 }
 
 // ---- Store mutations (each returns a new file and never mutates the input) ----
@@ -247,7 +335,8 @@ export function duplicateProfile(
 	if (hasOwn(file.profiles, to)) {
 		throw new AgentProfileError("duplicate_name", `Profile already exists: ${to}.`);
 	}
-	return createProfile(file, to, file.profiles[from]);
+	const created = createProfile(file, to, file.profiles[from]);
+	return setProfileOrchestratorMode(created, to, readProfileWorkflow(file, from).orchestratorMode);
 }
 
 export function renameProfile(
@@ -273,6 +362,9 @@ export function renameProfile(
 		...file,
 		active: file.active === from ? to : file.active,
 		profiles,
+		...(renamedWorkflow(file.workflow, from, to) === undefined
+			? {}
+			: { workflow: renamedWorkflow(file.workflow, from, to) }),
 	};
 }
 
@@ -292,6 +384,9 @@ export function deleteProfile(file                   , name        )            
 		profiles: Object.fromEntries(
 			Object.entries(file.profiles).filter(([profileName]) => profileName !== name),
 		),
+		...(workflowWithout(file.workflow, name) === undefined
+			? {}
+			: { workflow: workflowWithout(file.workflow, name) }),
 	};
 }
 
@@ -301,6 +396,69 @@ export function setActiveProfile(file                   , name        )         
 		throw new AgentProfileError("missing_profile", `Profile does not exist: ${name}.`);
 	}
 	return { ...file, active: name };
+}
+
+// ---- Per-profile orchestrator workflow (full-delegation-mode) ----
+
+/**
+ * The orchestrator mode a profile carries, defaulting to today's behaviour.
+ *
+ * Unknown names resolve to the default instead of throwing: this is read on
+ * every prompt build, and a profile deleted or renamed between reads must not
+ * be able to break the orchestrator prompt.
+ */
+export function readProfileWorkflow(file                   , name        )                  {
+	const entry = file.workflow !== undefined && hasOwn(file.workflow, name) ? file.workflow[name] : undefined;
+	return { orchestratorMode: entry?.orchestratorMode ?? DEFAULT_ORCHESTRATOR_MODE };
+}
+
+/**
+ * Opts one profile into a mode (S1). Selecting the default removes the entry
+ * instead of persisting it, so an all-organic store keeps its pre-change shape.
+ */
+export function setProfileOrchestratorMode(
+	file                   ,
+	name        ,
+	mode                  ,
+)                    {
+	requireValidName(name);
+	if (!hasOwn(file.profiles, name)) {
+		throw new AgentProfileError("missing_profile", `Profile does not exist: ${name}.`);
+	}
+	if (mode === DEFAULT_ORCHESTRATOR_MODE) return { ...file, workflow: workflowWithout(file.workflow, name) };
+	return { ...file, workflow: { ...file.workflow, [name]: { orchestratorMode: mode } } };
+}
+
+/** The mode the focused profile would get from one key press (panel `d`). */
+export function toggleProfileOrchestratorMode(
+	file                   ,
+	name        ,
+)                    {
+	const current = readProfileWorkflow(file, name).orchestratorMode;
+	const next = ORCHESTRATOR_MODES[(ORCHESTRATOR_MODES.indexOf(current) + 1) % ORCHESTRATOR_MODES.length];
+	return setProfileOrchestratorMode(file, name, next);
+}
+
+/** Drops one profile's workflow entry, and the map itself once it is empty. */
+function workflowWithout(
+	workflow                                             ,
+	name        ,
+)                                              {
+	if (workflow === undefined) return undefined;
+	const kept = Object.fromEntries(Object.entries(workflow).filter(([key]) => key !== name));
+	return Object.keys(kept).length === 0 ? undefined : kept;
+}
+
+function renamedWorkflow(
+	workflow                                             ,
+	from        ,
+	to        ,
+)                                              {
+	if (workflow === undefined) return undefined;
+	const remapped = Object.fromEntries(
+		Object.entries(workflow).map(([key, entry]) => [key === from ? to : key, entry]),
+	);
+	return Object.keys(remapped).length === 0 ? undefined : remapped;
 }
 
 // ---- Summaries and panel decision helpers ----

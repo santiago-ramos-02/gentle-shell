@@ -267,8 +267,8 @@ export function bundledPi(install                , input                        
 // given explicitly, and its npm through the home's npmCommand setting), plus
 // only no Pi override, subagents on the same node and Pi (the subagent runner
 // splits GENTLE_PI_AGENTS_PI on whitespace, so a spaced path is left to its
-// default, the running node and cli.js), and no Pi update check, since Pi only
-// updates with Gentle Shell (S5). S9: the prefix (GENTLE_SHELL_PREFIX, from
+// default, the running node and cli.js), and no separate Pi update check, since
+// Shell handles Pi updates. S9: the prefix (GENTLE_SHELL_PREFIX, from
 // which gentle-pi derives its config folder and gives its own gentle-ai runs
 // Gentle AI's variables, never set here because the agent's shell would pass
 // them to a gentle-ai the user runs), and the published Engram as
@@ -276,7 +276,7 @@ export function bundledPi(install                , input                        
 // (S2, S6): the startup policy, and ENGRAM_BIN is the Shell-owned guard, so no
 // provider, whatever loaded it, runs an Engram binary against a store; allowed
 // memory reaches the shared server through ENGRAM_URL only.
-export const ENGRAM_COMPANION_SOURCE = "npm:gentle-engram@0.4.2";
+export const ENGRAM_COMPANION_SOURCE = "npm:gentle-engram";
 export const ENGRAM_RECOVERY_NOTICE = "Engram memory disabled: Shell could not verify safe server reuse. Matching versions or updating alone do not prove compatibility. Reuse requires a server on 127.0.0.1:7437 with verified /compatibility evidence; Shell never stops or replaces a server already listening there. Back up existing Engram data before manual changes; do not delete it or bypass the safety check. Shell rechecks on every launch and remains usable without memory.";
 export const ENGRAM_START_FAILED_NOTICE = "Engram memory disabled for this launch: Shell could not start the shared Engram server, or it did not report ready in time. Restart Shell to retry; if another program holds 127.0.0.1:7437, stop it first. Shell remains usable without memory.";
 export const ENGRAM_NEWER_SCHEMA_NOTICE = "Engram memory disabled: ~/.engram was migrated by a newer Engram than Shell's bundled core, so Shell will not start a server on it. Start that newer Engram's server yourself (engram serve); Shell reuses a running server with verified /compatibility evidence. Back up the store; do not delete or downgrade it. Shell remains usable without memory.";
@@ -287,16 +287,50 @@ export const ENGRAM_COMPATIBILITY_MIN_VERSION = "3.4.0";
 export function engramOutdatedServerNotice(version        )         {
 	return `Engram memory disabled: the running Engram server reports version ${version}, which cannot prove store compatibility. Back up your Engram data, update that server to ${ENGRAM_COMPATIBILITY_MIN_VERSION} or later with the method you installed it with, and restart it; updating Shell alone does not replace a running server. Shell rechecks on every launch and remains usable without memory.`;
 }
+// A canonical numeric x.y.z (optionally v-prefixed, no leading zeros), split
+// into numeric parts; undefined otherwise. The version comes from the server,
+// so anything else is never echoed to the user.
+function canonicalVersion(version                    )                       {
+	const match = /^v?(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})$/.exec(version ?? "");
+	return match === null ? undefined : match.slice(1).map(Number);
+}
+
+// "older" or "same-or-newer" over canonical numeric parts, or undefined when
+// the version itself is not canonical.
+function compareVersion(version                    , minimum        )                                        {
+	const parts = canonicalVersion(version);
+	if (parts === undefined) return undefined;
+	const base = canonicalVersion(minimum);
+	if (base === undefined) return undefined;
+	for (let i = 0; i < parts.length; i += 1) {
+		if (parts[i] !== base[i]) return parts[i] < base[i] ? "older" : "same-or-newer";
+	}
+	return "same-or-newer";
+}
+
 // A canonical numeric x.y.z (optionally v-prefixed, no leading zeros) older than
 // the minimum. The version comes from the server, so anything else is never
 // echoed to the user.
 function outdatedServerVersion(version                    )                     {
-	const match = /^v?(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,3})$/.exec(version ?? "");
-	if (match === null) return undefined;
-	const parts = match.slice(1).map(Number);
-	const minimum = ENGRAM_COMPATIBILITY_MIN_VERSION.split(".").map(Number);
-	const index = parts.findIndex((part, i) => part !== minimum[i]);
-	return index >= 0 && parts[index] < minimum[index] ? parts.join(".") : undefined;
+	const parts = canonicalVersion(version);
+	if (parts === undefined) return undefined;
+	return compareVersion(version, ENGRAM_COMPATIBILITY_MIN_VERSION) === "older" ? parts.join(".") : undefined;
+}
+
+// The first release whose CLI runs the shared server's whole lifecycle as a
+// pidfile-tracked daemon (`engram run -d` plus the `ps`, `stop`, `logs`,
+// `restart` verbs; engram issues #2228 and #2346): a core older than this
+// knows only `serve`, which no daemon verb can adopt.
+export const ENGRAM_DAEMON_LIFECYCLE_MIN_VERSION = "3.7.0";
+export function engramSupportsDaemonLifecycle(version                    )          {
+	return compareVersion(version, ENGRAM_DAEMON_LIFECYCLE_MIN_VERSION) === "same-or-newer";
+}
+
+// The command line Shell starts the shared server with: daemon-lifecycle cores
+// register with `run -d` so the standard verbs manage the server; older cores
+// spawn only the legacy detached `serve`.
+export function engramSpawnArgs(version                    )           {
+	return engramSupportsDaemonLifecycle(version) ? ["run", "-d"] : ["serve"];
 }
 // The default endpoint gentle-engram uses without ENGRAM_URL or ENGRAM_PORT.
 export const ENGRAM_DEFAULT_PORT = 7437;
@@ -411,12 +445,69 @@ export function parseEngramProvenance(text                    )                 
 }
 
 // The bundled core's own schema (SQLite user_version), verified from the
-// tagged sources v3.3.2, v3.4.0 and v3.5.2: internal/store/store.go `const schemaVersion = 1`.
-// A pin without a verified entry leaves the header check unavailable.
-const BUNDLED_ENGRAM_SCHEMA                         = { "3.3.2": 1, "3.4.0": 1, "3.5.2": 1 };
+// tagged sources v3.3.2, v3.4.0, v3.5.2 and the v3.7.0 and v3.7.2 trees:
+// internal/store/store.go `const schemaVersion = 1`, and the released 3.7.2
+// linux/darwin binaries stamp user_version 1 in an isolated store. A pin
+// without a verified entry leaves the header check unavailable.
+const BUNDLED_ENGRAM_SCHEMA                         = { "3.3.2": 1, "3.4.0": 1, "3.5.2": 1, "3.7.0": 1, "3.7.2": 1 };
 
 export function bundledEngramSchema(coreVersion        )                     {
 	return Object.hasOwn(BUNDLED_ENGRAM_SCHEMA, coreVersion) ? BUNDLED_ENGRAM_SCHEMA[coreVersion] : undefined;
+}
+
+// Companion-vs-core contract gate (gentle-shell#3015): the runtime-contract
+// digest each pinned core answers on GET /runtime-contract, read from the real
+// release binaries during development; the 3.5.2 windows archive sha256 matched
+// the retired 3.5.2 pin exactly. gentle-engram 0.8.0 requires the 3.7.2 digest:
+// the released 3.7.2 binary and the published 0.8.0 companion both report
+// contract_id engram.pi-http-runtime/v1, revision 1, with the same digest, and
+// only that digest differs from 3.5.2. A pin without a verified entry leaves
+// the gate unavailable, and the gate only ever warns (S3: "Instalar y avisar
+// fuerte"), never blocks.
+const BUNDLED_ENGRAM_CONTRACT                         = {
+	"3.5.2": "4bf32703e111162b24073d090bec1c15c9120708587000bf595a07264e768672",
+	"3.7.0": "0af9af176928e98562ab1396d3196efe582dd5d1c5d2c5f8f546ab4ed609810f",
+	"3.7.2": "0af9af176928e98562ab1396d3196efe582dd5d1c5d2c5f8f546ab4ed609810f",
+};
+
+export function bundledEngramContract(coreVersion        )                     {
+	return Object.hasOwn(BUNDLED_ENGRAM_CONTRACT, coreVersion) ? BUNDLED_ENGRAM_CONTRACT[coreVersion] : undefined;
+}
+
+// The runtime contract a gentle-engram companion ships (runtime-contract.json)
+// and the running core answers on GET /runtime-contract. Only the exact
+// contract id, an integer revision and a lowercase 64-hex digest count as
+// evidence; anything else is no signal, never an error.
+
+
+export function parseEngramRuntimeContract(payload         )                                          {
+	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return undefined;
+	const record = payload                           ;
+	const revision = record.revision;
+	if (record.contract_id !== "engram.pi-http-runtime/v1" || typeof revision !== "number" || !Number.isInteger(revision)) return undefined;
+	if (typeof record.digest !== "string" || !/^[0-9a-f]{64}$/.test(record.digest)) return undefined;
+	return { contract_id: "engram.pi-http-runtime/v1", revision, digest: record.digest };
+}
+
+// The loud, warn-only mismatch notice (S3): Shell still installs and runs the
+// pair, and the human decides whether to update the core or the companion.
+// Silent when the digests are equal or either side is unknown — never a false
+// alarm. `coreDigest` lets the launch path pass the digest the running server
+// actually answered; the default is the pinned core's verified table entry.
+// `coreLabel` names whoever answered, so a reused older server is never
+// misattributed to the pinned version.
+export function engramContractMismatchNotice(companionDigest                    , coreVersion        , coreDigest                     = bundledEngramContract(coreVersion), coreLabel         = `the Engram core ${coreVersion}`)                     {
+	if (companionDigest === undefined || coreDigest === undefined || !/^[0-9a-f]{64}$/.test(companionDigest) || companionDigest === coreDigest) return undefined;
+	return `Engram contract mismatch: the gentle-engram companion declares runtime-contract digest ${companionDigest}, while ${coreLabel} answers ${coreDigest}; memory may be unavailable until the pair matches. Update the core with a new Gentle Shell release, or update the companion.`;
+}
+
+// One bounded read-only GET /runtime-contract on the shared server (the same
+// loopback rules as probeEngramEndpoint): the parsed digest, or undefined when
+// the server does not answer with a well-formed contract.
+export async function probeEngramRuntimeContract(input                                        = {})                              {
+	const answer = await localGet(input.port ?? ENGRAM_DEFAULT_PORT, "/runtime-contract", input.timeoutMs ?? 1000);
+	if (answer.kind !== "response" || answer.status !== 200) return undefined;
+	return parseEngramRuntimeContract(parseJson(answer.body))?.digest;
 }
 
 // SQLite's user_version from the raw database header (bytes 60-63), or
@@ -614,27 +705,14 @@ export function bundledUpdatePlan(passthrough          )                    {
 	return { self: true, ...marked };
 }
 
-// What `gentle-shell update` does after the redirected upgrade or the
-// `--latest` Pi update (`upgradeCode` is undefined when it did not run): with
-// nothing left for Pi it exits with that code; otherwise Pi still runs, so
-// `update --all` updates the extensions even when that step could not complete.
+// Forward extension updates even when the latest Pi update failed; the caller
+// retains that failure code while Pi handles the remaining arguments.
 export function bundledUpdateNext(plan                   , upgradeCode                    )                                                             {
 	if (plan.piArgs === undefined) return { exitCode: upgradeCode ?? 0 };
 	if (plan.self && upgradeCode !== undefined && upgradeCode !== 0) {
-		const step = plan.latest ? "latest Pi update" : "Gentle Shell upgrade";
-		return { piArgs: plan.piArgs, note: `gentle-shell: the ${step} did not complete; updating the extensions anyway.` };
+		return { piArgs: plan.piArgs, note: "gentle-shell: the latest Pi update did not complete; updating the extensions anyway." };
 	}
 	return { piArgs: plan.piArgs };
-}
-
-export function bundledUpdateNotice(input                                             )           {
-	return [
-		`Pi ships pinned with Gentle Shell (Pi ${input.piVersion}): a newer Pi arrives with a Gentle Shell release.`,
-		input.interactive
-			? "Running 'gentle-shell upgrade'..."
-			: "Run 'gentle-shell upgrade' to install the latest Gentle Shell release and its Pi.",
-		"Run 'gentle-shell update --latest' to install the newest published Pi now, without the release's verified lockfile.",
-	];
 }
 
 

@@ -22,6 +22,8 @@ const sources = [
 	"model-routing-authority",
 	"agent-profiles",
 	"agents-config",
+	"agent-tool-overlay",
+	"agents-report-cap",
 	"agent-profile-pin",
 	"profiles-orchestrator",
 	"agent-assets",
