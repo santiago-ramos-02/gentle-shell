@@ -99,6 +99,14 @@ small adapters in any terminal tool, independently of Herdr. See
 heartbeat/staleness rules and privacy guidance. The task-summary preference also
 controls titles in these files; existing Herdr behavior is unchanged.
 
+## Desktop session snapshot
+
+Interactive top-level Gentle Shell sessions also keep a bounded JSON snapshot of
+everything the terminal UI shows (model, profile, context, cost, plan usage,
+permission mode, todo, changes, subagents, jobs, review, stats, activity and the
+open question) under `<agentDir>/desktop/sessions/<sessionId>.json`, for the
+Gentle Shell Desktop mods. See [desktop feed format](desktop-feed.md).
+
 ## Herdr active-work summary
 
 Choose `/gentle:customize` → **Layout** → **Task summary: on/off** to show or
@@ -329,6 +337,7 @@ gentle-shell upgrade [--channel release|main]
 gentle-shell upgrade --rollback
 gentle-shell update [pi|self|--self|--all] [--latest]
 gentle-shell self-uninstall [--dry-run] [--yes] [--include-shared]
+gentle-shell desktop [--yes] [--no-open] | --status | --uninstall
 ```
 
 ### Flags
@@ -618,6 +627,17 @@ when empty. Like `upgrade`, it runs before any Pi runtime check.
 `gentle-shell uninstall <source>` stays Pi's own alias for `remove`. Details,
 refusals and exit codes: [Removing Gentle Shell](gentle-shell-uninstall.md).
 
+### `desktop` subcommand
+
+`gentle-shell desktop` installs and opens Gentle Shell Desktop: Herdr app
+(0.1.15 or newer, unchanged; a missing or older one gets the pinned 0.1.15,
+checked against its SHA-256) with the package's `herdr/` mods, layout and
+shortcuts. It prints its plan and asks first (`--yes` skips the question);
+`--no-open` installs only, `--status` reports, `--uninstall` removes only what
+it installed and puts back what was there before. Like `upgrade`, it runs before
+any Pi runtime check, and `gentle-shell upgrade` refreshes it when it was
+installed. Guide: [Gentle Shell Desktop](gentle-shell-desktop.md).
+
 ### First run in an isolated or custom home
 
 The first time `gentle-shell` resolves to an isolated or `--home <path>` home that does not already exist, it creates the directory, writes `"tuiMode": "fullscreen"` and, unless the home's `settings.json` already declares one, `"theme": "Gentleman-Cute"` into its `settings.json`, writes a small ownership marker file at `<home>/.gentle-shell-home` (a one-line JSON object naming the `gentle-pi` version that created it), and prints one hint to stderr pointing at `--link` (and at `gentle-shell home import-pi` when your pi home has an `auth.json`). A `--link` home is never bootstrapped this way — it is assumed to already exist as your pi agent home. Later runs against the same home skip the write and the hint. The default theme is also re-applied after automatic or manual setup if gentle-ai's own managed install wrote a different theme into a home that had none before that run; a home (or `--link`) that already declares its own theme is never touched.
@@ -646,7 +666,7 @@ gentle-pi's postinstall only writes the global `tuiMode: fullscreen` setting whe
 
 ### Interactive RPC hosts
 
-Setting `GENTLE_SHELL_INTERACTIVE_HOST=1` on a `pi --mode rpc` process turns on two things a plain headless RPC host does not get: dialogs for `ask_user_question` and `ask_user_choice` (one `ctx.ui.select` prompt per question, looped for multiSelect), and Gentle Agents' helper activity pushed live through `setWidget`. A subagent child spawned by such a host never inherits the variable, so nested children stay headless regardless of their parent. See the [activity payload reference](gentle-agents-activity.md) for the exact schema, field bounds, and shrink order.
+Setting `GENTLE_SHELL_INTERACTIVE_HOST=1` on a `pi --mode rpc` process turns on two things a plain headless RPC host does not get: dialogs for `ask_user_question` and `ask_user_choice` (one `ctx.ui.select` prompt per question, looped for multiSelect, plus a free-text entry answered through `ctx.ui.input`: `ask_user_question`'s "Type something." row, and `ask_user_choice`'s "Type your answer" unless the call passes `allowCustomResponse: false`), and Gentle Agents' helper activity pushed live through `setWidget`. A subagent child spawned by such a host never inherits the variable, so nested children stay headless regardless of their parent. See the [activity payload reference](gentle-agents-activity.md) for the exact schema, field bounds, and shrink order.
 
 ### Herdr lifecycle bridge
 
@@ -1031,7 +1051,8 @@ Behavior:
 - a best-effort watcher refreshes when skill files change; the cache is a non-authoritative SHA-256 hint, and each refresh compares actual rendered and on-disk bytes;
 - watcher events are debounced by 500 ms; a full fallback scan every 30 seconds also detects changes when watchers are unavailable or silently miss an event. Those missed changes can wait until the next scan; explicit refresh and the next prompt still read the current disk state;
 - each file is published atomically, registry before cache; they are not an atomic pair, and a later refresh repairs a mismatch;
-- the registry indexes skill names, descriptions, scope, and exact `SKILL.md` paths without copying skill body rules or runtime-only rows.
+- the registry indexes skill names, descriptions, scope, and exact `SKILL.md` paths without copying skill body rules or runtime-only rows;
+- dot-prefixed directories directly inside a skill root (for example `.backup-foo-2026/`) are not scanned; when sibling directories declare the same skill `name`, the directory named after the skill wins over copies such as `foo.backup-2026/`, otherwise project scope, root order, and direct-over-nested order decide.
 
 Skill discovery is a guardrail, not a workflow router: it helps Pi load the right skill without forcing extra ceremony.
 
@@ -1355,6 +1376,8 @@ Every parent session uses one profile for its subagent launches, the footer and 
 
 A session that never selected a profile resolves the shared defaults once, at startup: the local pin (`p`), then the repository declaration (`P`), then the globally active profile in `profiles.json`. It keeps that profile's name, routing, and origin (`local`, `repo`, or `global`). Changing a pin, the repository declaration, the active profile, or the profile's content afterwards affects new sessions only, the same way Pi's "set as default" for the orchestrator model leaves open sessions alone. Outside a Git worktree the repository declaration is still read, as non-Git writer admission does.
 
+**Live orchestrator at own start.** A new parent session that starts on a profile also switches its live orchestrator to that profile's `orchestrator` entry, resolved through the `p → P → G` layers of its own directory. Pi's persisted default remains only when no profile resolves or the entry is missing or unavailable (model not found or credentials missing); a failed switch keeps the current model and notifies you. This never writes `settings.json`. Follow mode and subagent children do not switch.
+
 **Behavior change for unpinned sessions.** Without a pin or declaration, launches now use the globally active profile from `profiles.json`, replacing the materialized `subagents.json` routing wholesale like a pin does. Before, an unpinned launch read the materialized stores. When nothing is pinned and no profile is active, the session freezes "no profile" and keeps routing through the materialized stores, as before; a pin added later does not change it.
 
 **Drift notice.** On each subagent launch, a session with a frozen profile compares it with the current defaults of its own directory, without applying them. When they differ, it shows one line:
@@ -1596,6 +1619,7 @@ To opt out:
 | `docs/skill-style-guide.md`    | Normative style guide used by the packaged skill creation/improvement skills.                              |
 | `docs/native-authority-architecture.md` | Post-U8 ownership boundary, reproducible slimming metrics, Windows evidence, exact #191 seam, and the `review-integration/v1`→`v2` migration status, including the "compact-v2" naming disambiguation.     |
 | `docs/review-integration.md`   | Negotiated provider/consumer contract and the current Gentle Pi adoption boundary.                         |
+| `herdr/`                       | Gentle Shell Desktop for Herdr app: the `gentle-*` mods, the `gentle-shell` layout, `keys.json` shortcuts, the gallery brief `RECIPE.md` and `preview.png`. Installed by `gentle-shell desktop` ([guide](gentle-shell-desktop.md)). |
 
 ## Development
 

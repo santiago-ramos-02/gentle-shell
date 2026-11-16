@@ -63,7 +63,7 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { PROVIDER_REVIEW_ROLES, discoverAgents, loadAgentsConfig, unmatchedProfileKeys } from "../lib/agents-config.ts";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
 	ExtensionAPI,
@@ -152,7 +152,7 @@ import { createSessionProfileIntegration, hasPendingSessionProfileSelection, rea
 import { publishSessionProfileOutcome, readSessionProfileAuthority, requireSessionProfileAuthority } from "../lib/session-profile-authority.ts";
 import { isSessionProfileFamilyEntry, type SessionProfileStartupState } from "../lib/session-profile-persistence.ts";
 import type { SessionProfileAppendOutcome } from "../lib/session-profile-append-controller.ts";
-import { freezeSessionProfileAtOwnStart, profileFollowEnabled, readSessionProfileOwnStartup, resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles, sessionProfileRoutingAt, setFrozenDefaultOrchestrator } from "../lib/session-profile-freeze.ts";
+import { freezeSessionProfileAtOwnStart, profileFollowEnabled, readFrozenDefaultOrchestrator, readSessionProfileOwnStartup, resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles, sessionProfileRoutingAt, setFrozenDefaultOrchestrator } from "../lib/session-profile-freeze.ts";
 import {
 	applyOrchestratorSettings,
 	readOrchestratorSettings,
@@ -2109,9 +2109,109 @@ function normalizePolicyPath(value: string): string {
 	return value.trim().replace(/^~(?=[/\\]|$)/, homedir()).replace(/\\/g, "/").toLowerCase();
 }
 
-function isSensitivePath(value: string): boolean {
+// Gentle Shell Desktop (odd/tasks/herdr-desktop.md T7): the inbox, outbox and
+// snapshots under `<agentDir>/desktop/` are the human's channel into a live
+// session; the agent never writes an action there. Only the real folders are
+// guarded, never a project folder that happens to be named `agent/desktop`:
+// `<home>/desktop` for the resolved Gentle Pi agent home (the one the desktop
+// feed writes under) and the two standard homes, compared as normalized
+// absolute paths. `~`, `$HOME` and `${HOME}` expand, `.` and `..` resolve
+// lexically, and a relative path resolves against the tool call's cwd (a
+// relative path with no cwd never matches), so a project folder that is named
+// `agent/desktop` stays outside the guard while `../../.gentle-shell/...` from
+// the project does not. Case folds like the patterns.
+//
+// On Windows the bash tool is Git for Windows (MSYS) bash, where `/c/Users/x`
+// and `/cygdrive/c/Users/x` are the same folder as `C:\Users\x`, and Win32
+// accepts `//?/C:/...`. On win32 only, those spellings read as the drive path
+// before the compare (separators normalized, case folded). Shell variables
+// such as `$USERPROFILE` are not expanded: that indirection stays the
+// documented fail-open limit of a word-level guard.
+interface PolicyPathHost {
+	platform: NodeJS.Platform;
+	home: string;
+}
+
+function currentPolicyPathHost(): PolicyPathHost {
+	return { platform: process.platform, home: homedir() };
+}
+
+function windowsDrivePath(path: string): string {
+	const msys = /^(?:\/cygdrive)?\/([a-zA-Z])(\/.*)?$/.exec(path);
+	if (msys !== null) return `${msys[1]}:${msys[2] ?? "/"}`;
+	const device = /^\/\/[?.]\/([a-zA-Z]:(?:\/.*)?)$/.exec(path);
+	return device === null ? path : device[1].length === 2 ? `${device[1]}/` : device[1];
+}
+
+function normalizeAbsolutePolicyPath(value: string, cwd?: string, host: PolicyPathHost = currentPolicyPathHost()): string | undefined {
+	let expanded = value.trim()
+		.replace(/^(?:~|\$HOME|\$\{HOME\})(?=[/\\]|$)/, host.home.replace(/\\/g, "/"))
+		.replace(/\\/g, "/");
+	if (expanded.length === 0) return undefined;
+	if (host.platform === "win32") expanded = windowsDrivePath(expanded);
+	if (!/^(?:\/|[a-zA-Z]:\/)/.test(expanded)) {
+		const base = cwd === undefined ? undefined : normalizeAbsolutePolicyPath(cwd, undefined, host);
+		return base === undefined ? undefined : posix.join(base, expanded).replace(/(.)\/+$/, "$1").toLowerCase();
+	}
+	return posix.normalize(expanded).replace(/(.)\/+$/, "$1").toLowerCase();
+}
+
+function desktopActionRootsFor(homes: readonly string[], host: PolicyPathHost): string[] {
+	const roots = new Set<string>();
+	for (const home of homes) {
+		const normalized = normalizeAbsolutePolicyPath(home, undefined, host);
+		if (normalized !== undefined) roots.add(posix.join(normalized, "desktop"));
+	}
+	return [...roots];
+}
+
+function desktopActionRoots(env: NodeJS.ProcessEnv): string[] {
+	const homes = [
+		resolveGentlePiAgentHome(env),
+		resolveGentlePiAgentHome(process.env),
+		join(homedir(), ".gentle-shell", "agent"),
+		join(homedir(), ".pi", "agent"),
+	];
+	const spellings: string[] = [];
+	for (const home of homes) {
+		spellings.push(home);
+		try { spellings.push(realpathSync(home)); } catch { /* A missing home has only its own spelling. */ }
+	}
+	return desktopActionRootsFor(spellings, currentPolicyPathHost());
+}
+
+function isUnderDesktopRoot(value: string, roots: readonly string[], cwd: string | undefined, host: PolicyPathHost): boolean {
+	const normalized = normalizeAbsolutePolicyPath(value, cwd, host);
+	if (normalized === undefined) return false;
+	return roots.some((root) => normalized === root || normalized.startsWith(`${root}/`));
+}
+
+/** Pure seam of the desktop-folder guard: `homes` are agent homes, `home` the user home that `~`/`$HOME` expand to. */
+export function isDesktopActionPathOn(value: string, options: PolicyPathHost & { homes: readonly string[]; cwd?: string }): boolean {
+	const host = { platform: options.platform, home: options.home };
+	return isUnderDesktopRoot(value, desktopActionRootsFor(options.homes, host), options.cwd, host);
+}
+
+function isDesktopActionPath(value: string, env: NodeJS.ProcessEnv, cwd?: string): boolean {
+	return isUnderDesktopRoot(value, desktopActionRoots(env), cwd, currentPolicyPathHost());
+}
+
+function isSensitivePath(value: string, env: NodeJS.ProcessEnv = process.env, cwd?: string): boolean {
 	const normalized = normalizePolicyPath(value);
-	return SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(normalized));
+	return SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(normalized)) || isDesktopActionPath(value, env, cwd);
+}
+
+// A shell word can carry a path after `=`: `--target-directory=$HOME/...` or
+// `VAR=~/...` (quotes are already stripped by shellCommandWords). Only the
+// desktop guard reads these values; the pattern list keeps its word-level reach.
+function isSensitiveCommandWord(word: string, env: NodeJS.ProcessEnv, cwd?: string): boolean {
+	if (isSensitivePath(word, env, cwd)) return true;
+	let index = word.indexOf("=");
+	while (index >= 0) {
+		if (isDesktopActionPath(word.slice(index + 1), env, cwd)) return true;
+		index = word.indexOf("=", index + 1);
+	}
+	return false;
 }
 
 function isSensitiveRequestContextPath(path: string): boolean {
@@ -2229,8 +2329,8 @@ function shellCommandWords(command: string): string[] {
 	return words;
 }
 
-function findSensitiveCommandPath(command: string): string | undefined {
-	return shellCommandWords(command).find(isSensitivePath);
+function findSensitiveCommandPath(command: string, env: NodeJS.ProcessEnv = process.env, cwd?: string): string | undefined {
+	return shellCommandWords(command).find((word) => isSensitiveCommandWord(word, env, cwd));
 }
 
 function sensitivePathBlock(sensitivePath: string): ToolCallEventResult {
@@ -2243,15 +2343,17 @@ function sensitivePathBlock(sensitivePath: string): ToolCallEventResult {
 function evaluateSensitivePathTool(
 	toolName: string,
 	input: unknown,
+	env: NodeJS.ProcessEnv = process.env,
+	cwd?: string,
 ): ToolCallEventResult | undefined {
 	const sensitivePath = PATH_GUARDED_TOOL_NAMES.has(toolName)
-		? collectPathInputs(input).find(isSensitivePath)
+		? collectPathInputs(input).find((path) => isSensitivePath(path, env, cwd))
 		: undefined;
 	if (sensitivePath !== undefined) return sensitivePathBlock(sensitivePath);
 	if (!SHELL_COMMAND_TOOLS.has(toolName)) return undefined;
 	const command = readStringPath(input, ["command"]);
 	if (command === undefined) return undefined;
-	const commandPath = findSensitiveCommandPath(command);
+	const commandPath = findSensitiveCommandPath(command, env, cwd);
 	return commandPath === undefined ? undefined : sensitivePathBlock(commandPath);
 }
 
@@ -3096,13 +3198,16 @@ function readReviewerRouting(cwd: string, sessionId: string | undefined, session
 		: resolution.kind === "inherited" && resolution.profile !== undefined ? "frozen session profile"
 		: resolution.kind === "follow" ? "followed session profile"
 		: "repository profile pin";
-	// Only a profile chosen with Use in this session, or recorded as the session's
-	// startup profile, carries its orchestrator to the provider review roles; an
-	// in-memory freeze, pinned and global routing leave them on Pi's persisted
-	// default (gentle-shell#2716 A1, gentle-shell#2742 section 8).
+	// Provider review roles inherit the explicit binding's orchestrator, the
+	// startup record's, or the in-memory frozen profile's, before Pi's persisted
+	// default. Pins and global routing never supply this fallback; a session
+	// frozen without a profile has no orchestrator to carry to a foreign target.
 	if (resolution.kind !== "explicit") delete config.orchestrator;
-	const recorded = resolution.kind === "inherited" ? readSessionProfileBinding(sessionId)?.modelProfiles.orchestrator : undefined;
-	if (recorded !== undefined) config.orchestrator = { ...recorded };
+	const orchestrator = resolution.kind === "inherited"
+		? readSessionProfileBinding(sessionId)?.modelProfiles.orchestrator
+			?? (resolution.profile === undefined ? undefined : readFrozenDefaultOrchestrator(sessionId))
+		: undefined;
+	if (orchestrator !== undefined) config.orchestrator = { ...orchestrator };
 	return { config, source };
 }
 
@@ -9501,8 +9606,8 @@ function reviewHostRelayFailureReport(error: ReviewHostRelayError): Record<strin
 // gentle-pi#2271: review-refuter and review-validator are provider review
 // roles, not installable agents, so nothing seeds their entries and profiles
 // never carry them. For those two keys only, a snapshot with no model falls
-// back to Pi's persisted default model and effort, the default the routing
-// panel already labels them with. Lens keys keep the fail-closed rule.
+// back to the session profile's orchestrator, then Pi's persisted default model
+// and effort. Lens keys keep the fail-closed rule.
 //
 // gentle-shell#2163: a caller that knows where the snapshot came from passes
 // it, so the relay's refusal names the routing source and whether the entry
@@ -12631,10 +12736,40 @@ function createGentleAiExtensionForTesting(
 		sessionProfiles.start(ctx.sessionManager, (type, data) => pi.appendEntry(type, data), event);
 		// gentle-shell#2742: only a session's own start tells this process its
 		// startup state; anything else leaves it unknown.
+		let startupProfile: SessionProfileStartupState | undefined;
 		try {
-			if (profileSessionId && isSessionOwnStart(event, ctx.sessionManager))
+			if (profileSessionId && isSessionOwnStart(event, ctx.sessionManager)) {
 				freezeSessionProfileAtOwnStart({ sessionId: profileSessionId, cwd: ctx.sessionManager.getCwd(), configHome: gentleAiConfigHome() });
+				startupProfile = readSessionProfileOwnStartup(profileSessionId);
+			}
 		} catch { /* The startup state stays unknown. */ }
+		// A3: only this session's own start applies its frozen full definition.
+		// The workflow mode remains live; launches still receive role routing only.
+		if (startupProfile && startupProfile !== "none" && permissionEnvironment.GENTLE_PI_AGENTS_CHILD !== "1" && !profileFollowEnabled(permissionEnvironment)) {
+			const orchestrator = readProfileOrchestrator(startupProfile.modelProfiles);
+			const current = () => startupEpoch === reminderEpoch && sessionProfiles.isCurrent(ctx.sessionManager);
+			// The switch is best-effort and contained: a reload or session
+			// replacement racing the awaited switch must neither abort the rest
+			// of session_start (Pi's runner throws on any access to a stale ctx)
+			// nor leave the outcome unreported. Checked before and after the await.
+			try {
+				if (!current()) return;
+				const note = orchestrator?.model
+					? await switchLiveOrchestrator(ctx, pi, orchestrator, current)
+						|| "\nThe profile's orchestrator model is invalid; this session keeps its current model."
+					: `\nprofile "${startupProfile.name}" has no orchestrator model; this session keeps its current model.`;
+				if (!current()) return;
+				// A headless session (pi -p) has no notify surface: the startup note
+				// falls back to stderr, the same channel Pi's own startup notifications
+				// use headlessly, so a failed switch is observable instead of silent.
+				const startedWith = `el Gentleman started with profile "${startupProfile.name}".${note}`;
+				if (ctx.hasUI) ctx.ui.notify(startedWith, "info");
+				else console.error(startedWith);
+			} catch {
+				// The startup switch stays best-effort: a staled context or a
+				// reporting failure never aborts the remaining startup work.
+			}
+		}
 		readSessionProfileAuthority(ctx.sessionManager);
 		if (ctx.hasUI) notifySessionProfileProblem(ctx);
 		auto.reset();
@@ -13030,6 +13165,8 @@ function createGentleAiExtensionForTesting(
 		const sensitivePathDenied = evaluateSensitivePathTool(
 			event.toolName,
 			event.input,
+			permissionEnvironment,
+			typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : undefined,
 		);
 		if (sensitivePathDenied) return sensitivePathDenied;
 		const surfaceDenied = evaluateExecutionSurfaceTool(event.toolName, event.input);
