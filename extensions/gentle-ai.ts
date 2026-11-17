@@ -173,6 +173,13 @@ import {
 	type DesktopProfilesService,
 } from "../lib/desktop-rpc-profiles.ts";
 import {
+	DESKTOP_REVIEW_SERVICE_CHANNEL,
+	DESKTOP_REVIEW_SERVICE_SCHEMA,
+	type DesktopReviewOwnerRead,
+	type DesktopReviewOwnerWrite,
+	type DesktopReviewService,
+} from "../lib/desktop-rpc-review.ts";
+import {
 	REVIEW_HOST_RELAY_FAILURE,
 	REVIEW_HOST_RELAY_PI_TIMEOUT_ENV,
 	REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS,
@@ -1683,6 +1690,10 @@ function resolveSessionDelegationMode(
 
 const TEST_FIRST_PRINCIPLE = "- For behavior changes with applicable runnable deterministic tests and a clear expected outcome, use test-first by default: observe RED, GREEN, then refactor with focused checks. Write one RED test per requested rule. For every existing command or option the change touches, add one test proving its previous behavior still holds; add no other cases. An existing behavior counts as touched when it shares the code you changed (options, parsers, helpers, validation). Only when your diff changes shared code (options, parsers, helpers) that an existing command the request did not name also uses, run one differential check before finishing, as a single script: for each such command, run it with the new or changed input (for example a new option passed to a sibling subcommand) against the previous code (a copy of the base commit in a `mktemp -d` scratch directory, never committed as a test; committed tests never read git history or a fixed commit) and against your change, and compare stdout, stderr, and exit code; any difference nobody asked for is a regression to fix and pin with a test. Test presence alone does not establish applicability; no chat or TUI toggle activates it. For passive documentation, non-testable changes, an unavailable runner, or no meaningful RED, explain why and run proportionate ordinary functional or structural verification. Never invent lifecycle evidence or skip checks. Follow orchestrator-delegation.md for ODD forwarding and evidence.";
 const FULL_DELEGATION_TEST_FIRST_PRINCIPLE = "- Writers apply test-first (RED, GREEN, PRESERVE with its differential check) from their own contract; forward it in every writer handoff and require their observed RED/GREEN evidence or stated exception. Never invent lifecycle evidence or skip checks.";
+// orchestrator-owns-correction-exhaustion S2: after a worker exhausts its limit the parent decides the next step
+// from the diagnosed cause; only organic mode may fix it inline, full delegation launches a new bounded writer.
+const EXHAUSTION_ROUTE = "fix inline if small and understood, or relaunch with changed scope, hypothesis or handoff plus new evidence";
+const FULL_DELEGATION_EXHAUSTION_ROUTE = "never edit: launch a new bounded writer with the diagnosis, new evidence and changed scope or hypothesis";
 
 function buildGentlePrompt(
 	persona: PersonaMode,
@@ -1699,6 +1710,7 @@ function buildGentlePrompt(
 	// cost-speed-painpoints S5: writers apply the test-first procedure from their own
 	// contract; a full delegation parent only forwards it and checks the evidence.
 	const testFirstPrinciple = delegationMode === DEFAULT_ORCHESTRATOR_MODE ? TEST_FIRST_PRINCIPLE : FULL_DELEGATION_TEST_FIRST_PRINCIPLE;
+	const exhaustionRoute = delegationMode === DEFAULT_ORCHESTRATOR_MODE ? EXHAUSTION_ROUTE : FULL_DELEGATION_EXHAUSTION_ROUTE;
 	return `## el Gentleman Identity and Harness
 
 Current persona mode: ${persona}
@@ -1724,7 +1736,7 @@ Resolving an incident or subdecision does not complete or cancel the original au
 
 Honor explicit one-run, no-retry, or diagnostic-only limits. Correct a failing check only within the existing correction budget; never reset budgets, add retry allowances, weaken checks, or override final outcomes.
 
-An exhausted worker-local correction limit ends that automatic cycle, not necessarily the feature. Partial worker execution is not by itself exhausted proof or a terminal native review outcome. Stop and report the remaining work, failed checks and missing proof, and offer an explicit human-controlled bounded continuation. Name its scope, executor, correction limit and checks, or let the human stop. Before any worker continuation, confirm no child is active or has an uncertain status. The Close stop ends the cycle; later explicit requests stay subject to native authority. Quota recovery: \`orchestrator-quota-recovery.md\`. A new session does not reset any limit. When specifically authorized and not prohibited by actual native authority, continue ordinary in-scope compilation or implementation.
+An exhausted worker-local correction limit ends that worker's cycle, not the unit; within native authority you own the next step, unasked. Partial worker execution is not by itself exhausted proof or a terminal native review outcome. Name the loop's cause from the evidence; act on it: ${exhaustionRoute}; never repeat an attempt or swap executors to dodge limits. Same cause again or no new hypothesis: block the unit; continue independent work. Before any worker continuation, confirm no child is active or has an uncertain status. The Close stop ends the cycle; later explicit requests stay subject to native authority. Quota recovery: \`orchestrator-quota-recovery.md\`. A new session does not reset any limit.
 
 For worker-prohibited maintenance or rollback, worker prohibitions remain unchanged. The parent only may perform the operation when the human explicitly authorized the operation itself, exact scope, ownership, and preservation are established, and available permitted tools can perform it; fresh runtime/native consent and guards remain binding. A broad feature authorization is not destructive authority; never substitute another worker or tool to bypass a denial. For an upgrade require a validated backup, artifact and migration validation where applicable, and a recovery path. For rollback preserve unrelated edits even in the same file, remove only proven task-created helpers, and never blanket restore, reset, or clean. Stop when ambiguous ownership or denial stops the operation, or any prerequisite is missing. This route is guidance, not authorization.
 
@@ -13613,6 +13625,69 @@ function createGentleAiExtensionForTesting(
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}
 		},
+	});
+
+	// Desktop's get_review_mode/set_review_mode (#3324) reach this same switch
+	// through a versioned, adapter-shaped seam: every read and write goes
+	// through executeReviewMode and the native adapter, exactly like
+	// /gentle:review-mode. The Desktop bridge owns the confirmation step; this
+	// owner only reads (bounded, fail closed) and writes then re-reads. Raw
+	// native errors never leave: they are classified as unavailable (gentle-ai
+	// missing or the command unsupported), unknown, or failed. Subagent
+	// children never answer, and hosts without an event bus skip the seam.
+	const DESKTOP_REVIEW_WRITE_TIMEOUT_MS = 10_000;
+	const reviewModeUnavailable = (error: unknown): boolean => {
+		const code = asNativeReviewCliError(error)?.code;
+		return code === NATIVE_REVIEW_ERROR_CODE.UNAVAILABLE || code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE ||
+			code === NATIVE_REVIEW_ERROR_CODE.PACKAGE_BINARY_MISSING || code === NATIVE_REVIEW_ERROR_CODE.UNSUPPORTED_TRANSITION_OPERATION;
+	};
+	const boundedReviewMode = async (request: NativeReviewModeRequest, ctx: ExtensionContext, timeoutMs: number) => {
+		const signal = AbortSignal.timeout(timeoutMs);
+		return await Promise.race([executeReviewMode({ ...request, signal }, ctx), rddAbortRejection(signal)]);
+	};
+	if (typeof pi.events?.on === "function") pi.events.on(DESKTOP_REVIEW_SERVICE_CHANNEL, (payload: unknown) => {
+		if (!payload || typeof payload !== "object") return;
+		const request = payload as Partial<{ context: ExtensionContext; respond(service: DesktopReviewService): void }>;
+		if (typeof request.respond !== "function" || !request.context) return;
+		if (permissionEnvironment.GENTLE_PI_AGENTS_CHILD === "1") return;
+		const ctx = request.context;
+		let disposed = false;
+		const read = async (): Promise<DesktopReviewOwnerRead> => {
+			if (disposed || nativeReviewCli?.reviewMode === undefined) return { kind: "unavailable" };
+			try {
+				const result = await boundedReviewMode({ cwd: ctx.cwd, operation: NATIVE_REVIEW_MODE_OPERATION.STATUS }, ctx, resolveRddStatusTimeoutMs(permissionEnvironment));
+				if (result.operation !== NATIVE_REVIEW_MODE_OPERATION.STATUS || !isValidRddModeStatus(result.status)) return { kind: "unknown" };
+				const { global, cloneLocal, effective, source, revision } = result.status;
+				return { kind: "status", status: { global, cloneLocal, effective, source, ...(revision === undefined ? {} : { revision }) } };
+			} catch (error) {
+				return reviewModeUnavailable(error) ? { kind: "unavailable" } : { kind: "unknown" };
+			}
+		};
+		try {
+			request.respond({
+				schema: DESKTOP_REVIEW_SERVICE_SCHEMA,
+				read,
+				async write({ enabled, scope }): Promise<DesktopReviewOwnerWrite> {
+					if (disposed || nativeReviewCli?.reviewMode === undefined) return { kind: "unavailable" };
+					const operation = enabled ? NATIVE_REVIEW_MODE_OPERATION.ENABLE : NATIVE_REVIEW_MODE_OPERATION.DISABLE;
+					try {
+						const result = await boundedReviewMode({ cwd: ctx.cwd, operation, scope }, ctx, DESKTOP_REVIEW_WRITE_TIMEOUT_MS);
+						if (result.operation !== operation) return { kind: "failed" };
+					} catch (error) {
+						// A write that could not start changed nothing; any other failure
+						// has an unknown outcome and is never retried.
+						return reviewModeUnavailable(error) ? { kind: "unavailable" } : { kind: "failed" };
+					}
+					// Report the owner's state re-read after the write, not the write's echo.
+					return await read();
+				},
+				dispose: () => {
+					disposed = true;
+				},
+			});
+		} catch {
+			/* obsolete trusted context: discovery expires closed */
+		}
 	});
 
 	// gentle-pi#677: gentle-ai owns telemetry end to end (status, the opt-out
