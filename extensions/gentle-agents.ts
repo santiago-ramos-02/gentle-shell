@@ -47,7 +47,7 @@ import { isFinished, MISSING_TOOLS_NOTE_PREFIX, TASK_EVENT, TASK_STATUS, TaskSto
 import { AgentRunner, piCommand, abortReasonText, CHILD_JOBS_ENV, REQUESTED_TOOLS_ENV, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
 import { parseChildPackageInjection } from "../lib/child-package-injection.ts";
 import { CHILD_MESSAGE_MAX_BYTES, ChildMessenger, formatChildJobState, type IpcEndpoint } from "../lib/agents-messaging.ts";
-import { ActiveSessionClient, ActiveSessionListener, SessionPresenceError, SessionPresenceRegistry, type PresenceRecord, type ReceivedNotification, type SentNotification, type SessionPresenceCandidate } from "../lib/agents-session-transport.ts";
+import { ActiveSessionClient, ActiveSessionClientError, ActiveSessionListener, SessionPresenceError, SessionPresenceRegistry, type PresenceRecord, type ReceivedNotification, type SentNotification, type SessionPresenceCandidate } from "../lib/agents-session-transport.ts";
 import { WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, WindowsSessionRegistryPhaseSequence, isWindowsSessionBootstrapDiagnosticCode, type WindowsSessionBootstrapDiagnosticCode, type WindowsSessionBootstrapDiagnosticObserver, type WindowsSessionRegistryPhaseObserver } from "../lib/windows-session-transport.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
 import { inheritedUnsafeGitEnvironmentKeys } from "../lib/review-repository.ts";
@@ -3331,7 +3331,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		renderResult(result, options, theme, context) {
 			return outgoingMessageResult(result, options.expanded, options.isPartial, theme, context);
 		},
-		description: "Send a notification to another active session in this trusted local profile. If recipient_session_id is omitted, the sole peer is selected or the user selects one. Acceptance means enqueued, not read or completed.",
+		description: "Send a notification to another active session in this trusted local profile. recipient_session_id is a Pi session ID from orchestrator_list, not a T3 thread ID. If recipient_session_id is omitted, the sole peer is selected or the user selects one. Acceptance means enqueued, not read or completed.",
 		parameters: {
 			type: "object",
 			additionalProperties: false,
@@ -3401,8 +3401,10 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				try { current = activeTransportFor(ctx) === transport; } catch { /* stale ctx: the session was replaced */ }
 				if (current) emitHerdr(HERDR_DESKTOP_SEND, { sessionId: transport.sessionId, target: recipient });
 				return text(`Message ${accepted.id} from ${transport.sessionId} to ${recipient} accepted for delivery; it is not a delivery or read receipt.`, { gentleAgents: { messageId: accepted.id, senderSessionId: transport.sessionId, recipientSessionId: recipient, state: "accepted", message, reason, senderLabel, recipientLabel: messagePeerLabel(agentHome, recipient) } });
-			} catch {
-				return text("Error: session message was not accepted.", { error: "not accepted" });
+			} catch (error) {
+				const reason = error instanceof ActiveSessionClientError ? error.code : "unknown";
+				const hint = reason === "not_found" ? ` No live Pi session has ID ${recipient}; recipient_session_id takes a Pi session ID from orchestrator_list, not a T3 thread ID.` : "";
+				return text(`Error: session message was not accepted (${reason}).${hint}`, { error: "not accepted", reason });
 			}
 		},
 	});

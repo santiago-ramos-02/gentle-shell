@@ -1134,6 +1134,32 @@ test("Windows-native discovery reclaims an orphan without deleting a resumed act
 	} finally { await previous.closeInput(); }
 });
 
+test("Windows-native discovery survives more than 64 orphaned records and drains them", { skip: process.platform !== "win32", timeout: 90_000 }, async (t) => {
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-overflow-presence-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	// Each helper owns at most 64 publications; forced termination leaks them as orphans.
+	for (const [helper, count] of [[0, 64], [1, 16]] as const) {
+		const orphaner = await openInitializedHelper(agentHome, { diagnostics: t });
+		try {
+			for (let index = 0; index < count; index += 1) {
+				const record = requirePublicPresenceResult(await orphaner.presence("record", { sessionId: `orphan-${helper}-${index}`, createdAt: index + 1 }));
+				assert.equal((await orphaner.presence("publish", { record })).ok, true);
+			}
+			assert.notEqual(await orphaner.terminate(), 0);
+		} finally { await orphaner.closeInput(); }
+	}
+	await withInitializedHelpers([agentHome, agentHome], async ([owner, observer]) => {
+		assert.equal((requirePublicPresenceResult(await observer.enumerate()) as { entries: number }).entries, 80);
+		const live = requirePublicPresenceResult(await owner.presence("listen", { sessionId: "live", createdAt: 1 })) as Record<string, unknown>;
+		assert.deepEqual(requirePublicPresenceResult(await observer.presence("resolve", { sessionId: "live" })), live, "a known recipient resolves however many orphans exist");
+		for (let attempt = 0; attempt < 3; attempt += 1) assert.equal((await observer.presence("list")).ok, true, "discovery never fails on overflow");
+		assert.deepEqual(requirePublicPresenceResult(await observer.presence("list")), { records: [live] }, "repeated discovery drains the orphans");
+		assert.equal((requirePublicPresenceResult(await observer.enumerate()) as { entries: number }).entries, 1);
+		assert.equal((await owner.presence("stop-listener", { record: live })).ok, true);
+	}, { diagnostics: t });
+});
+
 test("Windows-native discovery preserves a busy endpoint without connecting or mutating its record", { skip: process.platform !== "win32", timeout: 30_000 }, async (t) => {
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-busy-presence-"));
 	const agentHome = join(root, "profile", "agent");

@@ -336,7 +336,8 @@ public static class WindowsSessionBootstrap {
   }
   // The helper keeps this capability local. Publication/list RPCs are intentionally absent.
   static string[] EnumeratePinned(IntPtr directory) {
-    const int MaxEntries = 64, MaxBytes = 8192; const uint STATUS_NO_MORE_FILES = 0x80000006;
+    // Names are cheap to list; per-record work is bounded by the callers instead.
+    const int MaxEntries = 65536, MaxBytes = 8192; const uint STATUS_NO_MORE_FILES = 0x80000006;
         int Header = Marshal.OffsetOf(typeof(FILE_ID_BOTH_DIR_HEADER), "FileName").ToInt32(); if (Header <= 0 || Header >= MaxBytes) Fail("unavailable"); var names = new List<string>(); IntPtr buffer = Marshal.AllocHGlobal(MaxBytes);
     try {
       bool restart = true;
@@ -472,10 +473,20 @@ public static class WindowsSessionBootstrap {
         lock (Gate) {
           RequirePresence();
           if (excluded != null && !Regex.IsMatch(excluded, "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")) Fail("invalid");
+          return Newest(EnumeratePinned(Presence), null, excluded, sid);
+        }
+      }
+      // Examines at most MaxExamined records per call; each needs at most two
+      // explicit 1ms pipe waits, with no retries or protocol handshake. Orphans
+      // among them are reclaimed, so an overfull directory drains across calls.
+      const int MaxExamined = 64;
+      static PresenceRecord[] Newest(string[] names, string sessionId, string excluded, string sid) {
           var newest = new Dictionary<string, PresenceRecord>(StringComparer.Ordinal);
-          // Enumeration is capped at MaxEntries (64); each entry needs at most
-          // two explicit 1ms pipe waits, with no retries or protocol handshake.
-          foreach (string name in EnumeratePinned(Presence)) {
+          int examined = 0;
+          foreach (string name in names) {
+            if (!name.EndsWith(".json", StringComparison.Ordinal)) continue;
+            if (sessionId != null && !name.StartsWith(sessionId + ".", StringComparison.Ordinal)) continue;
+            if (examined++ >= MaxExamined) break;
             IntPtr file = IntPtr.Zero;
             try {
               RecordIdentity identity;
@@ -494,9 +505,16 @@ public static class WindowsSessionBootstrap {
           var records = new List<PresenceRecord>(newest.Values);
           records.Sort(delegate(PresenceRecord left, PresenceRecord right) { return String.CompareOrdinal(left.SessionId, right.SessionId); });
           return records.ToArray();
+      }
+      public static PresenceRecord Resolve(string sessionId, string sid) {
+        lock (Gate) {
+          RequirePresence();
+          if (!Regex.IsMatch(sessionId ?? "", "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")) Fail("not_found");
+          // Only this session's records are examined, so a known recipient resolves however full the directory is.
+          foreach (PresenceRecord record in Newest(EnumeratePinned(Presence), sessionId, null, sid)) if (record.SessionId == sessionId) return record;
+          Fail("not_found"); return null;
         }
       }
-      public static PresenceRecord Resolve(string sessionId, string sid) { PresenceRecord[] records = List(null, sid); foreach (PresenceRecord record in records) if (record.SessionId == sessionId) return record; Fail("not_found"); return null; }
       static void RemoveOwnedPublication(OwnedPublication owned) {
         IntPtr current = IntPtr.Zero;
         try {

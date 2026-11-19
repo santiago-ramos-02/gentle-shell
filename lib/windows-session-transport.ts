@@ -210,7 +210,7 @@ export function parseWindowsHostFrame(line: string): HostReply {
 		const result = frame.result as Record<string, unknown>;
 		const partial = Object.keys(result).length === 1 && result.state === "partial";
 		const initialized = Object.keys(result).length === 2 && result.state === "initialized" && result.bootstrap === "complete";
-		const enumerated = Object.keys(result).length === 3 && result.state === "initialized" && result.bootstrap === "complete" && typeof result.entries === "number" && Number.isSafeInteger(result.entries) && result.entries >= 0 && result.entries <= 64;
+		const enumerated = Object.keys(result).length === 3 && result.state === "initialized" && result.bootstrap === "complete" && typeof result.entries === "number" && Number.isSafeInteger(result.entries) && result.entries >= 0 && result.entries <= 65_536;
 		let publicResult: HostReply["result"];
 		if (partial || initialized || enumerated) publicResult = Object.freeze({ ...result }) as HostState;
 		else {

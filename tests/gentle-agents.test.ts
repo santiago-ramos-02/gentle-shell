@@ -18,7 +18,7 @@ import { sidebarState } from "../lib/shell-sidebar.ts";
 import { CHILD_PACKAGE_INJECTION_ENV, encodeChildPackageInjection } from "../lib/child-package-injection.ts";
 import installGentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, agentResultPreview, answerThroughUi, childContextExtensionPaths, completionText, createDefaultSessionTransport, legacySubagentsInstalled, HOLD_RECHECK_MS, INPUT_PROMPT_GRACE_MS, PARENT_WAKE_GRACE_MS, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
 import { createHerdrDesktopStatusExtension } from "../extensions/gentle-herdr-desktop-status.ts";
-import { ActiveSessionClient, ActiveSessionListener, SessionPresenceError, SessionPresenceRegistry, type PresenceRecord } from "../lib/agents-session-transport.ts";
+import { ActiveSessionClient, ActiveSessionClientError, ActiveSessionListener, SessionPresenceError, SessionPresenceRegistry, type PresenceRecord } from "../lib/agents-session-transport.ts";
 import { WindowsActiveSessionClient, WindowsActiveSessionListener } from "../lib/windows-session-transport.ts";
 import { historyDir, loadHistory, loadStoredTask, saveTask } from "../lib/agents-history.ts";
 import { STALE_COMPLETION_MS } from "../lib/agents-completion-delivery.ts";
@@ -900,7 +900,13 @@ test("Herdr send events occur only after acceptance and preserve the existing se
 	assert.match(accepted.content[0].text, /accepted for delivery; it is not a delivery or read receipt/);
 	assert.deepEqual(reports(), [{ sessionId: "s1", target: "peer" }]);
 	pending = tool.execute("send", params, undefined, undefined, ctx); await tick(); reject(new Error("rejected"));
-	assert.equal((await pending).details.error, "not accepted"); assert.equal(reports().length, 1);
+	const unknown = await pending;
+	assert.equal(unknown.details.error, "not accepted"); assert.equal(unknown.details.reason, "unknown"); assert.equal(reports().length, 1);
+	assert.equal(unknown.content[0].text, "Error: session message was not accepted (unknown).");
+	pending = tool.execute("send", params, undefined, undefined, ctx); await tick(); reject(new ActiveSessionClientError("not_found"));
+	const missing = await pending;
+	assert.equal(missing.details.error, "not accepted"); assert.equal(missing.details.reason, "not_found");
+	assert.match(missing.content[0].text, /^Error: session message was not accepted \(not_found\)\. No live Pi session has ID peer; recipient_session_id takes a Pi session ID from orchestrator_list, not a T3 thread ID\.$/);
 });
 
 test("Herdr send keeps an accepted receipt when the transport is replaced before acceptance resolves", async () => {
