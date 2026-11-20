@@ -3,14 +3,30 @@ import { execFileSync } from "node:child_process";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import { checkReviewDeliveryPreflight } from "../lib/review-delivery-preflight.ts";
+import { checkReviewDeliveryPreflight, deliveryDirectory } from "../lib/review-delivery-preflight.ts";
 import { recognizeReviewDeliveryActions } from "../lib/destructive-command-guard.ts";
 import { ReviewContinuationRegistry } from "../lib/review-continuation-registry.ts";
 import { NativeReviewCliV216, type NativeReviewCli } from "../lib/native-review-cli.ts";
+
+test("gentle-shell#3351: an unresolved delivery directory is denied with a runnable exit, even with RDD off", async () => {
+	const unresolvedMessage = "RDD pre-delivery: The delivery repository cannot be resolved from this directory or Git/environment redirect, so its review mode cannot be checked (a variable, ~, or redirect could name another repository); rerun with a literal path, e.g. `cd <literal path> && git push` or `git -C <absolute path> push`. This delivery command was not run. Review outcomes do not authorize delivery.";
+	let modeReads = 0;
+	const off = { reviewMode: async () => { modeReads++; return { status: { effective: "off" } }; } } as unknown as NativeReviewCli;
+	const check = (command: string) => checkReviewDeliveryPreflight("/session/cwd", "bash", command, off, () => undefined, () => false);
+	for (const command of ['git -C "$VAR" push', "cd ~/x && git push"]) {
+		assert.deepEqual(await check(command), { block: true, reason: unresolvedMessage }, command);
+	}
+	assert.equal(modeReads, 0, "an unresolvable directory never borrows the session's RDD mode");
+	// The suggested exits are runnable: a literal absolute path resolves, so RDD off allows it.
+	for (const command of ["cd /tmp/literal && git push", "git -C /tmp/literal push"]) {
+		assert.equal(await check(command), undefined, command);
+	}
+	assert.equal(modeReads, 2);
+});
 
 test("committed delivery requests pass the real native client validation without an untracked inventory", async t => {
 	const root = mkdtempSync(join(tmpdir(), "review-delivery-native-validation-"));
@@ -151,7 +167,7 @@ test("repository redirects remain delivery commands but cannot borrow the sessio
 		assert.equal(deliveries[0].unresolvedDirectory, true, command);
 		const result = await checkReviewDeliveryPreflight(process.cwd(), "bash", command, cli, () => "HEAD", () => false);
 		assert.equal(result?.block, true, command);
-		assert.match(result!.reason, /literal cd or git -C/);
+		assert.match(result!.reason, /rerun with a literal path/);
 	}
 	assert.equal(modeCalls, 0, "an unrelated off session repository cannot authorize a redirected target");
 	for (const command of ["env -u GIT_DIR git push", "sudo -C 3 git push", "CI=1 git push", "env CI=1 git push"]) {
@@ -459,4 +475,36 @@ test("#3169: the real native client sends the exclusion flags with the status in
 	assert.equal(result?.block, true);
 	assert.match(result!.reason, /Session changed during preflight/);
 	assert.equal(assessArgs.length, 0, "no assessment runs after the session changed");
+});
+
+test("#3310: git-bash drive directories resolve to the real Windows repository before preflight", () => {
+	assert.equal(deliveryDirectory("C:\\Users\\dev", ["/c/xampp/htdocs/myrepo"], "win32"), "C:\\xampp\\htdocs\\myrepo");
+	assert.equal(deliveryDirectory("D:\\work", ["/d/path/repo", "sub"], "win32"), "D:\\path\\repo\\sub");
+	assert.equal(deliveryDirectory("C:\\work", ["repo"], "win32"), "C:\\work\\repo");
+	assert.equal(deliveryDirectory("/home/dev", ["/c/repo"], "linux"), "/c/repo");
+	assert.equal(deliveryDirectory("/home/dev", [], "linux"), "/home/dev");
+});
+
+test("#3310: the preflight entry point hands the native client the real Windows directory for a git-bash cd", async () => {
+	const seen: string[] = [];
+	const cli = { reviewMode: async (request: { cwd: string }) => { seen.push(request.cwd); return { status: { effective: "off" } }; } } as unknown as NativeReviewCli;
+	const denied = await checkReviewDeliveryPreflight("C:\\Users\\dev", "bash", "cd /c/work/repo && git push", cli, () => undefined, () => false, undefined, () => true, "win32");
+	assert.equal(denied, undefined);
+	assert.deepEqual(seen, ["C:\\work\\repo"]);
+});
+
+test("#3271: an unexpected native failure names a bounded cause and a runnable exit", async () => {
+	const exit = "retry the delivery, or turn RDD off for this clone with 'gentle-ai review mode disable --scope clone'";
+	const tail = " This delivery command was not run. Review outcomes do not authorize delivery.";
+	const fail = (error: unknown) => checkReviewDeliveryPreflight("/work/repo", "bash", "git push origin HEAD",
+		{ reviewMode: async () => { throw error; } } as unknown as NativeReviewCli, () => "base", () => false);
+	const enoent = Object.assign(new Error("spawn gentle-ai ENOENT"), { code: "ENOENT" });
+	assert.deepEqual(await fail(enoent), { block: true, reason: `RDD pre-delivery: Native preflight is unavailable (ENOENT: spawn gentle-ai ENOENT); ${exit}.${tail}` });
+	const timeout = Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+	assert.deepEqual(await fail(timeout), { block: true, reason: `RDD pre-delivery: Native preflight is unavailable (TimeoutError: The operation was aborted due to timeout); ${exit}.${tail}` });
+	const noisy = Object.assign(new Error(`failed at ${homedir()}/secret/bin\nat stack line\n${"x".repeat(500)}`), { code: "EACCES" });
+	const reason = (await fail(noisy))!.reason;
+	assert.ok(!reason.includes(homedir()) && !reason.includes("at stack line") && !reason.includes("x".repeat(200)), "no home path, extra lines, or unbounded text");
+	assert.match(reason, /^RDD pre-delivery: Native preflight is unavailable \(EACCES: failed at ~\/secret\/bin\); retry the delivery/);
+	assert.equal((await fail("plain string"))?.reason, `RDD pre-delivery: Native preflight is unavailable (plain string); ${exit}.${tail}`);
 });

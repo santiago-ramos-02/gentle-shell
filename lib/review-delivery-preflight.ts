@@ -1,11 +1,22 @@
 import { execFile } from "node:child_process";
-import { resolve } from "node:path";
-import { NATIVE_UNTRACKED_SCOPE, type NativeReviewCli } from "./native-review-cli.ts";
+import { homedir } from "node:os";
+import { posix, win32 } from "node:path";
+import { NATIVE_UNTRACKED_SCOPE, normalizeNativeReviewCwd, type NativeReviewCli } from "./native-review-cli.ts";
 import { recognizeReviewDeliveryActions } from "./destructive-command-guard.ts";
 import { resolveSessionWorktree, worktreeGitEnvironment } from "./session-worktree-registry.ts";
 
 type Denial = { block: true; reason: string };
 const deny = (reason: string): Denial => ({ block: true, reason: `RDD pre-delivery: ${reason} This delivery command was not run. Review outcomes do not authorize delivery.` });
+
+/** gentle-shell#3271: a single-line, bounded failure cause (code or name plus first message line) with the home directory elided. */
+function preflightCause(error: unknown): string {
+	const record = typeof error === "object" && error !== null ? error as { code?: unknown; name?: unknown; message?: unknown } : undefined;
+	const label = typeof record?.code === "string" && record.code ? record.code : typeof record?.name === "string" && record.name ? record.name : "";
+	const message = String(record && "message" in record ? record.message : error).split(/\r?\n/, 1)[0]!.trim();
+	const home = homedir();
+	const text = (label ? `${label}: ${message}` : message).split(home).join("~");
+	return text.length > 120 ? `${text.slice(0, 119)}…` : text;
+}
 
 // Compare HEAD/base around this read, without retaining a verdict or snapshot.
 async function identity(root: string, baseRef: string): Promise<string | undefined> {
@@ -34,13 +45,23 @@ export async function committedRangeUntrackedExclusion(cli: Pick<NativeReviewCli
 	} catch { return {}; }
 }
 
+/**
+ * gentle-shell#3310: on Windows a git-bash `cd /c/repo` must name C:\repo;
+ * resolving the MSYS form directly yields C:\c\repo and the native spawn fails.
+ */
+export function deliveryDirectory(cwd: string, directories: readonly string[], platform: NodeJS.Platform = process.platform): string {
+	const path = platform === "win32" ? win32 : posix;
+	return directories.reduce((base, directory) => path.resolve(base, normalizeNativeReviewCwd(directory, platform)), cwd);
+}
+
 /** One fresh check per repository/batch. The existing session registry supplies only a base-ref hint. */
 export async function checkReviewDeliveryPreflight(cwd: string, toolName: string, command: string, cli: NativeReviewCli | null,
 	baseRefFor: (root: string) => string | undefined, declined: (root: string, target: string) => boolean,
-	signal?: AbortSignal, current: () => boolean = () => true): Promise<Denial | undefined> {
+	signal?: AbortSignal, current: () => boolean = () => true, platform: NodeJS.Platform = process.platform): Promise<Denial | undefined> {
 	const actions = recognizeReviewDeliveryActions(command), deliveries = actions.filter(action => action.kind === "delivery");
 	if (!deliveries.length || !cli?.reviewMode) return undefined;
-	if (deliveries.some(delivery => delivery.unresolvedDirectory)) return deny("The delivery repository cannot be resolved from this directory or Git/environment redirect; run delivery inside its repository or use literal cd or git -C.");
+	// gentle-shell#3351: an unresolvable directory may be another repository, so the session's RDD mode is never borrowed; name a runnable exit.
+	if (deliveries.some(delivery => delivery.unresolvedDirectory)) return deny("The delivery repository cannot be resolved from this directory or Git/environment redirect, so its review mode cannot be checked (a variable, ~, or redirect could name another repository); rerun with a literal path, e.g. `cd <literal path> && git push` or `git -C <absolute path> push`.");
 	if (signal?.aborted || !current()) return deny("Preflight was cancelled or its session changed.");
 	const bounded = AbortSignal.any([AbortSignal.timeout(10_000), ...(signal ? [signal] : [])]);
 	let abort!: () => void;
@@ -49,7 +70,7 @@ export async function checkReviewDeliveryPreflight(cwd: string, toolName: string
 		try {
 			const checked: Array<{ root: string; baseRef: string; before: string }> = [];
 			const roots = new Set(deliveries.map(delivery => {
-				const target = (delivery.directories ?? []).reduce((base, directory) => resolve(base, directory), cwd);
+				const target = deliveryDirectory(cwd, delivery.directories ?? [], platform);
 				return resolveSessionWorktree(target, cwd)?.root ?? target;
 			}));
 			for (const root of roots) {
@@ -78,7 +99,7 @@ export async function checkReviewDeliveryPreflight(cwd: string, toolName: string
 				if (bounded.aborted || !current() || baseRefFor(root) !== baseRef || await identity(root, baseRef) !== before || !current()) return deny("The range or session changed during preflight; assess again.");
 			}
 			return undefined;
-		} catch { return deny("Native preflight is unavailable; resolve it before delivery."); }
+		} catch (error) { return deny(`Native preflight is unavailable (${preflightCause(error)}); retry the delivery, or turn RDD off for this clone with 'gentle-ai review mode disable --scope clone'.`); }
 	};
 	try { return await Promise.race([run(), expired]); }
 	finally { bounded.removeEventListener("abort", abort); }
