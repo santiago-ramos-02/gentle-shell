@@ -30,12 +30,13 @@ import { reviewReviewerActivityReporter } from "../lib/review-reviewer-activity.
 import { snapshotReviewStartContext } from "../lib/review-start-context.ts";
 import { asNativeReviewCliError, readReviewFailureFacts } from "../lib/review-failure-facts.ts";
 import { REVIEW_BLOCKER_GUIDANCE, withReviewBlocker } from "../lib/review-blocker.ts";
-import { ReviewContinuationRegistry, type RetainedReviewContinuation, type RetainedNativeUntrackedSelection, type RetainedPreLineageNativeUntrackedSelection, type RetainedNativeCaptureRoute } from "../lib/review-continuation-registry.ts";
+import { ReviewContinuationRegistry, type RetainedReviewContinuation, type RetainedPreLineageNativeUntrackedSelection, type RetainedNativeCaptureRoute } from "../lib/review-continuation-registry.ts";
 import { boundedFindingClaims, parseReviewCoordinatorInput, runReviewCoordinator } from "../lib/review-coordinator.ts";
 import { StatusTimingDiagnostics } from "../lib/status-timing-diagnostics.ts";
 import { isOddPhase, oddPhaseRegistry, ODD_PHASES } from "../lib/odd-phase.ts";
 import { shellEnabled } from "../lib/shell-bar.ts";
-import { resolveSessionWorktree } from "../lib/session-worktree-registry.ts";
+import { resolveSessionWorktree, SessionWorktreeRegistry, toolWorktreePath } from "../lib/session-worktree-registry.ts";
+import { canonicalizeTarget, clearPathConsentSkills, isIndexedSkillTarget, isTempTarget, isWithinPath, setPathConsentSkills } from "../lib/path-consent-fence.ts";
 import { declareReviewRelayHandshake } from "../lib/review-relay-contract.ts";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
@@ -210,8 +211,6 @@ import {
 	ReviewHostRelayError,
 	reviewHostMediatedRoleSlots,
 	reviewHostRelaySlots,
-	reviewHostRelayUnachievableDetail,
-	reviewHostRelayUnachievableReason,
 	reviewProviderRoleVectorSlots,
 	resolveReviewHostRelaySubmission,
 	runReviewHostRelayReviewerGroup,
@@ -270,7 +269,6 @@ import {
 	isCanonicalProcessString,
 	isNativeReviewAbandonReason,
 	NATIVE_REVIEW_ABANDON_REASONS,
-	isNativeReviewUnachievableVerbRefused,
 	nativeReviewAbandonAuthorization,
 	nativeReviewRecoverAuthorization,
 	NATIVE_REVIEW_AUTHORITY_STATUS,
@@ -296,7 +294,6 @@ import {
 	type NativeReviewModeSource,
 	type NativeReviewModeStatus,
 	type NativeReviewProcessDiagnostics,
-	type NativeReviewUnachievableLensCaptureArtifact,
 	type NativeStartResult,
 	type NativeReviewAssessRequest,
 	type ExecFileAdapter,
@@ -2745,6 +2742,31 @@ function saveGuardedCommandAllowAlways(
 	}
 }
 
+async function requestToolConfirmation(
+	events: ExtensionAPI["events"],
+	herdrLifecycle: HerdrConfirmationLifecycle,
+	toolName: string,
+	confirm: () => Promise<boolean>,
+): Promise<boolean> {
+	const requestId = randomUUID();
+	const emitPermissionRequest = (state: "waiting" | "approved" | "denied"): void => {
+		events.emit("pi-permission-system:permission-request", {
+			requestId, state, source: "tool_call",
+			message: "Gentle AI safety policy requires confirmation for this tool call.", toolName,
+		});
+	};
+	let approved = false;
+	emitPermissionRequest("waiting");
+	herdrLifecycle.begin();
+	try {
+		approved = await confirm();
+		return approved;
+	} finally {
+		try { emitPermissionRequest(approved ? "approved" : "denied"); }
+		finally { herdrLifecycle.settle(); }
+	}
+}
+
 async function confirmCommand(
 	command: string,
 	ctx: ExtensionContext,
@@ -2827,24 +2849,7 @@ async function confirmCommand(
 		? "Allow recognized data-loss command?"
 		: guardedCommandTitle(evaluation.key, evaluation.matches);
 	const preview = guardedCommandPreview(command, evaluation.triggerIndex);
-	const requestId = randomUUID();
-	const emitPermissionRequest = (
-		state: "waiting" | "approved" | "denied",
-	): void => {
-		events.emit("pi-permission-system:permission-request", {
-			requestId,
-			state,
-			source: "tool_call",
-			message: "Gentle AI safety policy requires confirmation for this tool call.",
-			toolName: "bash",
-		});
-	};
-	let approved = false;
-	let confirmationFailed = false;
-	let confirmationError: unknown;
-	emitPermissionRequest("waiting");
-	herdrLifecycle.begin();
-	try {
+	const approved = await requestToolConfirmation(events, herdrLifecycle, "bash", async () => {
 		if (typeof (ctx.ui as { select?: unknown }).select === "function") {
 			// Scoped confirmation: the ask dialog itself carries the allowlist choices.
 			const canAlwaysAllow = !evaluation.dataLoss && typeof evaluation.key === "string"
@@ -2867,21 +2872,10 @@ async function confirmCommand(
 				&& !saveGuardedCommandAllowAlways(evaluation.key as GuardedCommandKey, {}, pushVariant)) {
 				try { ctx.ui.notify?.("Could not save the always-allow preference; the command is approved once only.", "warning"); } catch { /* display only */ }
 			}
-			approved = selection === "Allow once" || selection === "Allow for this session" || (alwaysLabel !== undefined && selection === alwaysLabel);
-		} else {
-			approved = (await ctx.ui.confirm(title, preview)) === true;
+			return selection === "Allow once" || selection === "Allow for this session" || (alwaysLabel !== undefined && selection === alwaysLabel);
 		}
-	} catch (error) {
-		confirmationFailed = true;
-		confirmationError = error;
-	} finally {
-		try {
-			emitPermissionRequest(confirmationFailed || !approved ? "denied" : "approved");
-		} finally {
-			herdrLifecycle.settle();
-		}
-	}
-	if (confirmationFailed) throw confirmationError;
+		return (await ctx.ui.confirm(title, preview)) === true;
+	});
 	if (approved) return undefined;
 	return {
 		block: true,
@@ -8670,7 +8664,6 @@ interface PendingReviewConsent {
 	candidateViews: CandidateViewRegistry | null;
 	verifyCandidate: () => void;
 	cleanupCandidate: () => void;
-	untrackedSelection?: RetainedNativeUntrackedSelection;
 	consent: ReviewConsentEnvelope;
 	requestContextPath?: string;
 	escalate?: AgentRiskEscalation;
@@ -9031,7 +9024,6 @@ function completeNativeStart(
 // would hit the already-burned lineage.
 const POST_BURN_CLEANUP = {
 	candidateView: { code: "candidate-view-cleanup-failed", nextAction: "retry-candidate-view-cleanup-or-remove-the-view-out-of-band" },
-	retainedSelection: { code: "retained-selection-cleanup-failed", nextAction: "retained-selection-clears-on-the-next-terminal-status" },
 } as const;
 
 function deferredPostBurnCleanup(step: (typeof POST_BURN_CLEANUP)[keyof typeof POST_BURN_CLEANUP], cleanup: () => void): Record<string, unknown> | undefined {
@@ -9275,30 +9267,6 @@ function resolveReviewControllerWorkspaceRoot(
 	return target.toplevel;
 }
 
-function cloneRetainedNativeUntrackedSelection(selection: NativeStartUntrackedSelection): RetainedNativeUntrackedSelection | undefined {
-	if (selection.untrackedScope === undefined || selection.expectedUntrackedInventory === undefined) return undefined;
-	return Object.freeze({
-		untrackedScope: selection.untrackedScope,
-		expectedUntrackedInventory: selection.expectedUntrackedInventory,
-		intendedUntracked: Object.freeze([...(selection.intendedUntracked ?? [])]),
-	});
-}
-
-function retainNativeUntrackedSelection(selections: ReviewContinuationRegistry, workspaceRoot: string, lineageId: string, selection: RetainedNativeUntrackedSelection | undefined): void {
-	if (selection !== undefined) selections.retainSelection(workspaceRoot, lineageId, selection);
-}
-
-function readRetainedNativeUntrackedSelection(selections: ReviewContinuationRegistry, workspaceRoot: string, lineageId: string): NativeStartUntrackedSelection {
-	const selection = selections.readSelection(workspaceRoot, lineageId);
-	return selection === undefined
-		? {}
-		: {
-			untrackedScope: selection.untrackedScope,
-			expectedUntrackedInventory: selection.expectedUntrackedInventory,
-			intendedUntracked: [...selection.intendedUntracked],
-		};
-}
-
 // gentle-pi#706: inspect's untrackedScope round trip retains the resolved
 // selection under the pre-lineage empty-lineage key so the next plain START in
 // that worktree adopts it without re-deriving the selection.
@@ -9469,15 +9437,16 @@ function retainNativeCaptureRoutes(selections: ReviewContinuationRegistry, works
 	const selection = reviewIntendedUntrackedInput(status);
 	if (!canCapture && (selection === undefined || !hasBoundSelectionLineage(selection, lineageId))) return;
 	const inputs = canCapture ? status.nextTransition?.collect?.inputs ?? [] : [selection!];
+	const verifiedSelection = selection !== undefined && hasBoundSelectionLineage(selection, lineageId)
+		&& intendedUntrackedStatusMismatch(selection, status) === undefined;
 	// Pin the commit for alias comparison without changing the request used to
 	// re-read STATUS. The provider's base tree alone cannot distinguish commits.
-	let selectionBaseCommit: string | undefined;
-	if (baseRef !== undefined && selection !== undefined && hasBoundSelectionLineage(selection, lineageId)
-		&& status.projection.kind === "base-diff" && /^sha256:[0-9a-f]{64}$/.test(status.targetIdentity)
-		&& intendedUntrackedStatusMismatch(selection, status) === undefined) {
+	let baseCommit: string | undefined;
+	if (baseRef !== undefined && status.projection.kind === "base-diff" && /^sha256:[0-9a-f]{64}$/.test(status.targetIdentity)
+		&& inputs.some((input) => input !== selection || verifiedSelection)) {
 		try {
 			const base = resolveCanonicalCandidateBase(workspaceRoot, baseRef);
-			if (base.tree === status.projection.baseTree) selectionBaseCommit = base.commit;
+			if (base.tree === status.projection.baseTree) baseCommit = base.commit;
 		} catch { /* No verified alias; keep the strict selector comparison. */ }
 	}
 	const routes = inputs.map((input) => {
@@ -9488,7 +9457,7 @@ function retainNativeCaptureRoutes(selections: ReviewContinuationRegistry, works
 			?? status.targetIdentity;
 		return { binding: canonicalReviewCaptureBinding(input), route: Object.freeze({
 			workspaceRoot, lineageId, targetIdentity, ...(baseRef === undefined ? {} : { baseRef, committedOnly: true as const }),
-			...(input === selection && targetIdentity === status.targetIdentity && selectionBaseCommit !== undefined ? { selectionBaseCommit } : {}),
+			...(baseCommit !== undefined && (input !== selection || (verifiedSelection && targetIdentity === status.targetIdentity)) ? { baseCommit } : {}),
 		}) };
 	});
 	for (const { binding, route } of routes) {
@@ -9497,10 +9466,9 @@ function retainNativeCaptureRoutes(selections: ReviewContinuationRegistry, works
 		if (existing.workspaceRoot !== route.workspaceRoot) throw new NativeCaptureRouteRegistrationError("workspace-mismatch");
 		if (existing.lineageId !== route.lineageId) throw new NativeCaptureRouteRegistrationError("lineage-mismatch");
 		if (existing.targetIdentity !== route.targetIdentity) throw new NativeCaptureRouteRegistrationError("target-mismatch");
-		if (existing.baseRef !== undefined && route.baseRef !== undefined && existing.baseRef !== route.baseRef) {
-			if (route.selectionBaseCommit === undefined || !("selectionBaseCommit" in existing) || existing.selectionBaseCommit !== route.selectionBaseCommit) {
-				throw new NativeCaptureRouteRegistrationError("selector-mismatch");
-			}
+		if (existing.baseRef !== undefined && route.baseRef !== undefined && existing.baseRef !== route.baseRef
+			&& (route.baseCommit === undefined || existing.baseCommit !== route.baseCommit)) {
+			throw new NativeCaptureRouteRegistrationError("selector-mismatch");
 		}
 		// Only a fresh offer for the identical verified target can add or omit
 		// its selector. A missing selector must never erase a known one.
@@ -9525,13 +9493,8 @@ function trustedNativeCaptureBaseRef(route: RetainedNativeCaptureRoute | undefin
 
 function isTerminalReviewAuthorityState(state: string | undefined): boolean { return state === "invalidated" || state === "approved" || state === "escalated"; }
 
-function clearRetainedNativeUntrackedSelection(selections: ReviewContinuationRegistry, workspaceRoot: string, lineageId: string): void {
-	selections.clearSelection(workspaceRoot, lineageId);
-}
-
 function clearRetainedNativeStatusSelectionsOnTerminal(selections: ReviewContinuationRegistry, workspaceRoot: string, lineageId: string | undefined, state: string | undefined, keepBindings: readonly string[] = []): void {
 	if (lineageId === undefined || !isTerminalReviewAuthorityState(state)) return;
-	if (state !== "approved") clearRetainedNativeUntrackedSelection(selections, workspaceRoot, lineageId);
 	selections.clearCaptureRoutes(workspaceRoot, lineageId, keepBindings);
 }
 
@@ -9572,16 +9535,6 @@ const REVIEW_HOST_RELAY_REFUSED_ACTION =
 	"gentle-ai refused this submission at admission and did not consume the lens slot; the reason is in failure.stderr. "
 	+ "Call fresh STATUS and run only the exact slot it reoffers so the reviewer produces a new result that satisfies that refusal; never resubmit the refused bytes.";
 
-// gentle-pi#638: the declaration recorded, so fresh STATUS stops the review with one withdraw binding per declared slot instead of reoffering the reviewer. The withdraw command is the only way back to the same slot; everything else needs a smaller candidate and a new review.
-const REVIEW_HOST_RELAY_UNACHIEVABLE_ACTION =
-	"A deterministic relay failure was declared unachievable for this bound slot, and fresh STATUS now stops this review instead of reoffering the reviewer. "
-	+ "If the failure was transient, run the withdraw command in unachievable_lens_slots with the same binding so the review re-offers this exact reviewer; otherwise reduce the candidate scope and start a new review.";
-
-// gentle-pi#638: the relay failure was deterministic but gentle-ai refused the declaration, so no slot state changed and the review still needs a provider-bound continuation.
-const REVIEW_HOST_RELAY_DECLARATION_FAILED_ACTION =
-	"The relay failure was deterministic for this slot, but gentle-ai refused the unachievable declaration, so no slot state changed. "
-	+ "Call fresh STATUS and follow only its declared action; never replay this capture from transcript inference.";
-
 function reviewHostRelayStreamTimeoutNextAction(error: ReviewHostRelayError): string | undefined {
 	if (error.kind !== REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT) return undefined;
 	const phase = error.reviewerEvidence?.timeoutPhase, limit = error.reviewerEvidence?.streamTimeoutMs;
@@ -9591,17 +9544,6 @@ function reviewHostRelayStreamTimeoutNextAction(error: ReviewHostRelayError): st
 	return `Do not relaunch this slot unchanged: the ${phase} stream bound${measured} stopped the reviewer. `
 		+ `Fix the stalled provider or adjust ${setting}=<milliseconds> first; raising the overall timeout does not change this stream bound. `
 		+ REVIEW_HOST_RELAY_RETRY_ACTION;
-}
-
-function reviewHostRelayTimeoutNextAction(error: ReviewHostRelayError): string {
-	const streamAction = reviewHostRelayStreamTimeoutNextAction(error);
-	if (streamAction !== undefined) return streamAction;
-	const measured = error.elapsedMs === null || error.timeoutMs === null
-		? ""
-		: ` The reviewer was killed after ${error.elapsedMs}ms against a ${error.timeoutMs}ms bound.`;
-	return `Do not relaunch this slot unchanged: the same bound kills the same reviewer run again and re-spends the model tokens for nothing.${measured} `
-		+ `Change one of two things first: export ${REVIEW_HOST_RELAY_PI_TIMEOUT_ENV}=<milliseconds> above the reviewer's real wall time (hard ceiling ${REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS}), or reduce the candidate scope so the materialized prompt is smaller. `
-		+ "Then call fresh STATUS and submit only its exact reoffered slot.";
 }
 
 function reviewHostRelayFailureReport(error: ReviewHostRelayError): Record<string, unknown> {
@@ -9914,101 +9856,6 @@ async function executeReviewHostRelayCapture(
 				mutation_outcome: "none",
 			};
 		}
-		// gentle-pi#638: the two deterministic relay failure classes end the slot, not the transport. Declaring the slot unachievable through the native verb records the provider-owned fact that this reviewer cannot complete under current conditions, then exactly one bound STATUS re-query renders the typed stop with its withdraw binding instead of reoffering the same slot. The declaration binding is re-derived from the slot's own provider-issued `--name=value` tokens, never from transcript state.
-		const unachievableReason = reviewHostRelayUnachievableReason(error);
-		const declarationBinding = unachievableSlotDeclarationBinding(slot);
-		if (unachievableReason !== undefined && declarationBinding !== undefined && nativeReviewCli.captureUnachievableLens !== undefined) {
-			let declared: NativeReviewUnachievableLensCaptureArtifact | undefined;
-			try {
-				declared = await nativeReviewCli.captureUnachievableLens({ cwd, ...declarationBinding, reason: unachievableReason, ...(reviewHostRelayUnachievableDetail(error) === undefined ? {} : { detail: reviewHostRelayUnachievableDetail(error)! }), ...(signal === undefined ? {} : { signal }) });
-			} catch (declarationError) {
-				// Fail open only on the unknown-verb capability refusal: an older binary without `capture-unachievable` keeps today's transport-failure behavior below. Every other declaration failure is surfaced, never hidden behind the relay failure it followed.
-				if (!isNativeReviewUnachievableVerbRefused(declarationError)) {
-					// gentle-pi#822 (outside-diff): the declaration failure's own envelope carries the mutation truth — the process may have recorded the declaration before failing — so the mutation fields are derived from it instead of hardcoded none, and an unknown outcome is proven or disproven by one bound STATUS re-query without ever changing the failure outcome.
-					const declarationFailureReport = nativeOperationFailure("gentle_review_capture", declarationError);
-					let declarationMutationPerformed = declarationFailureReport.mutation_performed === true;
-					let declarationMutationOutcome: "none" | "unknown" | "committed" = declarationFailureReport.mutation_outcome === "committed" ? "committed" : declarationFailureReport.mutation_outcome === "unknown" ? "unknown" : "none";
-					if (declarationMutationOutcome === "unknown") {
-						try {
-							const status = await reconcileUnknownReviewLastEventCapture(nativeReviewCli, cwd, binding, route === undefined ? { agent: REVIEW_HOST_AGENT } : { ...route, agent: REVIEW_HOST_AGENT });
-							syncRetainedNativeStatusSelections(selections, cwd, status, route?.baseRef);
-							const stop = status.nextTransition?.kind === "stop" && status.nextTransition.reasonCode === "unachievable_lens_slot" ? status.nextTransition : undefined;
-							const declaredSlot = stop?.unachievableLensSlots?.find((candidate) => candidate.lens === slot.lens && String(candidate.selectedOrder) === slot.order && candidate.subjectHash === declarationBinding.requestHash && candidate.withdraw.binding.targetIdentity === declarationBinding.targetIdentity && candidate.withdraw.binding.lineageId === declarationBinding.lineageId && candidate.withdraw.binding.revision === declarationBinding.expectedRevision);
-							if (stop !== undefined && declaredSlot !== undefined) {
-								declarationMutationPerformed = true;
-								declarationMutationOutcome = "committed";
-							}
-						} catch {
-							// Without proof the mutation stays unknown; the declaration failure is already the reported outcome.
-						}
-					}
-					return {
-						tool: "gentle_review_capture",
-						status: "blocked",
-						outcome: "unachievable-lens-declaration-failed",
-						reason: error.message,
-						failure: reviewHostRelayFailureReport(error),
-						declaration_failure: declarationFailureReport,
-						mutation_performed: declarationMutationPerformed,
-						mutation_outcome: declarationMutationOutcome,
-						next_action: REVIEW_HOST_RELAY_DECLARATION_FAILED_ACTION,
-					};
-					}
-			}
-			if (declared !== undefined) {
-				const declaration = { lens: declared.lens, selected_order: declared.selectedOrder, subject_hash: declarationBinding.requestHash, reason: declared.reason };
-				try {
-					const status = await reconcileUnknownReviewLastEventCapture(nativeReviewCli, cwd, binding, route === undefined ? { agent: REVIEW_HOST_AGENT } : { ...route, agent: REVIEW_HOST_AGENT });
-					syncRetainedNativeStatusSelections(selections, cwd, status, route?.baseRef);
-					const stop = status.nextTransition?.kind === "stop" && status.nextTransition.reasonCode === "unachievable_lens_slot" ? status.nextTransition : undefined;
-					// gentle-pi#822: the stop may also carry slots declared by other runs, so expose only the entry matching the identity this session just declared. A stop with slots but no matching entry is a reconciliation failure, never a success rendering someone else's withdraw command.
-					const declaredSlot = stop?.unachievableLensSlots?.find((slot) => slot.lens === declaration.lens && slot.selectedOrder === declaration.selected_order && slot.subjectHash === declaration.subject_hash && slot.withdraw.binding.targetIdentity === declarationBinding.targetIdentity && slot.withdraw.binding.lineageId === declarationBinding.lineageId && slot.withdraw.binding.revision === declarationBinding.expectedRevision);
-					// gentle-pi#822: success is proven, never assumed — a STATUS with no unachievable_lens_slot stop at all (no transition, a different reason code, or a collect reoffer) is a reconciliation failure exactly like a stop whose entries do not match the declared identity.
-					if (declaredSlot === undefined) {
-						return {
-							tool: "gentle_review_capture",
-							status: "blocked",
-							outcome: "unachievable-lens-declaration-reconciliation-failed",
-							reason: error.message,
-							failure: reviewHostRelayFailureReport(error),
-							declaration,
-							reconciliation_failure: { operation: "gentle_review_capture", status: "blocked", outcome: "unachievable-lens-slot-declaration-unmatched", reason: stop === undefined ? "the bound STATUS did not return the unachievable_lens_slot stop" : "no unachievable_lens_slots entry matches the declared slot identity", declared_slot: { lens: declaration.lens, selected_order: declaration.selected_order, subject_hash: declaration.subject_hash }, mutation_performed: true, mutation_outcome: "committed" },
-							mutation_performed: true,
-							mutation_outcome: "committed",
-							next_action: REVIEW_HOST_RELAY_DECLARATION_FAILED_ACTION,
-						};
-					}
-					return {
-						tool: "gentle_review_capture",
-						status: "blocked",
-						outcome: "unachievable-lens-slot-declared",
-						reason: error.message,
-						failure: reviewHostRelayFailureReport(error),
-						declaration,
-						provider_action: status.action,
-						...(status.nextTransition === undefined ? {} : { next_transition: status.nextTransition }),
-						unachievable_lens_slots: [{ lens: declaredSlot.lens, selected_order: declaredSlot.selectedOrder, subject_hash: declaredSlot.subjectHash, reason: declaredSlot.reason, ...(declaredSlot.detail === undefined ? {} : { detail: declaredSlot.detail }), withdraw: declaredSlot.withdraw.command }],
-						result: status.raw,
-						next_action: REVIEW_HOST_RELAY_UNACHIEVABLE_ACTION,
-						mutation_performed: true,
-						mutation_outcome: "committed",
-					};
-				} catch (statusError) {
-					return {
-						tool: "gentle_review_capture",
-						status: "blocked",
-						outcome: "unachievable-lens-declaration-reconciliation-failed",
-						reason: error.message,
-						failure: reviewHostRelayFailureReport(error),
-						declaration,
-						reconciliation_failure: nativeOperationFailure("gentle_review_capture", statusError),
-						mutation_performed: true,
-						mutation_outcome: "committed",
-						next_action: REVIEW_HOST_RELAY_DECLARATION_FAILED_ACTION,
-					};
-				}
-			}
-		}
 		return {
 			tool: "gentle_review_capture",
 			status: "blocked",
@@ -10017,32 +9864,14 @@ async function executeReviewHostRelayCapture(
 			reason: error.message,
 			mutation_performed: false,
 			mutation_outcome: "none",
-			next_action: error.kind === REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT
-				? reviewHostRelayTimeoutNextAction(error)
-				: error.kind === REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED
-					? REVIEW_HOST_RELAY_REFUSED_ACTION
-					: REVIEW_HOST_RELAY_RETRY_ACTION,
+			next_action: reviewHostRelayStreamTimeoutNextAction(error)
+				?? (error.kind === REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED ? REVIEW_HOST_RELAY_REFUSED_ACTION : REVIEW_HOST_RELAY_RETRY_ACTION),
 		};
 	}
 }
 
 const REVIEW_PROVIDER_ROLE_RETRY_ACTION =
 	"Call fresh STATUS and execute only the exact one-slot role vector it reoffers; never relaunch from transcript inference.";
-
-// gentle-pi#638: re-derives the capture-unachievable declaration binding from one materialize slot's own provider-issued tokens. The provider renders those tokens as `--name=value` pairs (review-host-relay.ts renderToken), and Go verifies every value against the frozen authority before recording, so a missing required value or subject hash means the slot cannot be declared and the caller keeps its fall-back behavior.
-function unachievableSlotDeclarationBinding(slot: ReviewHostRelaySlot): { lineageId: string; targetIdentity: string; expectedRevision: string; requestHash: string; repositoryContext?: string } | undefined {
-	const tokenValue = (name: string): string | undefined => {
-		const prefix = `--${name}=`;
-		const token = slot.captureArgumentTokens.find((candidate) => candidate.startsWith(prefix));
-		return token === undefined ? undefined : token.slice(prefix.length);
-	};
-	const lineageId = tokenValue("lineage");
-	const targetIdentity = tokenValue("target");
-	const expectedRevision = tokenValue("expected-revision");
-	const repositoryContext = tokenValue("repository-context");
-	if (lineageId === undefined || targetIdentity === undefined || expectedRevision === undefined || slot.subjectHash === undefined) return undefined;
-	return { lineageId, targetIdentity, expectedRevision, requestHash: slot.subjectHash, ...(repositoryContext === undefined ? {} : { repositoryContext }) };
-}
 
 async function executeProviderRoleVectorCapture(
 	slot: ReviewProviderRoleVectorSlot,
@@ -10554,10 +10383,10 @@ async function prepareCaptureContext(
 	// A registered route owns its selector, even when it intentionally has none.
 	// Only an absent route can fall back to a trusted candidate projection.
 	const baseRef = trustedNativeCaptureBaseRef(retainedRoute, candidateViews, cwd, parameters.lineageId);
+	// Native STATUS owns the lineage's frozen selection and any fresh inventory offer.
 	const freshStatus = () => negotiatedStatusForHostTransport(nativeReviewCli, {
 		cwd, lineageId: parameters.lineageId,
 		...(baseRef === undefined ? {} : { baseRef, committedOnly: true }),
-		...readRetainedNativeUntrackedSelection(retainedUntrackedSelections, cwd, parameters.lineageId),
 		...(signal === undefined ? {} : { signal }),
 	}, retainedUntrackedSelections, cwd);
 	let status: ReviewStatusV3;
@@ -10988,7 +10817,7 @@ async function executeReviewControllerOperationImpl(
 		// A new inspect supersedes every pre-lineage selection before its first
 		// STATUS attempt. A failed or changed-candidate inspect cannot leave an
 		// older selection available for a later START.
-		clearRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, "");
+		retainedUntrackedSelections.clearPreStart(defaultCwd);
 		try {
 			if (nativeReviewCli.targetStatus !== undefined) {
 				const negotiated = await negotiatedStatusForHostTransport(
@@ -11325,7 +11154,6 @@ async function executeReviewControllerOperationImpl(
 			cwd: defaultCwd,
 			lineageId: parameters.lineageId,
 			...(frozenTarget?.committedOnly === true ? { baseRef: nativeCommittedRangeSelector(frozenTarget), committedOnly: true } : {}),
-			...readRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId),
 			...(signal === undefined ? {} : { signal }),
 		};
 		let status: ReviewStatusV3;
@@ -11380,11 +11208,9 @@ async function executeReviewControllerOperationImpl(
 			return await reconcileNativeMutationFailure(parameters.operation, error, acknowledgementCli, target, retainedUntrackedSelections);
 		}
 		// gentle-ai#4003: from here the native burn is the committed authority
-		// outcome. Both Pi-side teardown steps run outside the mutation-result
-		// try/catch and each one is guarded on its own, so a cleanup failure is
-		// reported as deferred cleanup and never as a failed acknowledgement
-		// that would invite a replay of a burned operation.
-		const retainedSelectionCleanup = deferredPostBurnCleanup(POST_BURN_CLEANUP.retainedSelection, () => clearRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId));
+		// outcome. Candidate-view cleanup runs outside the mutation-result
+		// try/catch, so failure is reported as deferred cleanup, not as a failed
+		// acknowledgement that would invite a replay of a burned operation.
 		// The registry owns restoring writability of its 0555 views before
 		// removal; a terminal approved cleanup keeps the lineage projection.
 		const candidateViewCleanup = deferredPostBurnCleanup(POST_BURN_CLEANUP.candidateView, () => candidateViews?.cleanupTerminal(parameters.lineageId, "approved", defaultCwd));
@@ -11404,7 +11230,6 @@ async function executeReviewControllerOperationImpl(
 			delivery: "ordinary-repository-policy",
 			mutation_performed: true,
 			mutation_outcome: "committed",
-			...(retainedSelectionCleanup === undefined ? {} : { retained_selection_cleanup: retainedSelectionCleanup }),
 			...(candidateViewCleanup === undefined ? {} : { candidate_view_cleanup: candidateViewCleanup }),
 		};
 	}
@@ -11497,10 +11322,9 @@ async function executeReviewControllerOperationImpl(
 					...nativeStartPreAuthorityRejection(),
 				};
 			}
-			retainNativeUntrackedSelection(retainedUntrackedSelections, pending.authorityCwd, answered.start.lineageId, pending.untrackedSelection);
 			// gentle-pi#706: a START completed through answer-consent consumed the
 			// adopted pre-lineage selection too; clear it like the direct path.
-			clearRetainedNativeUntrackedSelection(retainedUntrackedSelections, pending.authorityCwd, "");
+			retainedUntrackedSelections.clearPreStart(pending.authorityCwd);
 			completed = completeNativeStart(parameters.operation, answered.start, pending.repositoryCwd, pending.candidateView, pending.candidateViews);
 		} catch (error) {
 			const value = error as { mutationOutcome?: unknown };
@@ -11660,18 +11484,6 @@ async function executeReviewControllerOperationImpl(
 			const untrackedSubmission =
 				intendedUntrackedSelection ??
 				(retainedPreLineageSelection?.untrackedScope === undefined ? undefined : retainedPreLineageSelection.submission);
-			// Only the selection moves into the lineage-scoped entry. The registry
-			// tracks its kind explicitly; selectors and candidate identity stay with
-			// their own routing and pre-start records.
-			const retainedUntrackedSelection: RetainedNativeUntrackedSelection | undefined =
-				retainedPreLineageSelection === undefined || retainedPreLineageSelection.untrackedScope === undefined
-					? cloneRetainedNativeUntrackedSelection(explicitUntrackedSelection)
-					: Object.freeze({
-							untrackedScope: retainedPreLineageSelection.untrackedScope,
-							expectedUntrackedInventory: retainedPreLineageSelection.expectedUntrackedInventory,
-							intendedUntracked: retainedPreLineageSelection.intendedUntracked,
-							...(retainedPreLineageSelection.submission === undefined ? {} : { submission: retainedPreLineageSelection.submission }),
-						});
 			if (needsPreparation) {
 				if (!await nativeRepositoryPreparationEnabled(nativeReviewCli, defaultCwd, signal)) return nativeRepositoryPreparationBlocked(parameters.operation);
 			} else {
@@ -11737,7 +11549,7 @@ async function executeReviewControllerOperationImpl(
 					retainedPreLineageSelection !== undefined &&
 					!sameNativePreLineageCandidate(retainedPreLineageSelection, target)
 				) {
-					clearRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, "");
+					retainedUntrackedSelections.clearPreStart(defaultCwd);
 					return {
 						operation: parameters.operation,
 						status: "blocked",
@@ -11825,7 +11637,6 @@ async function executeReviewControllerOperationImpl(
 								candidateCleaned = true;
 								try { consentCandidateView.cleanup(); } catch { /* Failed ownership proof preserves the view; consent teardown still completes. */ }
 							},
-							...(retainedUntrackedSelection === undefined ? {} : { untrackedSelection: retainedUntrackedSelection }),
 							consent: error.consent,
 							...requestContext,
 							...escalateContext,
@@ -11843,10 +11654,9 @@ async function executeReviewControllerOperationImpl(
 						...nativeStartPreAuthorityRejection(),
 					};
 				}
-				retainNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, result.lineageId, retainedUntrackedSelection);
 				// gentle-pi#706: the adopted pre-lineage selection dies with the START
 				// that consumed it; it must never leak to the next candidate.
-				clearRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, "");
+				retainedUntrackedSelections.clearPreStart(defaultCwd);
 				return completeNativeStart(parameters.operation, result, defaultCwd, candidateView, candidateViews);
 			} catch (error) {
 				if (!nativeStartAttempted && error instanceof CandidateViewError && error.diagnostics !== undefined) return nativeOperationFailure(parameters.operation, Object.assign(error, { candidateViewPreNative: true }));
@@ -11987,10 +11797,6 @@ async function executeReviewControllerOperationImpl(
 			parameters.lineageId !== undefined && !candidateViews?.hasProjection(parameters.lineageId, defaultCwd);
 		if (workspaceRefusal !== undefined && !committedRangeBound && !probeCommittedRange) return nativeStatusInputRejection(workspaceRefusal);
 		if (probeCommittedRange) untrackedSelection = {};
-		const retainedUntrackedSelection = cloneRetainedNativeUntrackedSelection(untrackedSelection);
-		const effectiveUntrackedSelection = rawStatus === undefined && !committedRangeBound && parameters.lineageId !== undefined
-			? readRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId)
-			: untrackedSelection;
 		const effectiveBaseRef = typeof baseRef === "string" ? baseRef : (committedRangeBound ? nativeCommittedRangeSelector(retainedCommittedTarget) : undefined);
 		if (nativeReviewCli?.targetStatus !== undefined) {
 			try {
@@ -11998,7 +11804,7 @@ async function executeReviewControllerOperationImpl(
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(effectiveBaseRef === undefined ? {} : { baseRef: effectiveBaseRef, committedOnly: true }),
-					...(effectiveUntrackedSelection.untrackedScope === undefined ? {} : effectiveUntrackedSelection),
+					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
 					// gentle-ai#6088: only on behalf of gentle_review_run (L19); the run
 					// bounds them and drops the raw set from its nested record.
 					...nonBlockingFindingsForRun(),
@@ -12016,13 +11822,6 @@ async function executeReviewControllerOperationImpl(
 					if (!(status.applicability === "current_target" && status.authority?.lineageId === parameters.lineageId && status.projection.kind === "base-diff")) return nativeStatusInputRejection(workspaceRefusal!);
 					syncRetainedNativeStatusSelections(retainedUntrackedSelections, defaultCwd, status, effectiveBaseRef);
 				}
-				if (
-					retainedUntrackedSelection !== undefined &&
-					parameters.lineageId !== undefined &&
-					status.applicability === "current_target" &&
-					status.authority?.lineageId === parameters.lineageId &&
-					(!isTerminalReviewAuthorityState(status.authority.state) || status.authority.state === "approved")
-				) retainNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId, retainedUntrackedSelection);
 				hydrateDispatchBindingFromStatus(candidateViews, defaultCwd, status);
 				return { ...mapNativeTargetStatus(parameters.operation, status, parameters.lineageId, includeWorkspaceRoot ? defaultCwd : undefined), ...(includeWorkspaceRoot ? { workspace_root: defaultCwd } : {}) };
 			} catch (error) {
@@ -12188,6 +11987,7 @@ function createGentleAiExtensionForTesting(
 		cancel: () => classifier?.cancel(),
 	}, { configHome: gentlePiConfigHome(permissionEnvironment) });
 	const auto = autoPermissions;
+	const pathTargetGrants = new WeakMap<object, { sessionId: string; targets: Set<string> }>();
 	const verifierSettleReminders = createVerifierSettleReminders<PendingReviewConsentSessionKey>();
 	const explorationBudget = createExplorationBudget();
 	// Named-agent or child runs started and not yet settled, per session. Such a run never records verifier attempts (its
@@ -12315,6 +12115,8 @@ function createGentleAiExtensionForTesting(
 		invalidateRddStatus(context.cwd);
 		rddOffReviewLoadout = false;
 		auto.reset();
+		pathTargetGrants.delete(context.sessionManager);
+		clearPathConsentSkills(context);
 		yolo.reset(context);
 		reviewSidebar.reset();
 		statusTiming.reset();
@@ -12975,6 +12777,9 @@ function createGentleAiExtensionForTesting(
 	};
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		const skills = event.systemPromptOptions?.skills;
+		setPathConsentSkills(ctx, "pi", Array.isArray(skills) ? skills
+			.filter(skill => skill?.disableModelInvocation !== true && typeof skill?.filePath === "string").map(skill => skill.filePath) : []);
 		const isNamedAgent = isNamedAgentStartEvent(event);
 		const isChildSession = permissionEnvironment.GENTLE_PI_AGENTS_CHILD === "1";
 		const isPrimarySession = !isNamedAgent && !isChildSession;
@@ -13238,6 +13043,70 @@ function createGentleAiExtensionForTesting(
 		return withNotice(undefined);
 	});
 
+	async function confirmOutsidePath(toolName: string, input: Record<string, unknown>, path: string, ctx: ExtensionContext, gate: () => Promise<ToolCallEventResult | undefined>, checkAfterAuto: boolean): Promise<ToolCallEventResult | undefined> {
+		const manager = ctx.sessionManager;
+		const cwd = ctx.cwd;
+		const sessionCwd = manager?.getCwd?.() ?? cwd;
+		const sessionId = manager?.getSessionId?.();
+		let target: string;
+		try { target = canonicalizeTarget(path, cwd, toolName); }
+		catch { return { block: true, reason: "Gentle AI safety policy cannot safely resolve the requested path." }; }
+		const worktree = resolveSessionWorktree(sessionCwd, sessionCwd);
+		// Files outside a Git checkout use the session directory as their boundary.
+		let root = worktree?.root ?? sessionCwd;
+		if (!worktree) {
+			try { root = realpathSync.native(root); }
+			catch { /* A missing bootstrap directory has no symlink destination. */ }
+		}
+		const sameTarget = () => {
+			const current = toolWorktreePath(toolName, input);
+			return current !== undefined && canonicalizeTarget(current, cwd, toolName) === target;
+		};
+		const gateWithTargetRecheck = async () => {
+			const denied = await gate();
+			if (denied || !checkAfterAuto) return denied;
+			try { if (ctx.cwd === cwd && sameTarget()) return undefined; } catch { /* Fail closed below. */ }
+			return { block: true, reason: "Gentle AI safety policy blocked the path access because its target changed during Auto classification. Retry to request fresh consent." };
+		};
+		if (isWithinPath(root, target) || isTempTarget(target, permissionEnvironment)) return gateWithTargetRecheck();
+		if (toolName === "read" && isIndexedSkillTarget(ctx, target)) return gateWithTargetRecheck();
+		if (worktree && sessionId && typeof manager.getEntries === "function"
+			&& new SessionWorktreeRegistry(pi, manager, sessionCwd).roots().some(root => isWithinPath(root, target))) return gateWithTargetRecheck();
+		const grant = manager && pathTargetGrants.get(manager);
+		if (grant && grant.sessionId === sessionId && grant.targets.has(target)) return gateWithTargetRecheck();
+		const displayedTarget = sanitizeTerminalText(target);
+		if (!ctx.hasUI || typeof ctx.ui?.confirm !== "function") return { block: true, reason: `Gentle AI safety policy requires interactive confirmation before accessing paths outside the session worktree: ${displayedTarget}. Ask the user for an explicit safer plan.` };
+		if (!sessionId || !manager) return { block: true, reason: "Session identity is unavailable; access outside the session worktree is blocked." };
+		const epoch = reminderEpoch, modeEpoch = yolo.epoch();
+		let changed = false, confirmationFailed = false;
+		const approved = await requestToolConfirmation(pi.events, herdrLifecycle, toolName, async () => {
+			try {
+				const message = `${toolName}: ${displayedTarget} (approval covers only this target for the rest of the session)`;
+				if ((await ctx.ui.confirm("Allow access outside the session worktree?", message)) !== true) return false;
+			} catch {
+				confirmationFailed = true;
+				return false;
+			}
+			try {
+				changed = ctx.signal?.aborted === true || epoch !== reminderEpoch || modeEpoch !== yolo.epoch()
+					|| ctx.sessionManager !== manager || ctx.cwd !== cwd
+					|| manager.getSessionId() !== sessionId || (manager.getCwd?.() ?? cwd) !== sessionCwd || !sameTarget();
+			} catch { changed = true; }
+			return !changed;
+		});
+		if (confirmationFailed) return { block: true, reason: "Gentle AI safety policy blocked the path access because the confirmation dialog failed. Retry to request fresh consent." };
+		if (!approved) return { block: true, reason: changed
+			? "Gentle AI safety policy blocked the path access because its target or session changed during confirmation. Retry to request fresh consent."
+			: "Gentle AI safety policy blocked the path access because it was not confirmed." };
+		const denied = await gateWithTargetRecheck();
+		if (denied) return denied;
+		const latest = pathTargetGrants.get(manager);
+		const targets = latest?.sessionId === sessionId ? latest.targets : new Set<string>();
+		targets.add(target);
+		pathTargetGrants.set(manager, { sessionId, targets });
+		return undefined;
+	}
+
 	pi.on("tool_call", async (event, ctx) => {
 		// Native review tools stalled the session when a codemode script called them
 		// (a nested call, which carries parentToolCallId); direct calls return at once.
@@ -13305,6 +13174,10 @@ function createGentleAiExtensionForTesting(
 			try { return await auto.check(event, ctx, primaryToolCall); }
 			catch { return { block: true, reason: "Auto permission checking failed. This action was not run; do not bypass the check." }; }
 		};
+		if (!superYoloActive && (!yoloActive || event.toolName === "write" || event.toolName === "edit") && isRecord(event.input)) {
+			const path = toolWorktreePath(event.toolName, event.input);
+			if (path !== undefined) return confirmOutsidePath(event.toolName, event.input, path, ctx, gate, settledMode === "auto");
+		}
 		if (!SHELL_COMMAND_TOOLS.has(event.toolName) || !isRecord(event.input)) return gate();
 		const command = (event.input as { command?: unknown }).command;
 		if (typeof command !== "string") return gate();
