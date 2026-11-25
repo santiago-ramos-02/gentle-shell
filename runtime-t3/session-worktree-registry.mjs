@@ -142,7 +142,10 @@ export class SessionWorktreeRegistry {
 	}
 
 	start()       {
-		if (this.identity) this.register(this.identity.root, "session:cwd");
+		// Register through the cwd Git just resolved, not through its root: with
+		// `core.worktree` pointing elsewhere, discovery from that root finds no
+		// repository, while the cwd still names this clone.
+		if (this.identity) this.register(this.cwd, "session:cwd");
 	}
 
 	close()       { this.active = false; }
