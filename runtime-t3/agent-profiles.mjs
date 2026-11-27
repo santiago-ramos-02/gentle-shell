@@ -50,6 +50,11 @@ export const DEFAULT_ORCHESTRATOR_MODE                   = "organic";
 
 
 
+
+
+
+
+
 export function isOrchestratorMode(value         )                            {
 	return typeof value === "string" && (ORCHESTRATOR_MODES                     ).includes(value);
 }
@@ -230,13 +235,15 @@ function normalizeWorkflowMap(
 			dropped.push({ profile: name, mode: described });
 			continue;
 		}
-		workflow[name] = { orchestratorMode: rawMode };
+		// Only exactly `true` turns Controlled Engineering on; any other value reads as off.
+		const controlledEngineering = isRecord(rawEntry) && rawEntry.controlledEngineering === true;
+		workflow[name] = persistedWorkflow({ orchestratorMode: rawMode, controlledEngineering });
 	}
 	if (dropped.length > 0) drops.droppedWorkflow = dropped;
-	// An all-organic map carries no information: keep the file identical to the
+	// An all-default map carries no information: keep the file identical to the
 	// pre-change shape so an opted-out file never grows a `workflow` key.
 	const meaningful = Object.fromEntries(
-		Object.entries(workflow).filter(([, entry]) => entry.orchestratorMode !== DEFAULT_ORCHESTRATOR_MODE),
+		Object.entries(workflow).filter(([, entry]) => isMeaningfulWorkflow(entry)),
 	);
 	return Object.keys(meaningful).length === 0 ? undefined : meaningful;
 }
@@ -282,7 +289,7 @@ export function serializeProfilesFile(file                   )         {
 	return `${JSON.stringify(payload, null, 2)}\n`;
 }
 
-/** The subset of a workflow map worth persisting: declared profiles, non-default modes. */
+/** The subset of a workflow map worth persisting: declared profiles with a non-default setting. */
 function meaningfulWorkflowMap(
 	workflow                                             ,
 	profiles                                  ,
@@ -290,10 +297,22 @@ function meaningfulWorkflowMap(
 	if (workflow === undefined) return undefined;
 	const kept = Object.fromEntries(
 		Object.entries(workflow)
-			.filter(([name, entry]) => hasOwn(profiles, name) && entry.orchestratorMode !== DEFAULT_ORCHESTRATOR_MODE)
-			.map(([name, entry]) => [name, { orchestratorMode: entry.orchestratorMode }]),
+			.filter(([name, entry]) => hasOwn(profiles, name) && isMeaningfulWorkflow(entry))
+			.map(([name, entry]) => [name, persistedWorkflow(entry)]),
 	);
 	return Object.keys(kept).length === 0 ? undefined : kept;
+}
+
+/** Whether an entry differs from the defaults (organic, Controlled Engineering off). */
+function isMeaningfulWorkflow(entry                 )          {
+	return entry.orchestratorMode !== DEFAULT_ORCHESTRATOR_MODE || entry.controlledEngineering === true;
+}
+
+/** The stored shape of an entry: the mode always, the option only while on. */
+function persistedWorkflow(entry                 )                  {
+	return entry.controlledEngineering === true
+		? { orchestratorMode: entry.orchestratorMode, controlledEngineering: true }
+		: { orchestratorMode: entry.orchestratorMode };
 }
 
 // ---- Store mutations (each returns a new file and never mutates the input) ----
@@ -336,7 +355,7 @@ export function duplicateProfile(
 		throw new AgentProfileError("duplicate_name", `Profile already exists: ${to}.`);
 	}
 	const created = createProfile(file, to, file.profiles[from]);
-	return setProfileOrchestratorMode(created, to, readProfileWorkflow(file, from).orchestratorMode);
+	return withProfileWorkflow(created, to, readProfileWorkflow(file, from));
 }
 
 export function renameProfile(
@@ -409,7 +428,10 @@ export function setActiveProfile(file                   , name        )         
  */
 export function readProfileWorkflow(file                   , name        )                  {
 	const entry = file.workflow !== undefined && hasOwn(file.workflow, name) ? file.workflow[name] : undefined;
-	return { orchestratorMode: entry?.orchestratorMode ?? DEFAULT_ORCHESTRATOR_MODE };
+	return {
+		orchestratorMode: entry?.orchestratorMode ?? DEFAULT_ORCHESTRATOR_MODE,
+		controlledEngineering: entry?.controlledEngineering === true,
+	};
 }
 
 /**
@@ -421,12 +443,30 @@ export function setProfileOrchestratorMode(
 	name        ,
 	mode                  ,
 )                    {
+	return withProfileWorkflow(file, name, { ...readProfileWorkflow(file, name), orchestratorMode: mode });
+}
+
+/** Turns Controlled Engineering on or off for one profile, keeping its mode. */
+export function setProfileControlledEngineering(
+	file                   ,
+	name        ,
+	enabled         ,
+)                    {
+	return withProfileWorkflow(file, name, { ...readProfileWorkflow(file, name), controlledEngineering: enabled });
+}
+
+/** Stores one profile's workflow, removing the entry when it holds only defaults. */
+function withProfileWorkflow(
+	file                   ,
+	name        ,
+	workflow                 ,
+)                    {
 	requireValidName(name);
 	if (!hasOwn(file.profiles, name)) {
 		throw new AgentProfileError("missing_profile", `Profile does not exist: ${name}.`);
 	}
-	if (mode === DEFAULT_ORCHESTRATOR_MODE) return { ...file, workflow: workflowWithout(file.workflow, name) };
-	return { ...file, workflow: { ...file.workflow, [name]: { orchestratorMode: mode } } };
+	if (!isMeaningfulWorkflow(workflow)) return { ...file, workflow: workflowWithout(file.workflow, name) };
+	return { ...file, workflow: { ...file.workflow, [name]: persistedWorkflow(workflow) } };
 }
 
 /** The mode the focused profile would get from one key press (panel `d`). */
